@@ -1,0 +1,5 @@
+// SD Card pin configuration
+#define SD_CS_PIN    34
+#define SD_MOSI_PIN  35
+#define SD_MISO_PIN  37
+#define SD_SCK_PIN   36
