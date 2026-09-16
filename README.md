@@ -130,19 +130,57 @@ ESP-IDF v5.5.5 the same files live under `components/hal/`. Manually port:
 esp32-p4-hub-keylogger/
 ├── README.md                     ← this file
 ├── fs-force.patch                ← FSLSSupp HAL patch (upstream not merged)
-├── firmware/
+├── firmware/                     ← ESP32-P4 firmware (HID passthrough)
 │   ├── CMakeLists.txt
 │   ├── sdkconfig.defaults
 │   └── main/
-│       ├── CMakeLists.txt
-│       ├── idf_component.yml
 │       ├── main.c                ← TinyUSB HID Device + PHY swap
 │       ├── hid_bridge.h          ← shared queue types
 │       ├── hid_host_task.c       ← USB Host + HID host
 │       ├── usb_probe.c           ← diagnostic firmware (not built by default)
 │       └── device_only_test.c    ← test firmware (not built by default)
+├── c6-firmware/                  ← ESP32-C6 firmware (Wi-Fi + web UI)
+│   ├── CMakeLists.txt
+│   ├── sdkconfig.defaults
+│   └── main/
+│       ├── main.c                ← Wi-Fi AP + HTTP + WebSocket + UART RX
+│       └── web_ui.c              ← embedded single-page HTML
 └── docs/                         ← schematic PDFs, board photos, analysis
 ```
+
+## Wi-Fi web UI (optional)
+
+Runs on the on-board ESP32-C6 as a completely independent firmware — no
+esp-hosted-mcu, no SDIO bridge, no interaction with the P4 firmware. If the
+C6 is unflashed, the P4 keeps working as a pure HID passthrough; the web UI
+is just not there.
+
+### Flash the C6 (one-time)
+
+1. **Set the C6 BOOT switch to `0` (BOOT)** — the little slide switch labeled
+   `C6  B-0 BOOT / B-1 WORK` next to the U1 Type-C on the EXT board
+2. **Plug U1 into your PC** — Windows shows a new COM port (call it COMyy)
+3. Build and flash:
+   ```bash
+   cd c6-firmware
+   idf.py set-target esp32c6
+   idf.py -p COMyy build flash
+   ```
+4. **Set the switch back to `1` (WORK)** and power-cycle the board
+
+### Use it
+
+- Wi-Fi AP `P4-KeyLogger` / `changeme123` appears on your phone
+- Browse to `http://192.168.4.1`
+- Web UI shows live keystrokes streamed over WebSocket
+
+### Optional — actually wire keystrokes from P4 to C6
+
+The C6 UI reads from UART1 RX on **C6 GPIO4** at 115200 baud. For the P4 to
+feed keystrokes, wire a jumper from **P4 GPIO37 (TX0)** to **C6 GPIO4**, plus
+a common GND. The P4 firmware currently doesn't emit anything on that TX
+line (see TODO in main.c); until that's added, the web UI works but shows no
+keystrokes.
 
 ## Board pinout summary
 

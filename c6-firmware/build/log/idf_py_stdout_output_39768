@@ -1,0 +1,66 @@
+Command: cmake -G Ninja -DPYTHON_DEPS_CHECKED=1 -DPYTHON=C:\Users\Flo\.espressif\python_env\idf5.5_py3.10_env\Scripts\python.exe -DESP_PLATFORM=1 -DIDF_TARGET=esp32c6 -DCCACHE_ENABLE=1 C:\Users\Flo\Downloads\NewApps\esp32-p4-hub-keylogger\c6-firmware
+-- Found Git: C:/Program Files/Git/cmd/git.exe (found version "2.55.0.windows.5")
+-- Component directory C:/Users/Flo/esp/esp-idf-v5.5/components/esp_blockdev does not contain a CMakeLists.txt file. No component will be added
+-- Minimal build - OFF
+-- ccache will be used for faster recompilation
+-- The C compiler identification is GNU 14.2.0
+-- The CXX compiler identification is GNU 14.2.0
+-- The ASM compiler identification is GNU
+-- Found assembler: C:/Users/Flo/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-gcc.exe
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: C:/Users/Flo/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-gcc.exe - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: C:/Users/Flo/.espressif/tools/riscv32-esp-elf/esp-14.2.0_20260121/riscv32-esp-elf/bin/riscv32-esp-elf-g++.exe - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Building ESP-IDF components for target esp32c6
+-- Project sdkconfig file C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/sdkconfig
+Loading defaults file C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/sdkconfig.defaults...
+C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/sdkconfig.defaults:13 CONFIG_ESP_CONSOLE_UART_NONE was replaced with CONFIG_ESP_CONSOLE_NONE 
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/riscv/ld/rom.api.ld
+-- Found Python3: C:/Users/Flo/.espressif/python_env/idf5.5_py3.10_env/Scripts/python.exe (found version "3.10.11") found components: Interpreter
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS
+-- Performing Test C_COMPILER_SUPPORTS_WFORMAT_SIGNEDNESS - Success
+-- USING O3
+-- App "p4_keylogger_c6_ui" version: aebbfcf
+-- Adding linker script C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/build/esp-idf/esp_system/ld/memory.ld
+-- Adding linker script C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/build/esp-idf/esp_system/ld/sections.ld.in
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.api.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.rvfp.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.wdt.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.systimer.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.version.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.phy.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.coexist.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.net80211.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.pp.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.libc.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.newlib.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.newlib-normal.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom/esp32c6/ld/esp32c6.rom.heap.ld
+-- Adding linker script C:/Users/Flo/esp/esp-idf-v5.5/components/soc/esp32c6/ld/esp32c6.peripherals.ld
+-- Components: app_trace app_update bootloader bootloader_support bt cmock console cxx driver efuse esp-tls esp_adc esp_app_format esp_bootloader_format esp_coex esp_common esp_driver_ana_cmpr esp_driver_bitscrambler esp_driver_cam esp_driver_dac esp_driver_gpio esp_driver_gptimer esp_driver_i2c esp_driver_i2s esp_driver_isp esp_driver_jpeg esp_driver_ledc esp_driver_mcpwm esp_driver_parlio esp_driver_pcnt esp_driver_ppa esp_driver_rmt esp_driver_sdio esp_driver_sdm esp_driver_sdmmc esp_driver_sdspi esp_driver_spi esp_driver_touch_sens esp_driver_tsens esp_driver_twai esp_driver_uart esp_driver_usb_serial_jtag esp_eth esp_event esp_gdbstub esp_hal_ieee802154 esp_hid esp_http_client esp_http_server esp_https_ota esp_https_server esp_hw_support esp_lcd esp_local_ctrl esp_mm esp_netif esp_netif_stack esp_partition esp_phy esp_pm esp_psram esp_ringbuf esp_rom esp_security esp_system esp_tee esp_timer esp_vfs_console esp_wifi espcoredump esptool_py fatfs freertos hal heap http_parser idf_test ieee802154 json log lwip main mbedtls mqtt newlib nvs_flash nvs_sec_provider openthread partition_table protobuf-c protocomm pthread riscv rt sdmmc soc spi_flash spiffs tcp_transport ulp unity usb vfs wear_levelling wifi_provisioning wpa_supplicant
+-- Component paths: C:/Users/Flo/esp/esp-idf-v5.5/components/app_trace C:/Users/Flo/esp/esp-idf-v5.5/components/app_update C:/Users/Flo/esp/esp-idf-v5.5/components/bootloader C:/Users/Flo/esp/esp-idf-v5.5/components/bootloader_support C:/Users/Flo/esp/esp-idf-v5.5/components/bt C:/Users/Flo/esp/esp-idf-v5.5/components/cmock C:/Users/Flo/esp/esp-idf-v5.5/components/console C:/Users/Flo/esp/esp-idf-v5.5/components/cxx C:/Users/Flo/esp/esp-idf-v5.5/components/driver C:/Users/Flo/esp/esp-idf-v5.5/components/efuse C:/Users/Flo/esp/esp-idf-v5.5/components/esp-tls C:/Users/Flo/esp/esp-idf-v5.5/components/esp_adc C:/Users/Flo/esp/esp-idf-v5.5/components/esp_app_format C:/Users/Flo/esp/esp-idf-v5.5/components/esp_bootloader_format C:/Users/Flo/esp/esp-idf-v5.5/components/esp_coex C:/Users/Flo/esp/esp-idf-v5.5/components/esp_common C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_ana_cmpr C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_bitscrambler C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_cam C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_dac C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_gpio C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_gptimer C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_i2c C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_i2s C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_isp C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_jpeg C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_ledc C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_mcpwm C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_parlio C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_pcnt C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_ppa C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_rmt C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_sdio C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_sdm C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_sdmmc C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_sdspi C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_spi C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_touch_sens C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_tsens C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_twai C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_uart C:/Users/Flo/esp/esp-idf-v5.5/components/esp_driver_usb_serial_jtag C:/Users/Flo/esp/esp-idf-v5.5/components/esp_eth C:/Users/Flo/esp/esp-idf-v5.5/components/esp_event C:/Users/Flo/esp/esp-idf-v5.5/components/esp_gdbstub C:/Users/Flo/esp/esp-idf-v5.5/components/esp_hal_ieee802154 C:/Users/Flo/esp/esp-idf-v5.5/components/esp_hid C:/Users/Flo/esp/esp-idf-v5.5/components/esp_http_client C:/Users/Flo/esp/esp-idf-v5.5/components/esp_http_server C:/Users/Flo/esp/esp-idf-v5.5/components/esp_https_ota C:/Users/Flo/esp/esp-idf-v5.5/components/esp_https_server C:/Users/Flo/esp/esp-idf-v5.5/components/esp_hw_support C:/Users/Flo/esp/esp-idf-v5.5/components/esp_lcd C:/Users/Flo/esp/esp-idf-v5.5/components/esp_local_ctrl C:/Users/Flo/esp/esp-idf-v5.5/components/esp_mm C:/Users/Flo/esp/esp-idf-v5.5/components/esp_netif C:/Users/Flo/esp/esp-idf-v5.5/components/esp_netif_stack C:/Users/Flo/esp/esp-idf-v5.5/components/esp_partition C:/Users/Flo/esp/esp-idf-v5.5/components/esp_phy C:/Users/Flo/esp/esp-idf-v5.5/components/esp_pm C:/Users/Flo/esp/esp-idf-v5.5/components/esp_psram C:/Users/Flo/esp/esp-idf-v5.5/components/esp_ringbuf C:/Users/Flo/esp/esp-idf-v5.5/components/esp_rom C:/Users/Flo/esp/esp-idf-v5.5/components/esp_security C:/Users/Flo/esp/esp-idf-v5.5/components/esp_system C:/Users/Flo/esp/esp-idf-v5.5/components/esp_tee C:/Users/Flo/esp/esp-idf-v5.5/components/esp_timer C:/Users/Flo/esp/esp-idf-v5.5/components/esp_vfs_console C:/Users/Flo/esp/esp-idf-v5.5/components/esp_wifi C:/Users/Flo/esp/esp-idf-v5.5/components/espcoredump C:/Users/Flo/esp/esp-idf-v5.5/components/esptool_py C:/Users/Flo/esp/esp-idf-v5.5/components/fatfs C:/Users/Flo/esp/esp-idf-v5.5/components/freertos C:/Users/Flo/esp/esp-idf-v5.5/components/hal C:/Users/Flo/esp/esp-idf-v5.5/components/heap C:/Users/Flo/esp/esp-idf-v5.5/components/http_parser C:/Users/Flo/esp/esp-idf-v5.5/components/idf_test C:/Users/Flo/esp/esp-idf-v5.5/components/ieee802154 C:/Users/Flo/esp/esp-idf-v5.5/components/json C:/Users/Flo/esp/esp-idf-v5.5/components/log C:/Users/Flo/esp/esp-idf-v5.5/components/lwip C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/main C:/Users/Flo/esp/esp-idf-v5.5/components/mbedtls C:/Users/Flo/esp/esp-idf-v5.5/components/mqtt C:/Users/Flo/esp/esp-idf-v5.5/components/newlib C:/Users/Flo/esp/esp-idf-v5.5/components/nvs_flash C:/Users/Flo/esp/esp-idf-v5.5/components/nvs_sec_provider C:/Users/Flo/esp/esp-idf-v5.5/components/openthread C:/Users/Flo/esp/esp-idf-v5.5/components/partition_table C:/Users/Flo/esp/esp-idf-v5.5/components/protobuf-c C:/Users/Flo/esp/esp-idf-v5.5/components/protocomm C:/Users/Flo/esp/esp-idf-v5.5/components/pthread C:/Users/Flo/esp/esp-idf-v5.5/components/riscv C:/Users/Flo/esp/esp-idf-v5.5/components/rt C:/Users/Flo/esp/esp-idf-v5.5/components/sdmmc C:/Users/Flo/esp/esp-idf-v5.5/components/soc C:/Users/Flo/esp/esp-idf-v5.5/components/spi_flash C:/Users/Flo/esp/esp-idf-v5.5/components/spiffs C:/Users/Flo/esp/esp-idf-v5.5/components/tcp_transport C:/Users/Flo/esp/esp-idf-v5.5/components/ulp C:/Users/Flo/esp/esp-idf-v5.5/components/unity C:/Users/Flo/esp/esp-idf-v5.5/components/usb C:/Users/Flo/esp/esp-idf-v5.5/components/vfs C:/Users/Flo/esp/esp-idf-v5.5/components/wear_levelling C:/Users/Flo/esp/esp-idf-v5.5/components/wifi_provisioning C:/Users/Flo/esp/esp-idf-v5.5/components/wpa_supplicant
+-- Configuring done (10.8s)
+-- Generating done (1.6s)
+-- Build files have been written to: C:/Users/Flo/Downloads/NewApps/esp32-p4-hub-keylogger/c6-firmware/build

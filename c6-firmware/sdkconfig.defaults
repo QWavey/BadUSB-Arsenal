@@ -1,0 +1,13 @@
+CONFIG_IDF_TARGET="esp32c6"
+
+# Wi-Fi enabled; run on C6's own radio (no coprocessor)
+CONFIG_ESP_WIFI_ENABLED=y
+
+# HTTP server + WebSocket
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_WS_SUPPORT=y
+CONFIG_LWIP_MAX_SOCKETS=16
+
+# Console over USB-Serial-JTAG so logs show up on U1
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_NONE=n
