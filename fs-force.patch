@@ -1,0 +1,190 @@
+=== components/esp_hal_usb/esp32p4/include/hal/usb_dwc_ll.h ===
+@@ -502,9 +502,53 @@ static inline void usb_dwc_ll_hcfg_en_scatt_gatt_dma(usb_dwc_dev_t *hw)
+     hw->hcfg_reg.descdma = 1;
+ }
+ 
+-static inline void usb_dwc_ll_hcfg_set_fsls_supp_only(usb_dwc_dev_t *hw)
++static inline bool usb_dwc_ll_is_hs_controller(usb_dwc_dev_t *hw)
++{
++    return hw == &USB_DWC_HS;
++}
++
++/**
++ * @brief Configure HS UTMI port for FS/LS-only host mode (HCFG.FSLSSupp)
++ *
++ * Skips HS chirp so FS/LS devices enumerate without split transactions.
++ * Call after PHY and host mode are configured, before the first port reset.
++ * Re-apply before each port reset because the controller may clear FSLSSupp.
++ */
++static inline void usb_dwc_ll_hcfg_init_hs_fsls_host(usb_dwc_dev_t *hw)
+ {
+     hw->hcfg_reg.fslssupp = 1;
++    hw->hcfg_reg.fslspclksel = 0;   // UTMI 16-bit interface: 30 MHz
++}
++
++/**
++ * @brief Refine UTMI PHY clock select after port reset based on device speed
++ *
++ * @attention Only valid after port reset when HPRT.PrtSpd reflects device speed
++ * @param[in] hw    Start address of the DWC_OTG registers
++ */
++static inline void usb_dwc_ll_hcfg_set_utmi_fsls_phy_clock(usb_dwc_dev_t *hw)
++{
++    usb_dwc_speed_t speed = (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    hw->hcfg_reg.fslspclksel = (speed == USB_DWC_SPEED_LOW) ? 2 : 0;
++}
++
++/**
++ * @brief Set frame interval for UTMI PHY in FS/LS-only host mode
++ *
++ * Frame interval follows dwc2_calc_frame_interval(): 1000 * PHY_MHz - 1
++ * for FS/LS, where PHY_MHz is 30 for FSLSPclkSel=0 and 6 for FSLSPclkSel=2.
++ *
++ * @attention Only valid after HPRT.PrtEna is set
++ * @param[in] hw    Start address of the DWC_OTG registers
++ */
++static inline void usb_dwc_ll_hfir_set_utmi_frame_interval(usb_dwc_dev_t *hw)
++{
++    usb_dwc_hfir_reg_t hfir;
++    hfir.val = hw->hfir_reg.val;
++    hfir.hfirrldctrl = 0;
++    usb_dwc_speed_t speed = (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    hfir.frint = (speed == USB_DWC_SPEED_LOW) ? 5999 : 29999;
++    hw->hfir_reg.val = hfir.val;
+ }
+ 
+ /**
+@@ -628,7 +672,12 @@ static inline uint32_t usb_dwc_ll_hflbaddr_get_base_addr(usb_dwc_dev_t *hw)
+ 
+ static inline usb_dwc_speed_t usb_dwc_ll_hprt_get_speed(usb_dwc_dev_t *hw)
+ {
+-    return (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    usb_dwc_speed_t speed = (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    // PrtSpd may still read HS after FS link-up; report FS for the HS root port.
++    if (usb_dwc_ll_is_hs_controller(hw) && speed == USB_DWC_SPEED_HIGH) {
++        speed = USB_DWC_SPEED_FULL;
++    }
++    return speed;
+ }
+ 
+ static inline uint32_t usb_dwc_ll_hprt_get_test_ctl(usb_dwc_dev_t *hw)
+@@ -667,6 +716,9 @@ static inline uint32_t usb_dwc_ll_hprt_get_pwr_line_status(usb_dwc_dev_t *hw)
+ 
+ static inline void usb_dwc_ll_hprt_set_port_reset(usb_dwc_dev_t *hw, bool reset)
+ {
++    if (reset && usb_dwc_ll_is_hs_controller(hw)) {
++        usb_dwc_ll_hcfg_init_hs_fsls_host(hw);
++    }
+     usb_dwc_hprt_reg_t hprt;
+     hprt.val = hw->hprt_reg.val;
+     hprt.prtrst = reset;
+=== components/esp_hal_usb/esp32s31/include/hal/usb_dwc_ll.h ===
+@@ -491,9 +491,53 @@ static inline void usb_dwc_ll_hcfg_en_scatt_gatt_dma(usb_dwc_dev_t *hw)
+     hw->hcfg_reg.descdma = 1;
+ }
+ 
+-static inline void usb_dwc_ll_hcfg_set_fsls_supp_only(usb_dwc_dev_t *hw)
++static inline bool usb_dwc_ll_is_hs_controller(usb_dwc_dev_t *hw)
++{
++    return hw == &USB_OTGHS;
++}
++
++/**
++ * @brief Configure HS UTMI port for FS/LS-only host mode (HCFG.FSLSSupp)
++ *
++ * Skips HS chirp so FS/LS devices enumerate without split transactions.
++ * Call after PHY and host mode are configured, before the first port reset.
++ * Re-apply before each port reset because the controller may clear FSLSSupp.
++ */
++static inline void usb_dwc_ll_hcfg_init_hs_fsls_host(usb_dwc_dev_t *hw)
+ {
+     hw->hcfg_reg.fslssupp = 1;
++    hw->hcfg_reg.fslspclksel = 0;   // UTMI 16-bit interface: 30 MHz
++}
++
++/**
++ * @brief Refine UTMI PHY clock select after port reset based on device speed
++ *
++ * @attention Only valid after port reset when HPRT.PrtSpd reflects device speed
++ * @param[in] hw    Start address of the DWC_OTG registers
++ */
++static inline void usb_dwc_ll_hcfg_set_utmi_fsls_phy_clock(usb_dwc_dev_t *hw)
++{
++    usb_dwc_speed_t speed = (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    hw->hcfg_reg.fslspclksel = (speed == USB_DWC_SPEED_LOW) ? 2 : 0;
++}
++
++/**
++ * @brief Set frame interval for UTMI PHY in FS/LS-only host mode
++ *
++ * Frame interval follows dwc2_calc_frame_interval(): 1000 * PHY_MHz - 1
++ * for FS/LS, where PHY_MHz is 30 for FSLSPclkSel=0 and 6 for FSLSPclkSel=2.
++ *
++ * @attention Only valid after HPRT.PrtEna is set
++ * @param[in] hw    Start address of the DWC_OTG registers
++ */
++static inline void usb_dwc_ll_hfir_set_utmi_frame_interval(usb_dwc_dev_t *hw)
++{
++    usb_dwc_hfir_reg_t hfir;
++    hfir.val = hw->hfir_reg.val;
++    hfir.hfirrldctrl = 0;
++    usb_dwc_speed_t speed = (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    hfir.frint = (speed == USB_DWC_SPEED_LOW) ? 5999 : 29999;
++    hw->hfir_reg.val = hfir.val;
+ }
+ 
+ /**
+@@ -617,7 +661,12 @@ static inline uint32_t usb_dwc_ll_hflbaddr_get_base_addr(usb_dwc_dev_t *hw)
+ 
+ static inline usb_dwc_speed_t usb_dwc_ll_hprt_get_speed(usb_dwc_dev_t *hw)
+ {
+-    return (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    usb_dwc_speed_t speed = (usb_dwc_speed_t)hw->hprt_reg.prtspd;
++    // PrtSpd may still read HS after FS link-up; report FS for the HS root port.
++    if (usb_dwc_ll_is_hs_controller(hw) && speed == USB_DWC_SPEED_HIGH) {
++        speed = USB_DWC_SPEED_FULL;
++    }
++    return speed;
+ }
+ 
+ static inline uint32_t usb_dwc_ll_hprt_get_test_ctl(usb_dwc_dev_t *hw)
+@@ -656,6 +705,9 @@ static inline uint32_t usb_dwc_ll_hprt_get_pwr_line_status(usb_dwc_dev_t *hw)
+ 
+ static inline void usb_dwc_ll_hprt_set_port_reset(usb_dwc_dev_t *hw, bool reset)
+ {
++    if (reset && usb_dwc_ll_is_hs_controller(hw)) {
++        usb_dwc_ll_hcfg_init_hs_fsls_host(hw);
++    }
+     usb_dwc_hprt_reg_t hprt;
+     hprt.val = hw->hprt_reg.val;
+     hprt.prtrst = reset;
+=== components/esp_hal_usb/usb_dwc_hal.c ===
+@@ -148,6 +148,11 @@ static void set_defaults(usb_dwc_hal_context_t *hal)
+     //Enable host mode
+     usb_dwc_ll_gusbcfg_force_host_mode(hal->dev);
+ 
++#if SOC_IS(ESP32P4) || SOC_IS(ESP32S31)
++    if (usb_dwc_ll_is_hs_controller(hal->dev)) {
++        usb_dwc_ll_hcfg_init_hs_fsls_host(hal->dev);
++    }
++#endif // SOC_IS(ESP32P4) || SOC_IS(ESP32S31)
+ #if SOC_IS(ESP32P4)
+     if (hnp_cap && hal->constant_config.hsphy_type != 0 && !ESP_CHIP_REV_ABOVE(efuse_hal_chip_revision(), 300)) {
+         // ESP32-P4 HW rev < 3.0, HS DWC + UTMI: no GPIO-matrix OTG sense for this instance; when HNPCap is enabled, anchor the A-host session
+@@ -307,10 +312,15 @@ void usb_dwc_hal_port_enable(usb_dwc_hal_context_t *hal)
+     usb_dwc_ll_hcfg_en_scatt_gatt_dma(hal->dev); // Enable Scatther-Gather DMA mode
+     usb_dwc_ll_hcfg_dis_perio_sched(hal->dev);   // Disable Periodic Scheduler (for now)
+ 
+-    // Configure PHY clock: Only for USB-DWC with FSLS PHY
++    // Configure PHY clock and frame interval once the port speed is known
+     if (hal->constant_config.hsphy_type == 0) {
+         usb_dwc_ll_hcfg_set_fsls_phy_clock(hal->dev);
+         usb_dwc_ll_hfir_set_frame_interval(hal->dev);
++#if SOC_IS(ESP32P4) || SOC_IS(ESP32S31)
++    } else if (usb_dwc_ll_is_hs_controller(hal->dev)) {
++        usb_dwc_ll_hcfg_set_utmi_fsls_phy_clock(hal->dev);
++        usb_dwc_ll_hfir_set_utmi_frame_interval(hal->dev);
++#endif // SOC_IS(ESP32P4) || SOC_IS(ESP32S31)
+     }
+ }
+ 
