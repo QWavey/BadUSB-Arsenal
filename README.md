@@ -16,12 +16,20 @@ layouts (`firmware/main/kb_layouts.{h,c}`). Default is DE — change
 what the keyboard sends; the layout tells us how to render each Usage as a
 glyph (y↔z, ä/ö/ü/ß, £, etc.).
 
-**Known bug (needs a fresh /bug-hunt tomorrow)**: on some boots the P4's USB
-Host doesn't pick up the keyboard on the first plug into a hub port. Cycling
-the keyboard between U1/U2/U3/U4 several times usually finds one that
-enumerates. Likely CH334 hub / TT-force-patch interaction with boot-time
-enumeration order. Not a data-path bug — once the port sticks it works fine
-for the whole session.
+**Known bugs (needs a fresh /bug-hunt tomorrow)**:
+
+1. **Port-flap on cold boot** — the P4's USB Host doesn't always pick up the
+   keyboard on the first plug into a hub port. Cycling the keyboard between
+   U1/U2/U3/U4 several times usually finds one that enumerates. Likely
+   CH334 hub / TT-force-patch interaction with boot-time enumeration order.
+   Not a data-path bug — once the port sticks it works fine for the whole
+   session.
+2. **SHIFT / TAB do not work as combo modifiers on the PC side** — e.g.
+   Shift+Tab (reverse-tab navigation) and Tab+other are not delivered as a
+   combo through TinyUSB, even though the P4 receives them fine (the web UI
+   log shows the raw events). Likely the HID report path is dropping the
+   modifier byte in some race between the host-side callback and the
+   TinyUSB device queue. Deferred for a proper look tomorrow.
 
 **Web UI + persistent log**: the on-board ESP32-C6 runs an independent Wi-Fi
 AP (`P4-KeyLogger` / `changeme123`) that hosts a small web UI at
