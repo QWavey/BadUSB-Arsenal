@@ -23,3 +23,9 @@ extern QueueHandle_t g_hid_bridge_q;
 
 // Starts the USB host + HID host stacks. Publishes reports on g_hid_bridge_q.
 void hid_host_task_start(void);
+
+// Push a keyboard LED-state byte back to the physical keyboard (bit0=NumLock,
+// bit1=CapsLock, bit2=ScrollLock, bit3=Compose, bit4=Kana). No-op if no
+// keyboard is currently connected. Safe to call from the tinyusb set-report
+// callback (short, non-blocking).
+void hid_host_set_kbd_leds(uint8_t leds);

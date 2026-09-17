@@ -1,4 +1,4 @@
-## ESP-IDF Component Manager manifest for HID passthrough
+## ESP-IDF Component Manager manifest for HID passthrough + raw SDIO link
 dependencies:
   idf: ">=5.3"
   espressif/usb_host_hid: "^1.0.5"

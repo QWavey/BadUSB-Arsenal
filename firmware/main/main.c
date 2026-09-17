@@ -13,6 +13,7 @@
 #include "class/hid/hid_device.h"
 
 #include "hid_bridge.h"
+#include "c6_uart.h"
 
 // Runtime USB PHY selector — swaps FS_PHY1↔FS_PHY2 assignments.
 // After swap: OTG_FS drives GPIO24/25 (the core Type-C on this board).
@@ -64,7 +65,13 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 }
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance; (void)report_id; (void)report_type; (void)buffer; (void)bufsize;
+    (void)instance;
+    // PC pushes Caps/Num/Scroll Lock state as an OUTPUT report on the keyboard
+    // interface. Boot layout is a single byte bitmap. Forward to the physical
+    // keyboard so its LEDs stay in sync with the PC.
+    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == REPORT_ID_KEYBOARD && bufsize >= 1) {
+        hid_host_set_kbd_leds(buffer[0]);
+    }
 }
 
 // Boot keyboard input report layout: modifier(1) + reserved(1) + keycode[6]
@@ -102,14 +109,17 @@ static void forward_task(void *arg) {
 
 void app_main(void) {
     ESP_LOGI(TAG, "Starting HID passthrough on ESP32-P4");
-    ESP_LOGW(TAG, "==== SWAPPING USB PHY: core Type-C -> OTG_FS ====");
-    ESP_LOGW(TAG, "==== USJ / COM34 will disappear in 3 s; hold BOOT+tap RST to flash ====");
-    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // Bring up the SDIO link to the C6 keylogger web UI. Runs in a background
+    // task so app_main isn't blocked if SDIO enum fails.
+    c6_uart_init();
+
+    // Short pause so any early ESP_LOG lands on USJ before the PHY swap.
+    // Removed the long diagnostic window — SDIO is proven working now.
+    vTaskDelay(pdMS_TO_TICKS(300));
 
     // Runtime PHY swap: after this line, GPIO24/25 (the core Type-C on the MINI)
-    // carries the OTG-FS controller instead of USB-Serial-JTAG. TinyUSB HID device
-    // configured on FS peripheral (see sdkconfig) will now reach the PC via the
-    // core Type-C — exactly the port we've been flashing from.
+    // carries the OTG-FS controller instead of USB-Serial-JTAG. USJ / COM34 dies.
     usb_phy_swap_to_otgfs_on_core_typec();
 
     g_hid_bridge_q = xQueueCreate(32, sizeof(hid_bridge_msg_t));

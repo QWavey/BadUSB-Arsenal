@@ -19,10 +19,29 @@
 #include "usb/hid_usage_mouse.h"
 
 #include "hid_bridge.h"
+#include "c6_uart.h"
 
 static const char *TAG = "hid_host";
 
+// Per-interface HID device kind, so DISCONNECTED can emit the right EVT.
+// Boot subclass keyboards/mice come in as separate hid_host_device handles;
+// we tag them at CONNECTED time.
+#define HID_TAG_KBD   1
+#define HID_TAG_MOUSE 2
+
 QueueHandle_t g_hid_bridge_q;
+
+// Track the most recently connected boot keyboard so tinyusb's SET_REPORT
+// (LED state) can forward to the physical keyboard.
+static hid_host_device_handle_t s_kbd_hdev;
+
+void hid_host_set_kbd_leds(uint8_t leds) {
+    if (!s_kbd_hdev) return;
+    // HID Output report ID 0 for boot keyboard, single byte LED bitmap.
+    esp_err_t err = hid_class_request_set_report(s_kbd_hdev,
+        HID_REPORT_TYPE_OUTPUT, 0, &leds, 1);
+    if (err != ESP_OK) ESP_LOGD(TAG, "set_report(LEDs=0x%02x): %s", leds, esp_err_to_name(err));
+}
 
 static void publish_report(hid_rep_kind_t kind, const uint8_t *buf, size_t len) {
     hid_bridge_msg_t m = { .kind = kind, .len = (len > sizeof(m.data)) ? sizeof(m.data) : (uint8_t)len };
@@ -52,12 +71,28 @@ static void hid_iface_cb(hid_host_device_handle_t hdev,
         err = hid_host_device_get_raw_input_report_data(hdev, buf, sizeof(buf), &data_len);
         if (err != ESP_OK) { ESP_LOGD(TAG, "get_input_report: %s", esp_err_to_name(err)); return; }
         if (p.sub_class == HID_SUBCLASS_BOOT_INTERFACE) {
-            if (p.proto == HID_PROTOCOL_KEYBOARD) publish_report(HID_REP_KIND_KEYBOARD, buf, data_len);
-            else if (p.proto == HID_PROTOCOL_MOUSE) publish_report(HID_REP_KIND_MOUSE, buf, data_len);
+            if (p.proto == HID_PROTOCOL_KEYBOARD) {
+                publish_report(HID_REP_KIND_KEYBOARD, buf, data_len);
+                c6_uart_feed_kbd_report(buf, data_len);
+            } else if (p.proto == HID_PROTOCOL_MOUSE) {
+                publish_report(HID_REP_KIND_MOUSE, buf, data_len);
+                c6_uart_feed_mouse_report(buf, data_len);
+            }
         }
         break;
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
         ESP_LOGI(TAG, "HID iface disconnected");
+        // Look up which kind this iface was tagged as at connect time.
+        {
+            hid_host_dev_params_t pp;
+            if (hid_host_device_get_params(hdev, &pp) == ESP_OK &&
+                pp.sub_class == HID_SUBCLASS_BOOT_INTERFACE) {
+                if (pp.proto == HID_PROTOCOL_KEYBOARD) {
+                    if (s_kbd_hdev == hdev) s_kbd_hdev = NULL;
+                    c6_uart_kbd_disconnect();
+                } else if (pp.proto == HID_PROTOCOL_MOUSE) c6_uart_mouse_disconnect();
+            }
+        }
         err = hid_host_device_close(hdev);
         if (err != ESP_OK) ESP_LOGW(TAG, "device_close: %s", esp_err_to_name(err));
         break;
@@ -88,6 +123,10 @@ static void hid_device_cb(hid_host_device_handle_t hdev,
         if (p.proto == HID_PROTOCOL_KEYBOARD) {
             err = hid_class_request_set_idle(hdev, 0, 0);
             if (err != ESP_OK) ESP_LOGW(TAG, "set_idle: %s (non-fatal)", esp_err_to_name(err));
+            s_kbd_hdev = hdev;   // remember for LED forwarding
+            c6_uart_kbd_connect();
+        } else if (p.proto == HID_PROTOCOL_MOUSE) {
+            c6_uart_mouse_connect();
         }
     }
     err = hid_host_device_start(hdev);
