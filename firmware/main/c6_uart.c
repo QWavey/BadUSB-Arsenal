@@ -41,9 +41,10 @@ static SemaphoreHandle_t s_lock;
 static sdmmc_card_t     *s_card;
 static uint8_t s_prev_keys[6];
 static uint8_t s_prev_mod = 0;
-static bool    s_kbd_seen_connected;    // sticky: emitted CONNECT once
+static bool    s_kbd_seen_connected;      // has a real kbd report arrived?
+static bool    s_kbd_interface_present;   // just an enumerated interface (may be a composite mouse's fake kbd)
 static bool    s_mouse_seen_connected;
-static bool    s_mouse_interface_present; // set at USB HID enum, not treated as "connected" until first report
+static bool    s_mouse_interface_present;
 
 // --- combo + hold-key tracking ---
 // The C6 web UI groups modifier + regular keys as "[LALT + 6 + h]" and reports
@@ -51,6 +52,10 @@ static bool    s_mouse_interface_present; // set at USB HID enum, not treated as
 //   * Modifier held while other keys pressed -> emit one combo on release
 //   * Solo key held > HOLD_MS -> emit HELD event on release (no HELD if in combo)
 #define HOLD_MS 1500
+
+// SHIFT (bits 1 / 5) is inherently part of typing; we do NOT let it enter
+// combo capture. Only CTRL / ALT / GUI trigger combos.
+#define COMBO_MOD_MASK 0xDDu     // ~(SHIFT_L | SHIFT_R) = 0xDD
 
 typedef struct { uint8_t kc; uint32_t t_press_ms; } key_ts_t;
 static key_ts_t s_pressed[6];         // parallel to s_prev_keys
@@ -318,18 +323,10 @@ static void tx_line(const char *prefix, const char *body) {
     xSemaphoreGive(s_lock);
 }
 
-// Periodic status heartbeat: re-announces the current HID device presence so
-// a browser that connects late (or a client that only became ready after the
-// physical keyboard plugged in) still gets the right pill colors. Sent as a
-// normal EVT so it's parsed on the C6 the same way.
-static void alive_task(void *arg) {
-    (void)arg;
-    while (1) {
-        tx_line("EVT", s_kbd_seen_connected   ? "KBD_CONNECT"   : "KBD_DISCONNECT");
-        tx_line("EVT", s_mouse_seen_connected ? "MOUSE_CONNECT" : "MOUSE_DISCONNECT");
-        vTaskDelay(pdMS_TO_TICKS(10000));   // low frequency, doesn't spam
-    }
-}
+// No periodic heartbeat: the browser polls /status every 3 s so it always has
+// current pill state, and every real connect/disconnect edge still emits an
+// EVT frame at the moment it happens. Re-announcing on a timer just spammed
+// the log with duplicate KBD_CONNECT / MOUSE_CONNECT lines.
 
 static void link_bringup_task(void *arg) {
     (void)arg;
@@ -340,7 +337,6 @@ static void link_bringup_task(void *arg) {
     }
     s_ready = true;
     tx_line("EVT", "P4_READY");
-    xTaskCreate(alive_task, "c6sdio_alive", 3072, NULL, 3, NULL);
     vTaskDelete(NULL);
 }
 
@@ -357,18 +353,35 @@ void c6_uart_init(void) {
 
 void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
     if (!s_ready || !buf || len < 8) return;
+
+    // Only announce KBD_CONNECT the first time we see a report with actual
+    // data (a keycode down or a modifier held). Composite mice with a "boot
+    // keyboard" phantom interface send periodic empty reports; those don't
+    // count as a real keyboard being plugged in.
+    if (s_kbd_interface_present && !s_kbd_seen_connected) {
+        bool has_data = buf[0] != 0;
+        for (int i = 0; !has_data && i < 6; i++) if (buf[2 + i] > 1) has_data = true;
+        if (has_data) {
+            s_kbd_seen_connected = true;
+            tx_line("EVT", "KBD_CONNECT");
+        }
+    }
+
     uint8_t mod  = buf[0];
     const uint8_t *keys = &buf[2];
     uint32_t now  = now_ms();
     bool shift    = (mod & 0x22) != 0;
 
-    // Any modifier down (any bit set) means we're in "combo capture" mode.
-    bool any_mod_now  = mod  != 0;
-    bool any_mod_prev = s_prev_mod != 0;
+    // A "combo modifier" excludes shift so plain shift-typing doesn't get
+    // swallowed into a giant combo.
+    uint8_t combo_mod_now  = mod        & COMBO_MOD_MASK;
+    uint8_t combo_mod_prev = s_prev_mod & COMBO_MOD_MASK;
+    bool any_mod_now  = combo_mod_now  != 0;
+    bool any_mod_prev = combo_mod_prev != 0;
 
     if (any_mod_now) {
         s_combo_active   = true;
-        s_combo_mods_ever |= mod;   // remember every mod that was down during the combo
+        s_combo_mods_ever |= combo_mod_now;   // remember every mod that was down during the combo
     }
 
     // ---- key press edges ----
@@ -457,7 +470,7 @@ void c6_uart_feed_mouse_report(const uint8_t *buf, size_t len) {
     }
 }
 
-void c6_uart_kbd_connect(void)     { s_kbd_seen_connected   = true;  tx_line("EVT", "KBD_CONNECT");     memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
-void c6_uart_kbd_disconnect(void)  { s_kbd_seen_connected   = false; tx_line("EVT", "KBD_DISCONNECT");  memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
-void c6_uart_mouse_connect(void)   { s_mouse_interface_present = true; /* wait for first report before announcing */ }
+void c6_uart_kbd_connect(void)     { s_kbd_interface_present = true; /* wait for first report */ memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+void c6_uart_kbd_disconnect(void)  { s_kbd_interface_present = false; if (s_kbd_seen_connected) { s_kbd_seen_connected = false; tx_line("EVT", "KBD_DISCONNECT"); } memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+void c6_uart_mouse_connect(void)   { s_mouse_interface_present = true; /* wait for first report */ }
 void c6_uart_mouse_disconnect(void){ s_mouse_interface_present = false; if (s_mouse_seen_connected) { s_mouse_seen_connected = false; tx_line("EVT", "MOUSE_DISCONNECT"); } }

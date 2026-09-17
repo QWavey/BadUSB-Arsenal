@@ -75,10 +75,16 @@ static bool s_kbd_present = false;
 static bool s_mouse_present = false;
 static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
-static uint32_t s_uart_bytes_total = 0;   // diagnostic: total bytes seen on GPIO4
-static uint32_t s_sdio_bytes_total = 0;   // diagnostic: total bytes seen over SDIO
-static uint32_t s_ws_frames_sent   = 0;   // diagnostic: how many WS frames we tried
-static bool     s_live_streaming   = true; // gates ws_broadcast (recording is separate)
+static uint32_t s_uart_bytes_total = 0;
+static uint32_t s_sdio_bytes_total = 0;
+static uint32_t s_publish_calls    = 0;   // how many times publish() was entered
+static uint32_t s_ws_broadcast_calls = 0; // ws_broadcast entries (all frames)
+static uint32_t s_ws_gated_off     = 0;   // dropped because live-streaming was off
+static uint32_t s_ws_no_clients    = 0;   // no WS fd in the table
+static uint32_t s_ws_queue_fail    = 0;   // httpd_queue_work returned non-OK
+static uint32_t s_ws_frames_sent   = 0;   // successfully queued
+static bool     s_live_streaming   = true;
+static int      s_client_count     = 0;   // how many WS fds populated (from ws_broadcast_ex snapshot)
 
 #define SDIO_RX_BUFSZ 512
 #define SDIO_RX_NBUF  8
@@ -142,27 +148,34 @@ static void ws_send_work_cb(void *arg) {
     free(w);
 }
 
-// The 'force' flag lets control frames (STATUS / CTL / EVT) still go through
-// when the user has paused the live stream — only KEY spam is gated.
-static void ws_broadcast_ex(const char *data, size_t len, bool force) {
+// Every call is force-through. If we want to pause the live stream, do it at
+// publish() level (skip the ws_broadcast call there). This keeps control /
+// status frames (STATUS, EVT) always live even while KEY frames are paused.
+static void ws_broadcast_ex(const char *data, size_t len) {
+    s_ws_broadcast_calls++;
     if (!s_http || !s_ws_lock || !len) return;
-    if (!force && !s_live_streaming) return;
     int fds[MAX_WS_CLIENTS];
     xSemaphoreTake(s_ws_lock, portMAX_DELAY);
     memcpy(fds, s_ws_fds, sizeof(fds));
     xSemaphoreGive(s_ws_lock);
+    int active = 0;
+    for (int i = 0; i < MAX_WS_CLIENTS; i++) if (fds[i]) active++;
+    s_client_count = active;
+    if (active == 0) { s_ws_no_clients++; return; }
     for (int i = 0; i < MAX_WS_CLIENTS; i++) {
         if (fds[i] == 0) continue;
         ws_send_work_t *w = malloc(sizeof(*w) + len);
         if (!w) continue;
         w->hd = s_http; w->fd = fds[i]; w->len = len;
         memcpy(w->data, data, len);
-        if (httpd_queue_work(s_http, ws_send_work_cb, w) != ESP_OK) { free(w); continue; }
+        if (httpd_queue_work(s_http, ws_send_work_cb, w) != ESP_OK) {
+            free(w); s_ws_queue_fail++; continue;
+        }
         s_ws_frames_sent++;
     }
 }
-static inline void ws_broadcast(const char *data, size_t len) { ws_broadcast_ex(data, len, false); }
-static inline void ws_broadcast_str(const char *s)            { ws_broadcast_ex(s, strlen(s), true); }
+static inline void ws_broadcast(const char *data, size_t len) { ws_broadcast_ex(data, len); }
+static inline void ws_broadcast_str(const char *s)            { ws_broadcast_ex(s, strlen(s)); }
 
 // --------------------- log write + rotate -----------------------------
 static void log_write(const char *line, size_t n) {
@@ -200,14 +213,53 @@ static void log_delete_all(void) {
     xSemaphoreGive(s_log_lock);
 }
 
-// --------------------- publish (broadcast + store) --------------------
-// All C6-generated frames go through here so tabs and disk see the same data.
+// Turn a wire frame ("KEY a\n", "KEY [LALT + 6]\n", "EVT KBD_CONNECT\n") into
+// clean log text ("a", "[LALT + 6]", "(KBD_CONNECT)\n") — no "KEY " prefix
+// and no artificial newline between characters.
+static size_t frame_to_log(const char *in, char *out, size_t out_sz) {
+    size_t n = strlen(in);
+    if (n && in[n-1] == '\n') n--;
+    if (!strncmp(in, "KEY ", 4)) {
+        const char *body = in + 4;
+        size_t bl = n - 4;
+        // Real Enter comes over the wire as the two chars '\\' + 'n'
+        if (bl == 2 && body[0] == '\\' && body[1] == 'n') {
+            if (out_sz < 2) return 0;
+            out[0] = '\n'; return 1;
+        }
+        if (bl > out_sz - 1) bl = out_sz - 1;
+        memcpy(out, body, bl);
+        return bl;
+    }
+    if (!strncmp(in, "EVT ", 4)) {
+        int m = snprintf(out, out_sz, "\n<%.*s>\n", (int)(n - 4), in + 4);
+        return m > 0 ? (size_t)m : 0;
+    }
+    if (n > out_sz - 1) n = out_sz - 1;
+    memcpy(out, in, n);
+    return n;
+}
+
+// All C6-generated frames go through here: WS gets the framed line unchanged
+// so the browser can distinguish frame types; the log file gets the cleaned
+// text produced by frame_to_log().
 static void publish(const char *line) {
     size_t n = strlen(line);
     if (!n) return;
+    s_publish_calls++;
     xRingbufferSend(s_live_ring, line, n, 0);
-    ws_broadcast(line, n);
-    log_write(line, n);
+    // Only KEY frames are gated by the live-stream toggle. EVT / STATUS always
+    // flow so pill colors stay in sync even while the user has KEY streaming
+    // paused.
+    bool is_key = !strncmp(line, "KEY ", 4);
+    if (!(is_key && !s_live_streaming)) {
+        ws_broadcast(line, n);
+    } else {
+        s_ws_gated_off++;
+    }
+    char clean[512];
+    size_t cl = frame_to_log(line, clean, sizeof(clean));
+    if (cl) log_write(clean, cl);
 }
 
 // ------------------------- HTTP handlers ------------------------------
@@ -248,18 +300,23 @@ static esp_err_t h_ws(httpd_req_t *r) {
 }
 
 static esp_err_t h_status(httpd_req_t *r) {
-    char body[256];
+    char body[512];
     size_t used = log_total_bytes();
     int n = snprintf(body, sizeof(body),
         "{\"chip\":\"esp32c6\",\"ssid\":\"%s\",\"kbd\":%s,\"mouse\":%s,"
          "\"recording\":%s,\"live\":%s,\"autoDownload\":%s,"
          "\"logBytes\":%u,\"logMax\":%u,\"warnBytes\":%u,"
-         "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,\"wsFrames\":%u}",
+         "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,"
+         "\"wsFrames\":%u,\"pub\":%u,\"wsCalls\":%u,\"wsGated\":%u,"
+         "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
         s_recording?"true":"false", s_live_streaming?"true":"false", s_auto_dl?"true":"false",
         (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
         (unsigned)s_sta_count, (unsigned)s_uart_bytes_total,
-        (unsigned)s_sdio_bytes_total, (unsigned)s_ws_frames_sent);
+        (unsigned)s_sdio_bytes_total, (unsigned)s_ws_frames_sent,
+        (unsigned)s_publish_calls, (unsigned)s_ws_broadcast_calls,
+        (unsigned)s_ws_gated_off, (unsigned)s_ws_no_clients,
+        (unsigned)s_ws_queue_fail, (unsigned)s_client_count);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, body, n);
