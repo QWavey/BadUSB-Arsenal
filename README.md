@@ -10,6 +10,37 @@ Windows sees the ESP32-P4 as `VID 303A / PID 4004` (HID keyboard + mouse
 composite). Every keystroke you make on the wired keyboard shows up in
 Notepad / your terminal / anywhere the PC treats keyboard input as text.
 
+**Web UI + persistent log**: the on-board ESP32-C6 runs an independent Wi-Fi
+AP (`P4-KeyLogger` / `changeme123`) that hosts a small web UI at
+http://192.168.4.1. Keystrokes travel from the P4 to the C6 over the SDIO bus
+that's already wired on the M-EXT (GPIO 14-19 + reset on GPIO54, no jumper
+needed), so the UI shows a live stream, records to SPIFFS with 1.5 MB
+rotation, and offers download / delete / start / stop / auto-download
+controls. See `c6-firmware/` for the source.
+
+## Web flasher — TODO
+
+This project **is not yet published to** [qwavey.github.io/flashers](https://qwavey.github.io/flashers/).
+Once it is, the flow for a new user should be:
+
+1. **Connect the ESP32-P4 first** (core Type-C on the MINI). Click *Flash P4*.
+2. **Move the cable to the C6 side** (U4 with switch B = 1 BOOT). Click
+   *Flash C6*.
+3. **Return switch B to 0 (WORK)**, plug the cable back into the core Type-C,
+   let both boards power-cycle.
+4. Test: PC should enumerate a HID keyboard (`VID 303A / PID 4004`). Connect
+   a phone to Wi-Fi `P4-KeyLogger` (password `changeme123`) and open
+   http://192.168.4.1 to see the live log.
+
+Two artifacts are produced by the CI / local build and need to be uploaded to
+the flasher page:
+
+- `firmware/build/hid_passthrough.bin` — flashed to the P4 at 0x10000 (plus
+  the bootloader at 0x2000 and partition table at 0x8000)
+- `c6-firmware/build/p4_keylogger_c6_ui.bin` — flashed to the C6 at 0x10000
+  (plus bootloader at 0x0 and partition table at 0x8000, with a custom
+  `partitions.csv` that includes a 2 MB SPIFFS `storage` region)
+
 ## Why this needed real work
 
 Both halves of the passthrough hit board-specific and IDF-specific brick walls.

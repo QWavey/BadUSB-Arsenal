@@ -190,6 +190,7 @@ const char WEB_UI_HTML[] =
 "}"
 
 "function connect(){"
+" try{if(ws&&(ws.readyState===0||ws.readyState===1))return;}catch(_){}"
 " ws=new WebSocket('ws://'+location.host+'/ws');"
 " ws.onopen=()=>setPill($('p_ws'),'ok','WebSocket: connected');"
 " ws.onmessage=e=>onWsData(e.data);"
@@ -197,6 +198,10 @@ const char WEB_UI_HTML[] =
 " ws.onerror=()=>setPill($('p_ws'),'warn','WebSocket: error');"
 "}"
 "connect();"
+// Mobile browsers throttle timers when the tab is backgrounded, so a WS
+// dropped while the phone slept can stay dead until user refreshes. Force a
+// reconnect the moment the tab becomes visible again.
+"document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){connect();refreshStatus();}});"
 
 "$('b_rec_start').onclick =()=>fetch('/rec/start', {method:'POST'}).then(refreshStatus);"
 "$('b_rec_stop').onclick  =()=>fetch('/rec/stop',  {method:'POST'}).then(refreshStatus);"

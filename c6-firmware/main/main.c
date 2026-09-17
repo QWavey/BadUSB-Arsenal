@@ -144,26 +144,37 @@ static void ws_send_work_cb(void *arg) {
         .payload = w->data, .len = w->len,
     };
     esp_err_t err = httpd_ws_send_frame_async(w->hd, w->fd, &f);
-    if (err != ESP_OK) ws_drop(w->fd);
+    // Only drop on HARD errors — socket closed / invalid arg. Transient
+    // errors (send-buffer full, timeout) mean "try again later", not "the
+    // client is gone". Dropping too eagerly was silently killing WS clients
+    // during typing bursts.
+    if (err == ESP_ERR_INVALID_ARG || err == ESP_ERR_INVALID_STATE ||
+        err == ESP_ERR_NOT_FOUND) {
+        ws_drop(w->fd);
+    }
     free(w);
 }
 
-// Every call is force-through. If we want to pause the live stream, do it at
-// publish() level (skip the ws_broadcast call there). This keeps control /
-// status frames (STATUS, EVT) always live even while KEY frames are paused.
+// Use httpd's own client tracking instead of the manual s_ws_fds table
+// (which was going empty and losing frames). httpd_get_client_list gives us
+// every socket the server currently knows about; httpd_ws_get_fd_info tells
+// us which of those are WebSocket clients.
 static void ws_broadcast_ex(const char *data, size_t len) {
     s_ws_broadcast_calls++;
-    if (!s_http || !s_ws_lock || !len) return;
-    int fds[MAX_WS_CLIENTS];
-    xSemaphoreTake(s_ws_lock, portMAX_DELAY);
-    memcpy(fds, s_ws_fds, sizeof(fds));
-    xSemaphoreGive(s_ws_lock);
-    int active = 0;
-    for (int i = 0; i < MAX_WS_CLIENTS; i++) if (fds[i]) active++;
-    s_client_count = active;
-    if (active == 0) { s_ws_no_clients++; return; }
-    for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-        if (fds[i] == 0) continue;
+    if (!s_http || !len) return;
+    size_t max_clients = CONFIG_LWIP_MAX_LISTENING_TCP;
+    if (max_clients > 16) max_clients = 16;
+    int fds[16];
+    size_t n_fds = max_clients;
+    if (httpd_get_client_list(s_http, &n_fds, fds) != ESP_OK) { s_ws_queue_fail++; return; }
+    int ws_clients = 0;
+    for (size_t i = 0; i < n_fds; i++) {
+        if (httpd_ws_get_fd_info(s_http, fds[i]) == HTTPD_WS_CLIENT_WEBSOCKET) ws_clients++;
+    }
+    s_client_count = ws_clients;
+    if (ws_clients == 0) { s_ws_no_clients++; return; }
+    for (size_t i = 0; i < n_fds; i++) {
+        if (httpd_ws_get_fd_info(s_http, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) continue;
         ws_send_work_t *w = malloc(sizeof(*w) + len);
         if (!w) continue;
         w->hd = s_http; w->fd = fds[i]; w->len = len;
@@ -273,22 +284,22 @@ static esp_err_t h_ws(httpd_req_t *r) {
     if (r->method == HTTP_GET) {
         int fd = httpd_req_to_sockfd(r);
         ws_add(fd);
-        // Send a hello frame that primes the UI status pills.
+        // On-connect priming: hello STATUS + recent live-ring backfill. Use
+        // the SYNC variant inside the request handler; async here is racy.
         char hello[128];
         int n = snprintf(hello, sizeof(hello),
             "\x1eSTATUS kbd=%d mouse=%d rec=%d adl=%d\n",
             s_kbd_present, s_mouse_present, s_recording, s_auto_dl);
         httpd_ws_frame_t hf = { .final=true, .type=HTTPD_WS_TYPE_TEXT,
                                 .payload=(uint8_t*)hello, .len=n };
-        httpd_ws_send_frame_async(r->handle, fd, &hf);
+        httpd_ws_send_frame(r, &hf);
 
-        // Backfill: last KB of live ring (recent keys).
         size_t item_sz = 0;
         char *item = (char *)xRingbufferReceiveUpTo(s_live_ring, &item_sz, 0, 2048);
         if (item && item_sz) {
             httpd_ws_frame_t f = { .final=true, .type=HTTPD_WS_TYPE_TEXT,
                                    .payload=(uint8_t*)item, .len=item_sz };
-            httpd_ws_send_frame_async(r->handle, fd, &f);
+            httpd_ws_send_frame(r, &f);
         }
         if (item) vRingbufferReturnItem(s_live_ring, item);
         return ESP_OK;
@@ -437,6 +448,16 @@ static esp_err_t http_up(void) {
     cfg.recv_wait_timeout = 5;
     cfg.send_wait_timeout = 10;
     cfg.stack_size = 8192;
+    // Keep the WS connection alive: without this the JS's /status poll every
+    // 3 s and any HTTP handler opens fresh sockets that push the WS out of
+    // the LRU cache. Result: WS drops within seconds and live view goes dark
+    // even though publish() is being called (see WS noClient counter).
+    cfg.max_open_sockets = 13;         // room for 1 WS + several transient GETs
+    cfg.lru_purge_enable = true;       // recycle the least-recent non-WS socket
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 5;
+    cfg.keep_alive_interval = 5;
+    cfg.keep_alive_count = 3;
     if (httpd_start(&s_http, &cfg) != ESP_OK) return ESP_FAIL;
     httpd_uri_t routes[] = {
         {"/",              HTTP_GET,  h_root,       NULL, false, false, NULL},
@@ -584,6 +605,9 @@ void app_main(void) {
     s_ws_lock  = xSemaphoreCreateMutex();
     s_log_lock = xSemaphoreCreateMutex();
     s_live_ring = xRingbufferCreate(LIVE_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
+    // Not persisted — always on at boot; user can only turn it off during
+    // this session with the Stop Live Logging button.
+    s_live_streaming = true;
 
     // Bring SDIO slave up BEFORE Wi-Fi so the host CMD5/CMD3 enumeration
     // isn't racing against Wi-Fi driver init on the C6's single core.
