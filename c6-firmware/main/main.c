@@ -77,6 +77,8 @@ static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
 static uint32_t s_uart_bytes_total = 0;   // diagnostic: total bytes seen on GPIO4
 static uint32_t s_sdio_bytes_total = 0;   // diagnostic: total bytes seen over SDIO
+static uint32_t s_ws_frames_sent   = 0;   // diagnostic: how many WS frames we tried
+static bool     s_live_streaming   = true; // gates ws_broadcast (recording is separate)
 
 #define SDIO_RX_BUFSZ 512
 #define SDIO_RX_NBUF  8
@@ -118,22 +120,49 @@ static void ws_drop(int fd) {
     for (int i = 0; i < MAX_WS_CLIENTS; i++) if (s_ws_fds[i] == fd) s_ws_fds[i] = 0;
     xSemaphoreGive(s_ws_lock);
 }
-static void ws_broadcast(const char *data, size_t len) {
-    if (!s_http || !s_ws_lock || !len) return;
+// httpd_ws_send_frame_async is asynchronous — the payload MUST stay valid until
+// the httpd worker actually sends it. Passing stack pointers straight to it is
+// a use-after-free (that's why the live view was blank). We instead schedule a
+// work item on the httpd thread with a heap copy that the worker frees.
+typedef struct {
+    httpd_handle_t hd;
+    int            fd;
+    size_t         len;
+    uint8_t        data[];        // flexible: full frame payload
+} ws_send_work_t;
+
+static void ws_send_work_cb(void *arg) {
+    ws_send_work_t *w = arg;
     httpd_ws_frame_t f = {
         .final = true, .fragmented = false, .type = HTTPD_WS_TYPE_TEXT,
-        .payload = (uint8_t *)data, .len = len,
+        .payload = w->data, .len = w->len,
     };
+    esp_err_t err = httpd_ws_send_frame_async(w->hd, w->fd, &f);
+    if (err != ESP_OK) ws_drop(w->fd);
+    free(w);
+}
+
+// The 'force' flag lets control frames (STATUS / CTL / EVT) still go through
+// when the user has paused the live stream — only KEY spam is gated.
+static void ws_broadcast_ex(const char *data, size_t len, bool force) {
+    if (!s_http || !s_ws_lock || !len) return;
+    if (!force && !s_live_streaming) return;
     int fds[MAX_WS_CLIENTS];
     xSemaphoreTake(s_ws_lock, portMAX_DELAY);
     memcpy(fds, s_ws_fds, sizeof(fds));
     xSemaphoreGive(s_ws_lock);
     for (int i = 0; i < MAX_WS_CLIENTS; i++) {
         if (fds[i] == 0) continue;
-        if (httpd_ws_send_frame_async(s_http, fds[i], &f) != ESP_OK) ws_drop(fds[i]);
+        ws_send_work_t *w = malloc(sizeof(*w) + len);
+        if (!w) continue;
+        w->hd = s_http; w->fd = fds[i]; w->len = len;
+        memcpy(w->data, data, len);
+        if (httpd_queue_work(s_http, ws_send_work_cb, w) != ESP_OK) { free(w); continue; }
+        s_ws_frames_sent++;
     }
 }
-static void ws_broadcast_str(const char *s) { ws_broadcast(s, strlen(s)); }
+static inline void ws_broadcast(const char *data, size_t len) { ws_broadcast_ex(data, len, false); }
+static inline void ws_broadcast_str(const char *s)            { ws_broadcast_ex(s, strlen(s), true); }
 
 // --------------------- log write + rotate -----------------------------
 static void log_write(const char *line, size_t n) {
@@ -223,13 +252,14 @@ static esp_err_t h_status(httpd_req_t *r) {
     size_t used = log_total_bytes();
     int n = snprintf(body, sizeof(body),
         "{\"chip\":\"esp32c6\",\"ssid\":\"%s\",\"kbd\":%s,\"mouse\":%s,"
-         "\"recording\":%s,\"autoDownload\":%s,\"logBytes\":%u,\"logMax\":%u,"
-         "\"warnBytes\":%u,\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u}",
+         "\"recording\":%s,\"live\":%s,\"autoDownload\":%s,"
+         "\"logBytes\":%u,\"logMax\":%u,\"warnBytes\":%u,"
+         "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,\"wsFrames\":%u}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
-        s_recording?"true":"false", s_auto_dl?"true":"false",
+        s_recording?"true":"false", s_live_streaming?"true":"false", s_auto_dl?"true":"false",
         (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
         (unsigned)s_sta_count, (unsigned)s_uart_bytes_total,
-        (unsigned)s_sdio_bytes_total);
+        (unsigned)s_sdio_bytes_total, (unsigned)s_ws_frames_sent);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, body, n);
@@ -280,6 +310,19 @@ static esp_err_t h_rec_stop(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_sendstr(r, "{\"recording\":false}");
 }
+static esp_err_t h_live_start(httpd_req_t *r) {
+    s_live_streaming = true;
+    ws_broadcast_str("EVT LIVE_START\n");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, "{\"live\":true}");
+}
+static esp_err_t h_live_stop(httpd_req_t *r) {
+    ws_broadcast_str("EVT LIVE_STOP\n");
+    s_live_streaming = false;
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, "{\"live\":false}");
+}
+
 static esp_err_t h_autodl_set(httpd_req_t *r) {
     char q[32] = { 0 };
     httpd_req_get_url_query_str(r, q, sizeof(q));
@@ -346,6 +389,8 @@ static esp_err_t http_up(void) {
         {"/log/delete",    HTTP_POST, h_log_delete, NULL, false, false, NULL},
         {"/rec/start",     HTTP_POST, h_rec_start,  NULL, false, false, NULL},
         {"/rec/stop",      HTTP_POST, h_rec_stop,   NULL, false, false, NULL},
+        {"/live/start",    HTTP_POST, h_live_start, NULL, false, false, NULL},
+        {"/live/stop",     HTTP_POST, h_live_stop,  NULL, false, false, NULL},
         {"/autodl",        HTTP_POST, h_autodl_set, NULL, false, false, NULL},
     };
     for (unsigned i = 0; i < sizeof(routes)/sizeof(routes[0]); i++)

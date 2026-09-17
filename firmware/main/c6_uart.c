@@ -43,6 +43,26 @@ static uint8_t s_prev_keys[6];
 static uint8_t s_prev_mod = 0;
 static bool    s_kbd_seen_connected;    // sticky: emitted CONNECT once
 static bool    s_mouse_seen_connected;
+static bool    s_mouse_interface_present; // set at USB HID enum, not treated as "connected" until first report
+
+// --- combo + hold-key tracking ---
+// The C6 web UI groups modifier + regular keys as "[LALT + 6 + h]" and reports
+// long solo presses as "[HELD KEY: J, 5 Seconds]". Rules from the user:
+//   * Modifier held while other keys pressed -> emit one combo on release
+//   * Solo key held > HOLD_MS -> emit HELD event on release (no HELD if in combo)
+#define HOLD_MS 1500
+
+typedef struct { uint8_t kc; uint32_t t_press_ms; } key_ts_t;
+static key_ts_t s_pressed[6];         // parallel to s_prev_keys
+static uint8_t  s_combo_mods_ever;    // union of mods that were down during combo
+static char     s_combo_buf[128];     // accumulated combo body ("6 + h + J")
+static int      s_combo_len;
+static bool     s_combo_active;
+
+static uint32_t now_ms(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; }
+
+// Forward decl — tx_line's body sits below the combo helpers.
+static void tx_line(const char *prefix, const char *body);
 
 static void reset_c6(void) {
     gpio_reset_pin(C6_RESET_PIN);
@@ -217,11 +237,67 @@ static const char *kb_special(uint8_t kc) {
     }
 }
 
-// Modifier byte bit -> name (in order LCTRL,LSHIFT,LALT,LWIN,RCTRL,RSHIFT,RALT,RWIN)
-static const char *mod_names[8] = {
-    "[LCTRL]", "[LSHIFT]", "[LALT]", "[WINDOWS]",
-    "[RCTRL]", "[RSHIFT]", "[RALT]", "[RWINDOWS]",
+// Modifier byte bit -> label used inside a combo ("LCTRL", "LALT", ...)
+static const char *mod_label[8] = {
+    "LCTRL", "LSHIFT", "LALT", "WINDOWS",
+    "RCTRL", "RSHIFT", "RALT", "RWINDOWS",
 };
+
+// Render one kc -> string. For printable this is the char; for special this is
+// the label without brackets (so we can nest inside "[LALT + F4]").
+static void render_key(uint8_t kc, bool shift, char *out, size_t out_sz) {
+    if (!out_sz) return;
+    char c = shift ? kb_shifted[kc] : kb_unshifted[kc];
+    if (c && c != '\n') { out[0] = c; out[1] = 0; return; }
+    const char *name = kb_special(kc);
+    if (name) {
+        if (name[0] == '\n' && name[1] == 0) { snprintf(out, out_sz, "ENTER"); return; }
+        // strip surrounding brackets from kb_special output for cleaner combos
+        size_t nl = strlen(name);
+        if (nl >= 2 && name[0] == '[' && name[nl-1] == ']') {
+            size_t inner = nl - 2 < out_sz - 1 ? nl - 2 : out_sz - 1;
+            memcpy(out, name + 1, inner); out[inner] = 0;
+        } else {
+            snprintf(out, out_sz, "%s", name);
+        }
+        return;
+    }
+    snprintf(out, out_sz, "0x%02X", kc);
+}
+
+static void combo_reset(void) { s_combo_len = 0; s_combo_buf[0] = 0; s_combo_mods_ever = 0; s_combo_active = false; }
+
+static void combo_append(const char *token) {
+    int need = (s_combo_len ? 3 : 0) + (int)strlen(token);
+    if (s_combo_len + need >= (int)sizeof(s_combo_buf) - 1) return;
+    if (s_combo_len) { memcpy(s_combo_buf + s_combo_len, " + ", 3); s_combo_len += 3; }
+    int tl = (int)strlen(token);
+    memcpy(s_combo_buf + s_combo_len, token, tl);
+    s_combo_len += tl;
+    s_combo_buf[s_combo_len] = 0;
+}
+
+// Flush the current combo to the C6. Called when the last modifier goes up.
+// If no keys were pressed while modifier was held, this emits "[MOD]" so lone
+// modifier presses are still logged (matches "Hello! [WINDOWS]" example).
+static void combo_flush(void) {
+    if (!s_combo_active && !s_combo_mods_ever) return;
+    char out[192]; int off = 0;
+    off += snprintf(out + off, sizeof(out) - off, "[");
+    bool first = true;
+    for (int i = 0; i < 8; i++) {
+        if (s_combo_mods_ever & (1u << i)) {
+            off += snprintf(out + off, sizeof(out) - off, "%s%s", first ? "" : " + ", mod_label[i]);
+            first = false;
+        }
+    }
+    if (s_combo_len) {
+        off += snprintf(out + off, sizeof(out) - off, "%s%s", first ? "" : " + ", s_combo_buf);
+    }
+    off += snprintf(out + off, sizeof(out) - off, "]");
+    tx_line("KEY", out);
+    combo_reset();
+}
 
 // Reusable DMA-capable buffer, avoids per-line heap_caps_malloc thrash.
 static uint8_t *s_tx_dma;
@@ -283,49 +359,105 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
     if (!s_ready || !buf || len < 8) return;
     uint8_t mod  = buf[0];
     const uint8_t *keys = &buf[2];
+    uint32_t now  = now_ms();
+    bool shift    = (mod & 0x22) != 0;
 
-    // Emit modifier press events on rising edges. Release is not shown — user
-    // wants "Hello! [WINDOWS]", not "Hello! [WINDOWS_DOWN] [WINDOWS_UP]".
-    uint8_t mod_pressed = mod & ~s_prev_mod;
-    for (int i = 0; i < 8; i++) {
-        if (mod_pressed & (1u << i)) tx_line("KEY", mod_names[i]);
+    // Any modifier down (any bit set) means we're in "combo capture" mode.
+    bool any_mod_now  = mod  != 0;
+    bool any_mod_prev = s_prev_mod != 0;
+
+    if (any_mod_now) {
+        s_combo_active   = true;
+        s_combo_mods_ever |= mod;   // remember every mod that was down during the combo
     }
-    s_prev_mod = mod;
 
-    bool shift = (mod & 0x22) != 0;   // L-shift or R-shift
-
+    // ---- key press edges ----
     for (int i = 0; i < 6; i++) {
         uint8_t kc = keys[i];
-        if (kc == 0 || kc == 1) continue;               // 0=idle, 1=rollover
-        if (keycode_was_pressed(kc)) continue;
+        if (kc == 0 || kc == 1) continue;
+        if (keycode_was_pressed(kc)) continue;    // still held from prev report
 
-        char c = shift ? kb_shifted[kc] : kb_unshifted[kc];
-        if (c) {
-            char body[2] = { c, 0 };
-            tx_line("KEY", body);
+        char tok[24];
+        render_key(kc, shift, tok, sizeof(tok));
+
+        if (any_mod_now) {
+            // Part of a combo — buffer, don't emit yet.
+            combo_append(tok);
         } else {
+            // Standalone press: emit immediately for typing responsiveness.
             const char *name = kb_special(kc);
-            if (name) {
-                // Real newline goes over the wire as an escape so a single line
-                // frame stays a single line; the JS renders "\\n" as "\n".
-                if (name[0] == '\n' && name[1] == 0) tx_line("KEY", "\\n");
-                else                                  tx_line("KEY", name);
+            if (name && name[0] == '\n' && name[1] == 0) {
+                tx_line("KEY", "\\n");
             } else {
-                // Unmapped: show the raw usage id so nothing is lost.
-                char body[16];
-                snprintf(body, sizeof(body), "[0x%02X]", kc);
-                tx_line("KEY", body);
+                char body[32];
+                if (tok[1] == 0 && tok[0] >= 0x20 && tok[0] < 0x7f) {
+                    // single printable char — emit as-is (no brackets)
+                    body[0] = tok[0]; body[1] = 0;
+                    tx_line("KEY", body);
+                } else {
+                    snprintf(body, sizeof(body), "[%s]", tok);
+                    tx_line("KEY", body);
+                }
             }
         }
+        // Record press-time (also mark this slot as tracked so release can find it)
+        for (int j = 0; j < 6; j++) {
+            if (s_pressed[j].kc == 0) { s_pressed[j].kc = kc; s_pressed[j].t_press_ms = now; break; }
+        }
     }
+
+    // ---- key release edges ----
+    for (int i = 0; i < 6; i++) {
+        uint8_t kc = s_prev_keys[i];
+        if (kc == 0 || kc == 1) continue;
+        // still pressed?
+        bool still = false;
+        for (int j = 0; j < 6; j++) if (keys[j] == kc) { still = true; break; }
+        if (still) continue;
+
+        // find the press time entry
+        for (int j = 0; j < 6; j++) {
+            if (s_pressed[j].kc != kc) continue;
+            uint32_t dur = now - s_pressed[j].t_press_ms;
+            s_pressed[j].kc = 0;
+            // Only report HELD for solo (no-modifier) press >= HOLD_MS.
+            if (!any_mod_now && !any_mod_prev && !s_combo_active && dur >= HOLD_MS) {
+                char tok[24]; render_key(kc, shift, tok, sizeof(tok));
+                char body[64];
+                snprintf(body, sizeof(body), "[HELD KEY: %s, %u.%u Seconds]",
+                         tok, (unsigned)(dur / 1000), (unsigned)((dur % 1000) / 100));
+                tx_line("KEY", body);
+            }
+            break;
+        }
+    }
+
+    // ---- modifier state transitions ----
+    // When ALL modifiers just released (any -> none), flush the combo.
+    if (!any_mod_now && any_mod_prev) {
+        combo_flush();
+        // Also clear any recorded press times so releasing keys after mod-up
+        // doesn't trigger spurious HELD messages.
+        memset(s_pressed, 0, sizeof(s_pressed));
+    }
+
+    s_prev_mod = mod;
     memcpy(s_prev_keys, keys, 6);
 }
 
+// Composite HID keyboards commonly expose a boot-mouse interface even when
+// there is no physical mouse — enumerating it fired MOUSE_CONNECT unconditionally
+// before, so the pill was always green. Now we only mark the mouse "connected"
+// after the first real mouse report arrives.
 void c6_uart_feed_mouse_report(const uint8_t *buf, size_t len) {
     (void)buf; (void)len;
+    if (s_mouse_interface_present && !s_mouse_seen_connected) {
+        s_mouse_seen_connected = true;
+        tx_line("EVT", "MOUSE_CONNECT");
+    }
 }
 
-void c6_uart_kbd_connect(void)     { s_kbd_seen_connected   = true;  tx_line("EVT", "KBD_CONNECT");     memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; }
-void c6_uart_kbd_disconnect(void)  { s_kbd_seen_connected   = false; tx_line("EVT", "KBD_DISCONNECT");  memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; }
-void c6_uart_mouse_connect(void)   { s_mouse_seen_connected = true;  tx_line("EVT", "MOUSE_CONNECT"); }
-void c6_uart_mouse_disconnect(void){ s_mouse_seen_connected = false; tx_line("EVT", "MOUSE_DISCONNECT"); }
+void c6_uart_kbd_connect(void)     { s_kbd_seen_connected   = true;  tx_line("EVT", "KBD_CONNECT");     memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+void c6_uart_kbd_disconnect(void)  { s_kbd_seen_connected   = false; tx_line("EVT", "KBD_DISCONNECT");  memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+void c6_uart_mouse_connect(void)   { s_mouse_interface_present = true; /* wait for first report before announcing */ }
+void c6_uart_mouse_disconnect(void){ s_mouse_interface_present = false; if (s_mouse_seen_connected) { s_mouse_seen_connected = false; tx_line("EVT", "MOUSE_DISCONNECT"); } }
