@@ -10,6 +10,19 @@ Windows sees the ESP32-P4 as `VID 303A / PID 4004` (HID keyboard + mouse
 composite). Every keystroke you make on the wired keyboard shows up in
 Notepad / your terminal / anywhere the PC treats keyboard input as text.
 
+**Keyboard layouts**: the decoder ships with US ANSI, German QWERTZ, and UK
+layouts (`firmware/main/kb_layouts.{h,c}`). Default is DE — change
+`s_layout = KL_DE` in `kb_layouts.c` for another. The HID Usage tables are
+what the keyboard sends; the layout tells us how to render each Usage as a
+glyph (y↔z, ä/ö/ü/ß, £, etc.).
+
+**Known bug (needs a fresh /bug-hunt tomorrow)**: on some boots the P4's USB
+Host doesn't pick up the keyboard on the first plug into a hub port. Cycling
+the keyboard between U1/U2/U3/U4 several times usually finds one that
+enumerates. Likely CH334 hub / TT-force-patch interaction with boot-time
+enumeration order. Not a data-path bug — once the port sticks it works fine
+for the whole session.
+
 **Web UI + persistent log**: the on-board ESP32-C6 runs an independent Wi-Fi
 AP (`P4-KeyLogger` / `changeme123`) that hosts a small web UI at
 http://192.168.4.1. Keystrokes travel from the P4 to the C6 over the SDIO bus

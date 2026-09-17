@@ -13,6 +13,7 @@
 // These are the same lines ESP-Hosted uses when the stock firmware is on the C6.
 
 #include "c6_uart.h"
+#include "kb_layouts.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -249,9 +250,16 @@ static const char *mod_label[8] = {
 };
 
 // Render one kc -> string. For printable this is the char; for special this is
-// the label without brackets (so we can nest inside "[LALT + F4]").
+// the label without brackets (so we can nest inside "[LALT + F4]"). We check
+// the current keyboard layout first so a German keyboard's y/z, ä/ö/ü/ß etc.
+// come out right.
 static void render_key(uint8_t kc, bool shift, char *out, size_t out_sz) {
     if (!out_sz) return;
+    const kb_layout_entry_t *layo = kb_layout_lookup(kb_layout_get(), kc);
+    if (layo) {
+        const char *s = shift ? layo->shifted : layo->unshifted;
+        if (s && *s) { snprintf(out, out_sz, "%s", s); return; }
+    }
     char c = shift ? kb_shifted[kc] : kb_unshifted[kc];
     if (c && c != '\n') { out[0] = c; out[1] = 0; return; }
     const char *name = kb_special(kc);
@@ -394,23 +402,19 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
         render_key(kc, shift, tok, sizeof(tok));
 
         if (any_mod_now) {
-            // Part of a combo — buffer, don't emit yet.
             combo_append(tok);
         } else {
-            // Standalone press: emit immediately for typing responsiveness.
             const char *name = kb_special(kc);
             if (name && name[0] == '\n' && name[1] == 0) {
                 tx_line("KEY", "\\n");
-            } else {
+            } else if (name) {
+                // Named non-printable key -> [ESC], [F4] etc.
                 char body[32];
-                if (tok[1] == 0 && tok[0] >= 0x20 && tok[0] < 0x7f) {
-                    // single printable char — emit as-is (no brackets)
-                    body[0] = tok[0]; body[1] = 0;
-                    tx_line("KEY", body);
-                } else {
-                    snprintf(body, sizeof(body), "[%s]", tok);
-                    tx_line("KEY", body);
-                }
+                if (name[0] == '[') tx_line("KEY", name);
+                else { snprintf(body, sizeof(body), "[%s]", name); tx_line("KEY", body); }
+            } else {
+                // Printable (may be multi-byte UTF-8 for umlauts etc.) -> emit as-is.
+                tx_line("KEY", tok);
             }
         }
         // Record press-time (also mark this slot as tracked so release can find it)
@@ -468,6 +472,13 @@ void c6_uart_feed_mouse_report(const uint8_t *buf, size_t len) {
         s_mouse_seen_connected = true;
         tx_line("EVT", "MOUSE_CONNECT");
     }
+}
+
+void c6_uart_set_layout(const char *name) {
+    if (!name) return;
+    if      (!strcmp(name, "DE")) kb_layout_set(KL_DE);
+    else if (!strcmp(name, "UK")) kb_layout_set(KL_UK);
+    else                          kb_layout_set(KL_US);
 }
 
 void c6_uart_kbd_connect(void)     { s_kbd_interface_present = true; /* wait for first report */ memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }

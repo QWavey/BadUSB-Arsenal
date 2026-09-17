@@ -31,3 +31,7 @@ void c6_uart_kbd_connect(void);
 void c6_uart_kbd_disconnect(void);
 void c6_uart_mouse_connect(void);
 void c6_uart_mouse_disconnect(void);
+
+// Set the active keyboard layout ("US", "DE", "UK"). Called by the SDIO RX
+// side of c6_uart.c when the C6 pushes a "SETLAYOUT <name>\n" packet.
+void c6_uart_set_layout(const char *name);
