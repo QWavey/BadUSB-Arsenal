@@ -58,6 +58,18 @@ static const char *TAG = "c6ui";
 #define NVS_NS           "kl"
 #define NVS_K_REC        "rec"
 #define NVS_K_AUTODL     "adl"
+#define NVS_K_LEDMODE    "ledm"
+
+// LED modes must match firmware/main/led.h
+#define LED_MODE_OFF       0
+#define LED_MODE_GREEN     1
+#define LED_MODE_KEYFLASH  2
+#define LED_MODE_RED       3
+#define LED_MODE_BLUE      4
+
+// SDIO scratch register position that the P4 polls. Range 0..27 or 32..63
+// (28..31 are the interrupt registers).
+#define SDIO_REG_LED_MODE  40
 
 // --------------------------- state ------------------------------------
 extern const char WEB_UI_HTML[];
@@ -75,6 +87,7 @@ static bool s_kbd_present = false;
 static bool s_mouse_present = false;
 static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
+static uint8_t  s_led_mode = LED_MODE_KEYFLASH;
 static uint32_t s_uart_bytes_total = 0;
 static uint32_t s_sdio_bytes_total = 0;
 static uint32_t s_publish_calls    = 0;   // how many times publish() was entered
@@ -83,7 +96,7 @@ static uint32_t s_ws_gated_off     = 0;   // dropped because live-streaming was 
 static uint32_t s_ws_no_clients    = 0;   // no WS fd in the table
 static uint32_t s_ws_queue_fail    = 0;   // httpd_queue_work returned non-OK
 static uint32_t s_ws_frames_sent   = 0;   // successfully queued
-static bool     s_live_streaming   = true;
+static bool     s_live_streaming   = false;   // off by default per user request
 static int      s_client_count     = 0;   // how many WS fds populated (from ws_broadcast_ex snapshot)
 
 #define SDIO_RX_BUFSZ 512
@@ -94,17 +107,26 @@ static void nvs_load_settings(void) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
     uint8_t v = 0;
-    if (nvs_get_u8(h, NVS_K_REC,    &v) == ESP_OK) s_recording = v ? true : false;
-    if (nvs_get_u8(h, NVS_K_AUTODL, &v) == ESP_OK) s_auto_dl   = v ? true : false;
+    if (nvs_get_u8(h, NVS_K_REC,     &v) == ESP_OK) s_recording = v ? true : false;
+    if (nvs_get_u8(h, NVS_K_AUTODL,  &v) == ESP_OK) s_auto_dl   = v ? true : false;
+    if (nvs_get_u8(h, NVS_K_LEDMODE, &v) == ESP_OK) s_led_mode  = v;
     nvs_close(h);
 }
 static void nvs_save_settings(void) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u8(h, NVS_K_REC,    s_recording ? 1 : 0);
-    nvs_set_u8(h, NVS_K_AUTODL, s_auto_dl   ? 1 : 0);
+    nvs_set_u8(h, NVS_K_REC,     s_recording ? 1 : 0);
+    nvs_set_u8(h, NVS_K_AUTODL,  s_auto_dl   ? 1 : 0);
+    nvs_set_u8(h, NVS_K_LEDMODE, s_led_mode);
     nvs_commit(h);
     nvs_close(h);
+}
+
+// Push the current LED mode over the SDIO scratch register so the P4 can
+// poll it. Safe to call from any context.
+static void push_led_mode(void) {
+    esp_err_t err = sdio_slave_write_reg(SDIO_REG_LED_MODE, s_led_mode);
+    if (err != ESP_OK) ESP_LOGW(TAG, "sdio_slave_write_reg(led): %s", esp_err_to_name(err));
 }
 
 static size_t file_size(const char *path) {
@@ -155,17 +177,17 @@ static void ws_send_work_cb(void *arg) {
     free(w);
 }
 
-// Use httpd's own client tracking instead of the manual s_ws_fds table
-// (which was going empty and losing frames). httpd_get_client_list gives us
-// every socket the server currently knows about; httpd_ws_get_fd_info tells
-// us which of those are WebSocket clients.
+// Use httpd's own client tracking (manual s_ws_fds bookkeeping was going
+// empty and losing frames). We keep the ws_send_work_t heap alloc: it's per-
+// worker, freed as soon as the send completes, and the payload copy is
+// necessary because the caller's buffer isn't guaranteed to outlive the
+// async send. A pool would help under sustained typing but the mallocs stay
+// bounded at (n WS clients) simultaneous in-flight.
 static void ws_broadcast_ex(const char *data, size_t len) {
     s_ws_broadcast_calls++;
     if (!s_http || !len) return;
-    size_t max_clients = CONFIG_LWIP_MAX_LISTENING_TCP;
-    if (max_clients > 16) max_clients = 16;
     int fds[16];
-    size_t n_fds = max_clients;
+    size_t n_fds = 16;
     if (httpd_get_client_list(s_http, &n_fds, fds) != ESP_OK) { s_ws_queue_fail++; return; }
     int ws_clients = 0;
     for (size_t i = 0; i < n_fds; i++) {
@@ -253,21 +275,31 @@ static size_t frame_to_log(const char *in, char *out, size_t out_sz) {
 
 // All C6-generated frames go through here: WS gets the framed line unchanged
 // so the browser can distinguish frame types; the log file gets the cleaned
-// text produced by frame_to_log().
+// text produced by frame_to_log(). Diagnostic EVTs like ENUM_RETRY are shown
+// live but skipped from the persistent log so they don't push out real
+// keystrokes at rotation time.
+static bool is_diagnostic_evt(const char *line) {
+    if (strncmp(line, "EVT ", 4)) return false;
+    const char *b = line + 4;
+    return !strncmp(b, "ENUM_RETRY",  10)
+        || !strncmp(b, "ENUM_OK",      7)
+        || !strncmp(b, "ENUM_FAIL",    9)
+        || !strncmp(b, "P4_READY",     8)
+        || !strncmp(b, "P4_ALIVE",     8);
+}
+
 static void publish(const char *line) {
     size_t n = strlen(line);
     if (!n) return;
     s_publish_calls++;
     xRingbufferSend(s_live_ring, line, n, 0);
-    // Only KEY frames are gated by the live-stream toggle. EVT / STATUS always
-    // flow so pill colors stay in sync even while the user has KEY streaming
-    // paused.
     bool is_key = !strncmp(line, "KEY ", 4);
     if (!(is_key && !s_live_streaming)) {
         ws_broadcast(line, n);
     } else {
         s_ws_gated_off++;
     }
+    if (is_diagnostic_evt(line)) return;   // keep the log clean
     char clean[512];
     size_t cl = frame_to_log(line, clean, sizeof(clean));
     if (cl) log_write(clean, cl);
@@ -319,7 +351,7 @@ static esp_err_t h_status(httpd_req_t *r) {
          "\"logBytes\":%u,\"logMax\":%u,\"warnBytes\":%u,"
          "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,"
          "\"wsFrames\":%u,\"pub\":%u,\"wsCalls\":%u,\"wsGated\":%u,"
-         "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u}",
+         "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u,\"ledMode\":%d}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
         s_recording?"true":"false", s_live_streaming?"true":"false", s_auto_dl?"true":"false",
         (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
@@ -327,7 +359,8 @@ static esp_err_t h_status(httpd_req_t *r) {
         (unsigned)s_sdio_bytes_total, (unsigned)s_ws_frames_sent,
         (unsigned)s_publish_calls, (unsigned)s_ws_broadcast_calls,
         (unsigned)s_ws_gated_off, (unsigned)s_ws_no_clients,
-        (unsigned)s_ws_queue_fail, (unsigned)s_client_count);
+        (unsigned)s_ws_queue_fail, (unsigned)s_client_count,
+        (int)s_led_mode);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, body, n);
@@ -389,6 +422,21 @@ static esp_err_t h_live_stop(httpd_req_t *r) {
     s_live_streaming = false;
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_sendstr(r, "{\"live\":false}");
+}
+
+static esp_err_t h_led_set(httpd_req_t *r) {
+    char q[32] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    char v[8] = { 0 };
+    httpd_query_key_value(q, "m", v, sizeof(v));
+    int m = atoi(v);
+    if (m < 0 || m > LED_MODE_BLUE) m = LED_MODE_KEYFLASH;
+    s_led_mode = (uint8_t)m;
+    nvs_save_settings();
+    push_led_mode();
+    httpd_resp_set_type(r, "application/json");
+    char body[32]; int n = snprintf(body, sizeof(body), "{\"ledMode\":%d}", (int)s_led_mode);
+    return httpd_resp_send(r, body, n);
 }
 
 static esp_err_t h_autodl_set(httpd_req_t *r) {
@@ -469,6 +517,7 @@ static esp_err_t http_up(void) {
         {"/rec/stop",      HTTP_POST, h_rec_stop,   NULL, false, false, NULL},
         {"/live/start",    HTTP_POST, h_live_start, NULL, false, false, NULL},
         {"/live/stop",     HTTP_POST, h_live_stop,  NULL, false, false, NULL},
+        {"/led",           HTTP_POST, h_led_set,    NULL, false, false, NULL},
         {"/autodl",        HTTP_POST, h_autodl_set, NULL, false, false, NULL},
     };
     for (unsigned i = 0; i < sizeof(routes)/sizeof(routes[0]); i++)
@@ -605,13 +654,15 @@ void app_main(void) {
     s_ws_lock  = xSemaphoreCreateMutex();
     s_log_lock = xSemaphoreCreateMutex();
     s_live_ring = xRingbufferCreate(LIVE_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
-    // Not persisted — always on at boot; user can only turn it off during
-    // this session with the Stop Live Logging button.
-    s_live_streaming = true;
+    // Live streaming defaults to OFF at boot so browsers connecting to the
+    // AP after keystrokes happened don't get flooded with a backlog. The
+    // user turns it on with the Start Live Logging button when they want it.
+    s_live_streaming = false;
 
     // Bring SDIO slave up BEFORE Wi-Fi so the host CMD5/CMD3 enumeration
     // isn't racing against Wi-Fi driver init on the C6's single core.
     if (sdio_slave_up() != ESP_OK) ESP_LOGE(TAG, "SDIO slave failed (P4 link disabled)");
+    push_led_mode();     // publish the saved led mode so the P4 picks it up as soon as it polls
 
     if (wifi_ap_up() != ESP_OK) ESP_LOGE(TAG, "Wi-Fi AP failed");
     if (storage_up() != ESP_OK) ESP_LOGE(TAG, "SPIFFS failed (log persistence disabled)");

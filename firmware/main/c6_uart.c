@@ -14,6 +14,7 @@
 
 #include "c6_uart.h"
 #include "kb_layouts.h"
+#include "led.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -42,10 +43,11 @@ static SemaphoreHandle_t s_lock;
 static sdmmc_card_t     *s_card;
 static uint8_t s_prev_keys[6];
 static uint8_t s_prev_mod = 0;
-static bool    s_kbd_seen_connected;      // has a real kbd report arrived?
-static bool    s_kbd_interface_present;   // just an enumerated interface (may be a composite mouse's fake kbd)
-static bool    s_mouse_seen_connected;
-static bool    s_mouse_interface_present;
+static bool     s_kbd_seen_connected;
+static bool     s_kbd_interface_present;
+static uint32_t s_kbd_iface_up_ms;         // ms tick when interface enumerated
+static bool     s_mouse_seen_connected;
+static bool     s_mouse_interface_present;
 
 // --- combo + hold-key tracking ---
 // The C6 web UI groups modifier + regular keys as "[LALT + 6 + h]" and reports
@@ -69,6 +71,11 @@ static uint32_t now_ms(void) { return xTaskGetTickCount() * portTICK_PERIOD_MS; 
 
 // Forward decl — tx_line's body sits below the combo helpers.
 static void tx_line(const char *prefix, const char *body);
+// Forward decl — led_poll_task's body sits below link_bringup_task.
+static void led_poll_task(void *arg);
+// The C6 exposes its "current LED mode" byte via SDIO scratch register at
+// CCCR position 0x60 + 40. Poll every 500 ms — cheap CMD52, negligible
+// SDIO bandwidth — and apply changes locally on the P4.
 
 static void reset_c6(void) {
     gpio_reset_pin(C6_RESET_PIN);
@@ -319,11 +326,20 @@ static uint8_t *s_tx_dma;
 static void tx_line(const char *prefix, const char *body) {
     if (!s_ready) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    // Zero the whole buffer so 4-byte-padded CMD53 tail has no garbage.
     memset(s_tx_dma, 0, TX_DMA_SZ);
     int n;
-    if (body && *body) n = snprintf((char*)s_tx_dma, TX_DMA_SZ, "%s %s\n", prefix, body);
-    else               n = snprintf((char*)s_tx_dma, TX_DMA_SZ, "%s\n", prefix);
+    // KEY frames whose body is a bracketed label ("[LALT + 6]", "[F4]",
+    // "[HELD KEY: J, 2 Seconds]") get a trailing space so subsequent typed
+    // text doesn't concatenate visually: "[LCTRL + a + x] s" instead of
+    // "[LCTRL + a + x]s". Non-bracket KEYs (single characters) stay tight.
+    bool wants_sep = body && body[0] == '['
+                     && !strcmp(prefix, "KEY");
+    if (body && *body) {
+        n = snprintf((char*)s_tx_dma, TX_DMA_SZ,
+                     wants_sep ? "%s %s \n" : "%s %s\n", prefix, body);
+    } else {
+        n = snprintf((char*)s_tx_dma, TX_DMA_SZ, "%s\n", prefix);
+    }
     if (n > 0 && n < TX_DMA_SZ) {
         esp_err_t err = sdio_raw_send(s_tx_dma, (size_t)n);
         if (err != ESP_OK) ESP_LOGW(TAG, "sdio_raw_send(%d): %s", n, esp_err_to_name(err));
@@ -345,7 +361,29 @@ static void link_bringup_task(void *arg) {
     }
     s_ready = true;
     tx_line("EVT", "P4_READY");
+    // Now that SDIO is up, spin up the reverse-channel poller so the C6
+    // web UI's LED mode changes reach us.
+    xTaskCreate(led_poll_task, "led_poll", 3072, NULL, 2, NULL);
     vTaskDelete(NULL);
+}
+
+#define C6_REG_LED_MODE_CCCR_ADDR   (0x60 + 40)
+
+// Definition follows below — link_bringup_task references it.
+static void led_poll_task(void *arg) {
+    (void)arg;
+    if (!s_card) { vTaskDelete(NULL); return; }
+    uint8_t last = 0xFF;
+    while (1) {
+        uint8_t v = 0;
+        esp_err_t err = sdmmc_io_read_byte(s_card, 0, C6_REG_LED_MODE_CCCR_ADDR, &v);
+        if (err == ESP_OK && v != last) {
+            // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
+            led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
+            last = v;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 }
 
 void c6_uart_init(void) {
@@ -362,14 +400,17 @@ void c6_uart_init(void) {
 void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
     if (!s_ready || !buf || len < 8) return;
 
-    // Only announce KBD_CONNECT the first time we see a report with actual
-    // data (a keycode down or a modifier held). Composite mice with a "boot
-    // keyboard" phantom interface send periodic empty reports; those don't
-    // count as a real keyboard being plugged in.
+    // Announce KBD_CONNECT on either (a) the first report with real data
+    // (fastest signal that this is a real keyboard) or (b) 300 ms after the
+    // interface enumerated, whichever comes first. This gets the pill green
+    // fast (~one HID poll cycle) for real keyboards while still filtering
+    // composite mice that only enumerate a phantom kbd but never send any
+    // report at all.
     if (s_kbd_interface_present && !s_kbd_seen_connected) {
         bool has_data = buf[0] != 0;
         for (int i = 0; !has_data && i < 6; i++) if (buf[2 + i] > 1) has_data = true;
-        if (has_data) {
+        uint32_t age = now_ms() - s_kbd_iface_up_ms;
+        if (has_data || age >= 300) {
             s_kbd_seen_connected = true;
             tx_line("EVT", "KBD_CONNECT");
         }
@@ -481,7 +522,22 @@ void c6_uart_set_layout(const char *name) {
     else                          kb_layout_set(KL_US);
 }
 
-void c6_uart_kbd_connect(void)     { s_kbd_interface_present = true; /* wait for first report */ memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
-void c6_uart_kbd_disconnect(void)  { s_kbd_interface_present = false; if (s_kbd_seen_connected) { s_kbd_seen_connected = false; tx_line("EVT", "KBD_DISCONNECT"); } memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+// Public escape hatch so hid_host_task.c can push status events (like
+// ENUM_RETRY N/8) to the C6 web UI without pulling in c6_uart's internals.
+void c6_uart_send_evt(const char *body) { if (body) tx_line("EVT", body); }
+
+void c6_uart_kbd_connect(void)     { s_kbd_interface_present = true; s_kbd_iface_up_ms = now_ms(); memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+void c6_uart_kbd_disconnect(void) {
+    // Only emit DISCONNECT if we ever emitted CONNECT — otherwise a composite
+    // mouse's phantom kbd interface unplug would flash the pill red for no
+    // reason.
+    bool announce = s_kbd_seen_connected;
+    s_kbd_interface_present = false;
+    s_kbd_seen_connected    = false;
+    if (announce) tx_line("EVT", "KBD_DISCONNECT");
+    memset(s_prev_keys, 0, sizeof(s_prev_keys));
+    s_prev_mod = 0; combo_reset();
+    memset(s_pressed, 0, sizeof(s_pressed));
+}
 void c6_uart_mouse_connect(void)   { s_mouse_interface_present = true; /* wait for first report */ }
 void c6_uart_mouse_disconnect(void){ s_mouse_interface_present = false; if (s_mouse_seen_connected) { s_mouse_seen_connected = false; tx_line("EVT", "MOUSE_DISCONNECT"); } }

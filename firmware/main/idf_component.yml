@@ -3,3 +3,4 @@ dependencies:
   idf: ">=5.3"
   espressif/usb_host_hid: "^1.0.5"
   espressif/esp_tinyusb: "^1.6.0"
+  espressif/led_strip: "^2.5.0"

@@ -14,6 +14,7 @@
 
 #include "hid_bridge.h"
 #include "c6_uart.h"
+#include "led.h"
 
 // Runtime USB PHY selector — swaps FS_PHY1↔FS_PHY2 assignments.
 // After swap: OTG_FS drives GPIO24/25 (the core Type-C on this board).
@@ -77,38 +78,70 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 // Boot keyboard input report layout: modifier(1) + reserved(1) + keycode[6]
 // Boot mouse input report layout:    buttons(1) + dx(int8) + dy(int8) [+ wheel]
 
+// Send every report in order — for keyboards, intermediate states matter
+// (Shift down + Shift+Tab + Tab up must ALL land). Retry the pending report
+// until it goes out; TinyUSB's tud_hid_ready flips true on every USB frame
+// (1 ms) so worst case we're re-trying a few times.
+//
+// If the PC isn't mounted (boot, suspend, cable not fully seated) we DROP
+// buffered reports rather than hold them — otherwise the whole backlog gets
+// dumped into whichever window has focus the moment the PC comes back,
+// which the user saw as "usb HID automatic spam" after enumeration.
 static void forward_task(void *arg) {
     hid_bridge_msg_t m;
+    bool have_pending = false;
+    bool was_mounted = false;
+    TickType_t mount_grace_end = 0;
     while (1) {
-        if (xQueueReceive(g_hid_bridge_q, &m, portMAX_DELAY) != pdTRUE) continue;
-        if (!tud_mounted()) continue;
-
-        // If TinyUSB is still transmitting the previous IN packet, wait very
-        // briefly for it to drain. Skips only after a hard 5 ms stall which
-        // means the PC isn't polling — dropping is preferable to backing up.
-        int spins = 0;
-        while (!tud_hid_ready() && spins < 50) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            spins++;
+        bool now_mounted = tud_mounted();
+        // Detect the unmounted -> mounted edge and open a 400 ms grace window
+        // during which we DROP incoming reports. That kills the spam-on-
+        // enumerate bug (PC finishes SET_CONFIGURATION, we start dumping the
+        // queue before Windows has bound our HID; text lands in the wrong
+        // window as a rapid flood).
+        if (now_mounted && !was_mounted) {
+            mount_grace_end = xTaskGetTickCount() + pdMS_TO_TICKS(400);
         }
-        if (!tud_hid_ready()) continue;
+        was_mounted = now_mounted;
 
+        if (!have_pending) {
+            if (xQueueReceive(g_hid_bridge_q, &m, portMAX_DELAY) != pdTRUE) continue;
+            have_pending = true;
+        }
+        if (!now_mounted || xTaskGetTickCount() < mount_grace_end) {
+            // Drop the pending one and drain the queue so we don't hold onto
+            // pre-mount / grace-window keystrokes.
+            have_pending = false;
+            hid_bridge_msg_t drop;
+            while (xQueueReceive(g_hid_bridge_q, &drop, 0) == pdTRUE) { /* discard */ }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (!tud_hid_ready())  { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+
+        bool sent = false;
         if (m.kind == HID_REP_KIND_KEYBOARD && m.len >= 8) {
-            uint8_t modifier = m.data[0];
-            uint8_t keycodes[6];
-            memcpy(keycodes, &m.data[2], 6);
-            tud_hid_keyboard_report(REPORT_ID_KEYBOARD, modifier, keycodes);
+            uint8_t mod = m.data[0];
+            uint8_t kcs[6]; memcpy(kcs, &m.data[2], 6);
+            sent = tud_hid_keyboard_report(REPORT_ID_KEYBOARD, mod, kcs);
         } else if (m.kind == HID_REP_KIND_MOUSE && m.len >= 3) {
             uint8_t buttons = m.data[0];
             int8_t dx = (int8_t)m.data[1];
             int8_t dy = (int8_t)m.data[2];
-            tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, dx, dy, 0, 0);
+            sent = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, dx, dy, 0, 0);
+        } else {
+            sent = true;   // unknown kind, drop
         }
+        if (sent) have_pending = false;
+        else      vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
 void app_main(void) {
     ESP_LOGI(TAG, "Starting HID passthrough on ESP32-P4");
+
+    // Status LED first so we get a green idle blink as boot progresses.
+    led_init();
 
     // Bring up the SDIO link to the C6 keylogger web UI. Runs in a background
     // task so app_main isn't blocked if SDIO enum fails.
@@ -122,7 +155,9 @@ void app_main(void) {
     // carries the OTG-FS controller instead of USB-Serial-JTAG. USJ / COM34 dies.
     usb_phy_swap_to_otgfs_on_core_typec();
 
-    g_hid_bridge_q = xQueueCreate(32, sizeof(hid_bridge_msg_t));
+    // 128 slots so a brief TinyUSB stall (PC suspend / poll gap) can't overflow
+    // and start dropping input reports from the physical keyboard.
+    g_hid_bridge_q = xQueueCreate(128, sizeof(hid_bridge_msg_t));
     configASSERT(g_hid_bridge_q);
 
     const tinyusb_config_t tcfg = {
