@@ -6,38 +6,45 @@ hub, the ESP32-P4 reads it as a host, and simultaneously presents itself to the
 PC as a HID keyboard on the *same* Type-C we flash from. No hardware mod, no
 EFUSE burn.
 
-Windows sees the ESP32-P4 as `VID 303A / PID 4004` (HID keyboard + mouse
-composite). Every keystroke you make on the wired keyboard shows up in
-Notepad / your terminal / anywhere the PC treats keyboard input as text.
+Windows sees the ESP32-P4 as `VID 303A / PID 4B44` with `bcdDevice 0x0201`
+(HID keyboard + mouse composite). The custom PID + bcdDevice revision (set in
+`firmware/sdkconfig.defaults`) keeps Windows from reusing a stale driver+devnode
+cache entry for the default `0x4004` — a fresh PID forces a clean enumeration.
+Every keystroke you make on the wired keyboard shows up in Notepad / your
+terminal / anywhere the PC treats keyboard input as text.
 
 **Keyboard layouts**: the decoder ships with US ANSI, German QWERTZ, and UK
-layouts (`firmware/main/kb_layouts.{h,c}`). Default is DE — change
-`s_layout = KL_DE` in `kb_layouts.c` for another. The HID Usage tables are
-what the keyboard sends; the layout tells us how to render each Usage as a
-glyph (y↔z, ä/ö/ü/ß, £, etc.).
+layouts (`firmware/main/kb_layouts.{h,c}`), default DE. The layout is
+switchable **at runtime from the web UI** (Settings → Keyboard layout): the
+C6 writes a scratch SDIO register, the P4 polls it and calls `kb_layout_set()`
+— no reflash. AltGr is decoded properly on DE (RALT = AltGr → €, @, ç, ², ³, …),
+and RALT is excluded from combo capture on DE so AltGr+key never logs as a
+fake `[RALT + …]` combo.
 
-**Known bugs (needs a fresh /bug-hunt tomorrow)**:
+**Known issues (mitigated in firmware, re-verify on hardware)**:
 
 1. **Port-flap on cold boot** — the P4's USB Host doesn't always pick up the
-   keyboard on the first plug into a hub port. Cycling the keyboard between
-   U1/U2/U3/U4 several times usually finds one that enumerates. Likely
-   CH334 hub / TT-force-patch interaction with boot-time enumeration order.
-   Not a data-path bug — once the port sticks it works fine for the whole
-   session.
-2. **SHIFT / TAB do not work as combo modifiers on the PC side** — e.g.
-   Shift+Tab (reverse-tab navigation) and Tab+other are not delivered as a
-   combo through TinyUSB, even though the P4 receives them fine (the web UI
-   log shows the raw events). Likely the HID report path is dropping the
-   modifier byte in some race between the host-side callback and the
-   TinyUSB device queue. Deferred for a proper look tomorrow.
+   keyboard on the first plug into a hub port. Mitigations in place: a 12-attempt
+   `port_flap_watchdog` (`hid_host_task.c`) that pokes the hub / full-resets the
+   HID stack when nothing attaches, a 250 ms settle window + explicit
+   all-keys-released flush on every mount in `forward_task`, and a flush on
+   keyboard disconnect. Not a data-path bug — once the port sticks it works for
+   the whole session.
+2. **SHIFT/TAB logging** — Shift is deliberately excluded from combo capture
+   (only Ctrl/Alt/Win form combos), so Shift+Tab logs `[TAB]` rather than
+   `[SHIFT + TAB]`; the PC still receives the full 8-byte report including the
+   modifier. If you rely on the log distinguishing shifted Tab, that is the
+   known gap.
 
 **Web UI + persistent log**: the on-board ESP32-C6 runs an independent Wi-Fi
 AP (`P4-KeyLogger` / `changeme123`) that hosts a small web UI at
-http://192.168.4.1. Keystrokes travel from the P4 to the C6 over the SDIO bus
-that's already wired on the M-EXT (GPIO 14-19 + reset on GPIO54, no jumper
-needed), so the UI shows a live stream, records to SPIFFS with 1.5 MB
-rotation, and offers download / delete / start / stop / auto-download
-controls. See `c6-firmware/` for the source.
+http://192.168.4.1. Keystrokes travel from the P4 to the C6 over the **SDIO
+bus** that's already wired on the M-EXT (GPIO 14-19 + reset on GPIO54, no
+jumper needed — the P4 boots as SDIO host, resets the C6, and streams frames),
+so the UI shows a live stream, records to SPIFFS with a 1.6 MB total budget
+(current + rotated old file — sized so both always fit the 2 MB SPIFFS
+`storage` partition), and offers download / delete / start / stop /
+auto-download / LED / layout controls. See `c6-firmware/` for the source.
 
 ## Web flasher — TODO
 
@@ -49,7 +56,7 @@ Once it is, the flow for a new user should be:
    *Flash C6*.
 3. **Return switch B to 0 (WORK)**, plug the cable back into the core Type-C,
    let both boards power-cycle.
-4. Test: PC should enumerate a HID keyboard (`VID 303A / PID 4004`). Connect
+4. Test: PC should enumerate a HID keyboard (`VID 303A / PID 4B44`). Connect
    a phone to Wi-Fi `P4-KeyLogger` (password `changeme123`) and open
    http://192.168.4.1 to see the live log.
 
@@ -124,16 +131,20 @@ long enough for esptool to talk to the chip.
   ┌────────────▼───────────────┐
   │  ESP32-P4  OTG-HS = HOST   │  <- hid_host_task.c
   │            OTG-FS = DEVICE │  <- main.c (TinyUSB HID)
-  └────────────┬───────────────┘
-               │  Core Type-C (PHY-swapped)
-  ┌────────────▼───────────────┐
-  │  Your PC — sees HID kbd    │
-  └────────────────────────────┘
+  └────────┬───────────┬───────┘
+           │           │  Core Type-C (PHY-swapped)
+           │ SDIO (GPIO14-19)   ▼
+  ┌────────▼───────────┐ ┌─────────────┐
+  │ ESP32-C6 (Wi-Fi AP)│ │ Your PC     │
+  │ web UI + SPIFFS log│ │ sees HID kbd│
+  └────────────────────┘ └─────────────┘
 ```
 
-Between the two USB tasks is a FreeRTOS queue (`g_hid_bridge_q`) that carries
+Between the two USB paths is a FreeRTOS queue (`g_hid_bridge_q`) that carries
 raw HID reports. Host callback publishes, `forward_task` pops and calls
-`tud_hid_keyboard_report()` / `tud_hid_mouse_report()`.
+`tud_hid_keyboard_report()` / `tud_hid_mouse_report()`. The same frames are
+mirrored to the C6 over SDIO, which decodes them (layout-aware), logs and
+displays them.
 
 ## Build & flash
 
@@ -150,7 +161,7 @@ idf.py -p COMxx build flash
 
 After the first successful flash, the app takes over. **COM34 (USJ)
 disappears** because of the PHY swap. Windows enumerates a new
-`VID 303A / PID 4004` HID composite keyboard+mouse.
+`VID 303A / PID 4B44` HID composite keyboard+mouse (bcdDevice `0x0201`).
 
 To flash again: hold **BOOT** on the MINI board, tap **RST**, release
 **BOOT**. ROM ignores the PHY swap register; COM34 comes back for esptool.
@@ -184,13 +195,15 @@ esp32-p4-hub-keylogger/
 ├── fs-force.patch                ← FSLSSupp HAL patch (upstream not merged)
 ├── firmware/                     ← ESP32-P4 firmware (HID passthrough)
 │   ├── CMakeLists.txt
-│   ├── sdkconfig.defaults
+│   ├── sdkconfig.defaults        ← custom PID 4B44 + bcdDevice 0x0201
 │   └── main/
-│       ├── main.c                ← TinyUSB HID Device + PHY swap
+│       ├── main.c                ← TinyUSB HID Device + PHY swap + forward_task
+│       ├── c6_uart.c             ← P4→C6 SDIO link, HID decode, AltGr/combos
+│       ├── kb_layouts.c/.h       ← US / DE / UK runtime-selectable tables
 │       ├── hid_bridge.h          ← shared queue types
-│       ├── hid_host_task.c       ← USB Host + HID host
-│       ├── usb_probe.c           ← diagnostic firmware (not built by default)
-│       └── device_only_test.c    ← test firmware (not built by default)
+│       ├── hid_host_task.c       ← USB Host + HID host + port-flap watchdog
+│       ├── led.c/.h              ← status LED (C6-controlled modes)
+│       └── tests/                 ← bring-up diagnostics (not built; ref only)
 ├── c6-firmware/                  ← ESP32-C6 firmware (Wi-Fi + web UI)
 │   ├── CMakeLists.txt
 │   ├── sdkconfig.defaults
@@ -228,11 +241,11 @@ is just not there.
 
 ### Optional — actually wire keystrokes from P4 to C6
 
-The C6 UI reads from UART1 RX on **C6 GPIO4** at 115200 baud. For the P4 to
-feed keystrokes, wire a jumper from **P4 GPIO37 (TX0)** to **C6 GPIO4**, plus
-a common GND. The P4 firmware currently doesn't emit anything on that TX
-line (see TODO in main.c); until that's added, the web UI works but shows no
-keystrokes.
+No jumper needed: the P4 enumerates the C6 as an SDIO slave at boot (the
+M-EXT already routes GPIO 14-19 + reset GPIO54 between the chips) and streams
+line-framed HID frames over CMD53. The C6 also still listens on UART1 RX
+(GPIO4) at 115200 for the same frame format if you ever want a wire-based
+tap instead.
 
 ## Board pinout summary
 

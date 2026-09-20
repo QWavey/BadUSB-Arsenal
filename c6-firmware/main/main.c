@@ -453,26 +453,37 @@ static esp_err_t h_autodl_set(httpd_req_t *r) {
 }
 
 // ------------------------- Wi-Fi AP + HTTP ----------------------------
+static volatile bool s_ap_ready = false;
+
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg; (void)data;
     if (base != WIFI_EVENT) return;
-    if (id == WIFI_EVENT_AP_STACONNECTED)         { s_sta_count++; ESP_LOGI(TAG, "STA+"); }
+    if (id == WIFI_EVENT_AP_START)         { s_ap_ready = true;  ESP_LOGI(TAG, "WIFI_EVENT_AP_START"); }
+    else if (id == WIFI_EVENT_AP_STOP)     { s_ap_ready = false; ESP_LOGW(TAG, "WIFI_EVENT_AP_STOP"); }
+    else if (id == WIFI_EVENT_AP_STACONNECTED)         { s_sta_count++; ESP_LOGI(TAG, "STA+"); }
     else if (id == WIFI_EVENT_AP_STADISCONNECTED) { if (s_sta_count) s_sta_count--; ESP_LOGI(TAG, "STA-"); }
 }
 
 static esp_err_t wifi_ap_up(void) {
+    // Every return value checked and logged: the v1 code ignored them all and
+    // logged "AP up" even when esp_wifi_start() had failed — which is exactly
+    // how a permanently-invisible wifi failure looked.
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase(); err = nvs_flash_init();
     }
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { ESP_LOGE(TAG, "nvs_flash_init: %s", esp_err_to_name(err)); return err; }
 
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_ap();
+    if ((err = esp_netif_init()) != ESP_OK) { ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err)); return err; }
+    if ((err = esp_event_loop_create_default()) != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(err)); return err;
+    }
+    if (!esp_netif_create_default_wifi_ap()) {
+        ESP_LOGE(TAG, "esp_netif_create_default_wifi_ap failed"); return ESP_FAIL;
+    }
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    if ((err = esp_wifi_init(&init)) != ESP_OK) return err;
+    if ((err = esp_wifi_init(&init)) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err)); return err; }
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
 
     wifi_config_t ap = { 0 };
@@ -483,11 +494,30 @@ static esp_err_t wifi_ap_up(void) {
     ap.ap.max_connection = AP_MAX_STA;
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
-    esp_wifi_set_config(WIFI_IF_AP, &ap);
-    esp_wifi_start();
-    ESP_LOGI(TAG, "AP \"%s\" up on channel %d", AP_SSID, AP_CHANNEL);
-    return ESP_OK;
+    if ((err = esp_wifi_set_mode(WIFI_MODE_AP)) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err)); return err; }
+    if ((err = esp_wifi_set_config(WIFI_IF_AP, &ap)) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err)); return err; }
+
+    // Bounded start with retries: a transient RF/PHY failure shouldn't be a
+    // permanent one-shot death (it was invisible before — err was ignored).
+    err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        err = esp_wifi_start();
+        if (err == ESP_OK) break;
+        ESP_LOGE(TAG, "esp_wifi_start #%d: %s", attempt, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    if (err != ESP_OK) return err;
+
+    // esp_wifi_start() returning OK does not prove the radio is hosting; wait
+    // briefly for the driver's AP_START event to confirm the frame is really
+    // being broadcast.
+    for (int i = 0; i < 40 && !s_ap_ready; i++) vTaskDelay(pdMS_TO_TICKS(50));
+    if (s_ap_ready) {
+        ESP_LOGI(TAG, "AP \"%s\" up on channel %d", AP_SSID, AP_CHANNEL);
+        return ESP_OK;
+    }
+    ESP_LOGW(TAG, "esp_wifi_start()=OK but WIFI_EVENT_AP_START never fired (channel %d)", AP_CHANNEL);
+    return ESP_ERR_INVALID_STATE;
 }
 
 static esp_err_t http_up(void) {
@@ -659,14 +689,41 @@ void app_main(void) {
     // user turns it on with the Start Live Logging button when they want it.
     s_live_streaming = false;
 
+    // NVS up front (idempotent — wifi_ap_up also initialises it) so that
+    // settings are loaded before anything is pushed to the P4.
+    esp_err_t nerr = nvs_flash_init();
+    if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase(); nerr = nvs_flash_init();
+    }
+    if (nerr != ESP_OK) ESP_LOGE(TAG, "nvs_flash_init: %s", esp_err_to_name(nerr));
+
     // Bring SDIO slave up BEFORE Wi-Fi so the host CMD5/CMD3 enumeration
     // isn't racing against Wi-Fi driver init on the C6's single core.
-    if (sdio_slave_up() != ESP_OK) ESP_LOGE(TAG, "SDIO slave failed (P4 link disabled)");
-    push_led_mode();     // publish the saved led mode so the P4 picks it up as soon as it polls
+    if (sdio_slave_up() != ESP_OK) {
+        ESP_LOGE(TAG, "SDIO slave failed (P4 link disabled)");
+        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_RED);   // best effort
+    } else {
+        // LED telemetry (the only live channel — the C6 has no usable serial
+        // console in this build). The P4 renders scratch reg 40 -> the RGB LED
+        // every 500 ms, so:
+        //   GREEN = SDIO up, booting          (frozen GREEN = crashed before wifi verdict)
+        //   BLUE  = Wi-Fi AP confirmed up     (held ~4 s, then saved mode)
+        //   RED   = Wi-Fi AP failed           (stays RED)
+        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_GREEN);
+    }
+    nvs_load_settings();     // load first so push_led_mode publishes the SAVED mode
 
-    if (wifi_ap_up() != ESP_OK) ESP_LOGE(TAG, "Wi-Fi AP failed");
+    if (wifi_ap_up() == ESP_OK) {
+        // AP really hosts -> BLUE, hold it long enough to be seen, then
+        // restore the saved operating mode.
+        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_BLUE);
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        push_led_mode();     // saved mode (default KEYFLASH = dim green idle)
+    } else {
+        ESP_LOGE(TAG, "Wi-Fi AP failed");
+        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_RED);   // stay RED
+    }
     if (storage_up() != ESP_OK) ESP_LOGE(TAG, "SPIFFS failed (log persistence disabled)");
-    nvs_load_settings();
     if (http_up()   != ESP_OK) ESP_LOGE(TAG, "HTTP server failed");
 
     xTaskCreate(uart_task, "uart_rx", 4096, NULL, 5, NULL);

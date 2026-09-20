@@ -27,7 +27,6 @@ static const kb_layout_entry_t de_1d = { "z",  "Z", "" };     // 0x1d Y-position
 static const kb_layout_entry_t de_1e = { "1", "!",  "" };
 static const kb_layout_entry_t de_1f = { "2", "\"", "\xc2\xb2" }; // " and ²
 static const kb_layout_entry_t de_20 = { "3", "\xc2\xa7", "\xc2\xb3" }; // § ³
-static const kb_layout_entry_t de_21 = { "4", "$",  "" };
 static const kb_layout_entry_t de_22 = { "5", "%",  "" };
 static const kb_layout_entry_t de_23 = { "6", "&",  "" };
 static const kb_layout_entry_t de_24 = { "7", "/",  "{" };
@@ -35,7 +34,7 @@ static const kb_layout_entry_t de_25 = { "8", "(",  "[" };
 static const kb_layout_entry_t de_26 = { "9", ")",  "]" };
 static const kb_layout_entry_t de_27 = { "0", "=",  "}" };
 static const kb_layout_entry_t de_2d = { "\xc3\x9f", "?", "\\" };   // ß ?
-static const kb_layout_entry_t de_2e = { "\xc2\xb4", "`", "" };     // ´ ` (dead)
+static const kb_layout_entry_t de_2e = { "\xc2\xb4", "`", "~" };     // ´ ` ~
 
 // Row: q w e r t z u i o p ü +
 static const kb_layout_entry_t de_2f = { "\xc3\xbc", "\xc3\x9c", "" }; // ü Ü
@@ -46,6 +45,13 @@ static const kb_layout_entry_t de_33 = { "\xc3\xb6", "\xc3\x96", "" }; // ö Ö
 static const kb_layout_entry_t de_34 = { "\xc3\xa4", "\xc3\x84", "" }; // ä Ä
 static const kb_layout_entry_t de_35 = { "^", "\xc2\xb0", "" };       // ^ °
 static const kb_layout_entry_t de_31 = { "#", "'", "" };              // # '
+
+// AltGr glyphs (RALT on DE = AltGr): € @ ç. Without these, AltGr+key
+// renders as plain letters or a spurious [RALT + ...] combo.
+static const kb_layout_entry_t de_21 = { "4", "$", "\xe2\x82\xac" };  // €
+static const kb_layout_entry_t de_06 = { "c", "C", "\xc3\xa7" };      // ç
+static const kb_layout_entry_t de_08 = { "e", "E", "\xe2\x82\xac" };  // €
+static const kb_layout_entry_t de_14 = { "q", "Q", "@" };             // @
 
 // Row: < y x c v b n m , . -
 static const kb_layout_entry_t de_64 = { "<", ">", "|" };   // non-US backslash
@@ -63,6 +69,9 @@ static const kb_layout_entry_t uk_64 = { "\\","|",  "" };            // <> key -
 const kb_layout_entry_t *kb_layout_lookup(kb_layout_t layout, uint8_t kc) {
     if (layout == KL_DE) {
         switch (kc) {
+        case 0x06: return &de_06;
+        case 0x08: return &de_08;
+        case 0x14: return &de_14;
         case 0x1c: return &de_1c;
         case 0x1d: return &de_1d;
         case 0x1e: return &de_1e;

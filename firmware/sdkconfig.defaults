@@ -6,8 +6,10 @@ CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_ESP32P4_REV_MIN_100=y
 
-# USB Host = HS peripheral (port 0), TinyUSB device = FS peripheral (port 1)
-# TinyUSB port selection: 0 = HS, 1 = FS. We put the DEVICE on HS to test U4-Slave routing.
+# USB Host = HS peripheral (port 0, CH334 hub), TinyUSB device = FS peripheral (port 1).
+# In app_main we SWAP the internal FS PHY onto the USJ pins (GPIO24/25 = the core
+# Type-C) via LP_SYSTEM_REG_USB_CTRL_REG, so the same port we flash becomes the
+# HID keyboard the PC sees. TinyUSB selects the FS controller: 0 = HS, 1 = FS.
 CONFIG_TINYUSB_RHPORT_HS=n
 CONFIG_TINYUSB_RHPORT_FS=y
 
@@ -39,3 +41,14 @@ CONFIG_SPIRAM=n
 
 # Disable Bluetooth stack (not used)
 CONFIG_BT_ENABLED=n
+
+# --- USB Device identity (Windows compatibility) ---
+# The esp_tinyusb default PID 0x4004 is shared by countless Espressif HID
+# examples. Windows caches the USB driver per VID:PID(+serial), so a stale or
+# ghost entry for 303A:4004 =P4HIDPT-0001 makes Windows refuse to re-enumerate
+# the device ("doesn't show in Device Manager") even though Linux/Android see
+# it fine. A custom PID (0x4B44 = "KD", keyboard) + bumped bcdDevice makes
+# Windows treat this as a brand-new device and bind it fresh.
+CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=n
+CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4B44
+CONFIG_TINYUSB_DESC_BCD_DEVICE=0x0201

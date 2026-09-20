@@ -8,8 +8,9 @@
 #include "freertos/queue.h"
 
 typedef enum {
-    HID_REP_KIND_KEYBOARD = 1,
-    HID_REP_KIND_MOUSE    = 2,
+    HID_REP_KIND_KEYBOARD       = 1,
+    HID_REP_KIND_MOUSE          = 2,
+    HID_REP_KIND_KEYBOARD_RESET = 3,   // flush: send "all keys released" to the PC
 } hid_rep_kind_t;
 
 typedef struct {

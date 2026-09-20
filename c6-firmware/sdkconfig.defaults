@@ -12,8 +12,20 @@ CONFIG_LWIP_MAX_SOCKETS=16
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_UART_NONE=n
 
-# Larger flash + custom partition table with storage partition
+# Larger flash + custom partition table with storage partition.
+# NOTE: the checked-in sdkconfig must NOT contradict this file (it did: 2MB +
+# single-app), or a build silently ships without the storage/SPIFFS partition.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# 64KB flash-MMU pages, matching the reference P4 ESP-Hosted C6 build.
+# 32KB pages (the stale sdkconfig value) cannot serve the 4MB custom layout.
+CONFIG_MMU_PAGE_SIZE_64KB=y
+
+# app_main drives the WHOLE wifi bring-up in v1 (init + start on the main
+# task). The IDF default main stack is only 3584 B; esp_wifi_init/start can
+# nest deep enough to overflow it and silently kill the app ~2s into boot —
+# which looks EXACTLY like "wifi never comes up". Give main room.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144

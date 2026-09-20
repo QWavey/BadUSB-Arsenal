@@ -64,8 +64,31 @@ void hid_host_set_kbd_leds(uint8_t leds) {
 static void publish_report(hid_rep_kind_t kind, const uint8_t *buf, size_t len) {
     hid_bridge_msg_t m = { .kind = kind, .len = (len > sizeof(m.data)) ? sizeof(m.data) : (uint8_t)len };
     memcpy(m.data, buf, m.len);
-    if (g_hid_bridge_q) {
-        // Drop on full — passthrough must not stall the USB stack.
+    if (!g_hid_bridge_q) return;
+    if (xQueueSend(g_hid_bridge_q, &m, 0) == pdTRUE) return;
+    // Queue full. A dropped keyboard key-UP reads as a stuck key/modifier on
+    // the PC ("keyboard goes crazy"), so for keyboard traffic evict the OLDEST
+    // queued report to make room instead of dropping the newest one. A single
+    // lost mouse delta is invisible, so mouse reports are simply dropped on
+    // overflow. Never blocks the USB host stack.
+    if (kind == HID_REP_KIND_KEYBOARD || kind == HID_REP_KIND_KEYBOARD_RESET) {
+        hid_bridge_msg_t drop;
+        if (xQueueReceive(g_hid_bridge_q, &drop, 0) == pdTRUE) {
+            xQueueSend(g_hid_bridge_q, &m, 0);
+        }
+    }
+}
+
+// Post a device-side "all keys released" flush. The ESP's view of the physical
+// keyboard resets on every (re)connect (fresh boot, hub-flap recovery, user
+// re-plug), so Windows must be told nothing is held — otherwise a modifier
+// whose key-up vanished during the reset stays stuck.
+static void bridge_post_keyboard_reset(void) {
+    if (!g_hid_bridge_q) return;
+    hid_bridge_msg_t m = { .kind = HID_REP_KIND_KEYBOARD_RESET, .len = 0 };
+    if (xQueueSend(g_hid_bridge_q, &m, 0) == pdTRUE) return;
+    hid_bridge_msg_t drop;
+    if (xQueueReceive(g_hid_bridge_q, &drop, 0) == pdTRUE) {
         xQueueSend(g_hid_bridge_q, &m, 0);
     }
 }
@@ -110,6 +133,10 @@ static void hid_iface_cb(hid_host_device_handle_t hdev,
         if (s_kbd_hdev == hdev) {
             s_kbd_hdev = NULL;
             c6_uart_kbd_disconnect();
+            // Physical keyboard gone: Windows still holds whatever key/modifier
+            // was last reported. Flush an all-released report so the PC releases
+            // before the next keyboard comes up (matches the connect flush).
+            bridge_post_keyboard_reset();
         } else {
             // No stale kbd handle -> it might have been a mouse. Best effort
             // to notify the pill.
@@ -157,6 +184,9 @@ static void hid_device_cb(hid_host_device_handle_t hdev,
         if (err != ESP_OK) ESP_LOGW(TAG, "set_idle: %s (non-fatal)", esp_err_to_name(err));
         s_kbd_hdev = hdev;
         c6_uart_kbd_connect();
+        // Keyboard (re)connected: our view of its state just reset, so flush
+        // the PC side with an all-released report (clears any stuck modifier).
+        bridge_post_keyboard_reset();
     } else if (p.proto == HID_PROTOCOL_MOUSE) {
         c6_uart_mouse_connect();
     }
