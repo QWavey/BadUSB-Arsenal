@@ -24,8 +24,16 @@ CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
 # 32KB pages (the stale sdkconfig value) cannot serve the 4MB custom layout.
 CONFIG_MMU_PAGE_SIZE_64KB=y
 
-# app_main drives the WHOLE wifi bring-up in v1 (init + start on the main
-# task). The IDF default main stack is only 3584 B; esp_wifi_init/start can
-# nest deep enough to overflow it and silently kill the app ~2s into boot —
-# which looks EXACTLY like "wifi never comes up". Give main room.
+# The wifi bring-up used to run on the IDF-default 3584B main stack; nesting in
+# esp_wifi_init/start overflows it silently ~2s into boot — the observed
+# "green 2s, then dead" signature. Move the wifi work off main in code AND give
+# main slack here.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# This C6 hosts a soft-AP for at most a handful of phones, with the SDIO
+# hosted-slave link and an HTTP+WS server all drawing on the same ~512KB.
+# The stock wifi buffer budget is sized for a busy STA+AP and over-allocates
+# here; trim it so esp_wifi_init never trips over memory.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
