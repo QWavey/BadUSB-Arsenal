@@ -61,6 +61,7 @@ const char WEB_UI_HTML[] =
  "<span id=p_boot class=pill><span class=dot></span> Boot: …</span>"
  "<span id=p_kbd class=pill><span class=dot></span> Keyboard: unknown</span>"
  "<span id=p_mouse class=pill><span class=dot></span> Mouse: unknown</span>"
+ "<span id=p_pc class=pill><span class=dot></span> PC: unknown</span>"
  "<span id=p_rec class=pill><span class=dot></span> Recording: …</span>"
 "</div>"
 "<div class=stats>"
@@ -133,7 +134,7 @@ const char WEB_UI_HTML[] =
   "</label>"
 "</div></div>"
 
-"<footer>C6 firmware v2 &middot; UART @ 115200 8N1 &middot; log budget 1.6&nbsp;MB (fits 2&nbsp;MB SPIFFS), warning at 90%</footer>"
+"<footer>C6 firmware v3 &middot; UART @ 115200 8N1 &middot; log budget 1.6&nbsp;MB (fits 2&nbsp;MB SPIFFS), warning at 90%</footer>"
 
 "<script>"
 "const $=id=>document.getElementById(id);"
@@ -168,6 +169,7 @@ const char WEB_UI_HTML[] =
 "  barwrap.className='bar'+(j.logBytes>j.warnBytes?' warn':'');"
 "  setPill($('p_kbd'),j.kbd?'ok':'warn','Keyboard: '+(j.kbd?'connected':'disconnected'));"
 "  setPill($('p_mouse'),j.mouse?'ok':'warn','Mouse: '+(j.mouse?'connected':'disconnected'));"
+"  setPill($('p_pc'),j.pc?'ok':'warn','PC: '+(j.pc?'connected':'not mounted'));"
 "  setPill($('p_rec'),j.recording?'ok':'warn','Recording: '+(j.recording?'on':'off'));"
  "  if(j.wifi===1){setPill($('p_ap'),'ok','Wi-Fi AP: online');}"
  "  else if(j.wifi===0){setPill($('p_ap'),'warn','Wi-Fi AP: FAILED');}"
@@ -210,6 +212,8 @@ const char WEB_UI_HTML[] =
 "  if(m){sp.textContent='(hub retry '+m[1]+'/'+m[2]+')\\n';}"
 "  else if(rest==='ENUM_OK'){sp.textContent='(keyboard enumerated)\\n';}"
 "  else if(rest==='ENUM_FAIL'){sp.textContent='(hub gave up — re-seat keyboard)\\n';}"
+"  else if(rest==='PC_CONNECT'){sp.textContent='(PC connected — keystrokes will reach Windows)\\n';}"
+"  else if(rest==='PC_DISCONNECT'){sp.textContent='(PC disconnected)\\n';}"
 "  else {sp.textContent='('+rest+')\\n';}"
 "  live.append(sp);"
 "  refreshStatus();"

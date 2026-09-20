@@ -262,6 +262,25 @@ static void forward_task(void *arg) {
     }
 }
 
+// Mount watchdog for the PC (TinyUSB device side). Whether Windows has bound
+// our HID composite was invisible — the C6 UI only knew about the keyboard and
+// mouse on the HOST side. Emit EVT PC_CONNECT / PC_DISCONNECT on mount edges so
+// the web UI shows a "PC" pill: green = Windows sees the keyboard, red/warn =
+// the device isn't mounted and keystrokes are being dropped by design.
+static void pc_watch_task(void *arg) {
+    (void)arg;
+    bool was = false;
+    while (1) {
+        bool now = tud_mounted();
+        if (now != was) {
+            was = now;
+            c6_uart_send_evt(now ? "PC_CONNECT" : "PC_DISCONNECT");
+            ESP_LOGI(TAG, "PC %s", now ? "mounted" : "unmounted");
+        }
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "Starting HID passthrough on ESP32-P4");
 
@@ -305,6 +324,8 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(tinyusb_driver_install(&tcfg));
     ESP_LOGI(TAG, "TinyUSB HID device up (FS port -> PC)");
+
+    xTaskCreatePinnedToCore(pc_watch_task, "pc_watch", 2048, NULL, 6, NULL, 0);
 
     // Priority 10 so the forward task preempts everything else on core 1
     // and hands each report to TinyUSB the instant it lands in the queue.

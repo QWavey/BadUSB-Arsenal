@@ -174,6 +174,16 @@ static void hid_device_cb(hid_host_device_handle_t hdev,
     err = hid_host_device_open(hdev, &cfg);
     if (err != ESP_OK) { ESP_LOGW(TAG, "device_open: %s", esp_err_to_name(err)); return; }
 
+    // Tell the UI the interface is live IMMEDIATELY, before the (slow on some
+    // keyboards) SET_PROTOCOL/SET_IDLE round-trips below. Waiting made the web
+    // pill lag "a little" behind enumeration, which read as a stuck boot.
+    if (p.proto == HID_PROTOCOL_KEYBOARD) {
+        c6_uart_kbd_connect();
+        bridge_post_keyboard_reset();
+    } else if (p.proto == HID_PROTOCOL_MOUSE) {
+        c6_uart_mouse_connect();
+    }
+
     // Try to switch into boot protocol regardless of the descriptor's
     // sub_class — many keyboards declare sub_class 0 but still respond to
     // SET_PROTOCOL(BOOT) with the 8-byte report layout we already parse.
@@ -183,12 +193,6 @@ static void hid_device_cb(hid_host_device_handle_t hdev,
         err = hid_class_request_set_idle(hdev, 0, 0);
         if (err != ESP_OK) ESP_LOGW(TAG, "set_idle: %s (non-fatal)", esp_err_to_name(err));
         s_kbd_hdev = hdev;
-        c6_uart_kbd_connect();
-        // Keyboard (re)connected: our view of its state just reset, so flush
-        // the PC side with an all-released report (clears any stuck modifier).
-        bridge_post_keyboard_reset();
-    } else if (p.proto == HID_PROTOCOL_MOUSE) {
-        c6_uart_mouse_connect();
     }
     err = hid_host_device_start(hdev);
     if (err != ESP_OK) ESP_LOGW(TAG, "device_start: %s", esp_err_to_name(err));
@@ -256,9 +260,9 @@ static void hid_stack_full_reset(void) {
 
 static void port_flap_watchdog(void *arg) {
     (void)arg;
-    // Fast first attempt (500 ms) so if the hub is healthy we just discover
-    // the keyboard; if it's stuck we start recovery immediately.
-    vTaskDelay(pdMS_TO_TICKS(500));
+    // Fast first attempt (700 ms) so a healthy hub just discovers the keyboard
+    // cleanly; a stuck port still gets rescued quickly afterwards.
+    vTaskDelay(pdMS_TO_TICKS(700));
     int free_all_stuck_count = 0;
     for (int attempt = 0; attempt < 12 && !s_hid_ever_connected; attempt++) {
         char body[48];

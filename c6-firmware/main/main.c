@@ -110,6 +110,7 @@ static bool s_recording   = true;
 static bool s_auto_dl     = false;
 static bool s_kbd_present = false;
 static bool s_mouse_present = false;
+static bool s_pc_present   = false;   // PC (user's computer) bound the P4's HID device
 static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
 static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER mode (also wire target)
@@ -439,8 +440,8 @@ static esp_err_t h_ws(httpd_req_t *r) {
         // the SYNC variant inside the request handler; async here is racy.
         char hello[128];
         int n = snprintf(hello, sizeof(hello),
-            "\x1eSTATUS kbd=%d mouse=%d rec=%d adl=%d\n",
-            s_kbd_present, s_mouse_present, s_recording, s_auto_dl);
+            "\x1eSTATUS kbd=%d mouse=%d pc=%d rec=%d adl=%d\n",
+            s_kbd_present, s_mouse_present, s_pc_present, s_recording, s_auto_dl);
         httpd_ws_frame_t hf = { .final=true, .type=HTTPD_WS_TYPE_TEXT,
                                 .payload=(uint8_t*)hello, .len=n };
         httpd_ws_send_frame(r, &hf);
@@ -466,6 +467,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     size_t used = log_total_bytes();
     int n = snprintf(body, sizeof(body),
         "{\"chip\":\"esp32c6\",\"ssid\":\"%s\",\"kbd\":%s,\"mouse\":%s,"
+         "\"pc\":%s,"
          "\"recording\":%s,\"live\":%s,\"autoDownload\":%s,"
          "\"logBytes\":%u,\"logMax\":%u,\"warnBytes\":%u,"
          "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,"
@@ -473,6 +475,7 @@ static esp_err_t h_status(httpd_req_t *r) {
          "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u,\"ledMode\":%d,"
          "\"wifi\":%d,\"bootphase\":%d,\"layout\":%d}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
+        s_pc_present?"true":"false",
         s_recording?"true":"false", s_live_streaming?"true":"false", s_auto_dl?"true":"false",
         (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
         (unsigned)s_sta_count, (unsigned)s_uart_bytes_total,
@@ -779,6 +782,8 @@ static void sdio_rx_task(void *arg) {
                     else if (!strncmp(line, "EVT KBD_DISCONNECT", 18)) s_kbd_present   = false;
                     else if (!strncmp(line, "EVT MOUSE_CONNECT",  17)) s_mouse_present = true;
                     else if (!strncmp(line, "EVT MOUSE_DISCONNECT",20)) s_mouse_present = false;
+                    else if (!strncmp(line, "EVT PC_CONNECT",     14)) s_pc_present    = true;
+                    else if (!strncmp(line, "EVT PC_DISCONNECT",  17)) s_pc_present    = false;
                     publish(line);
                     li = 0;
                 } else if (li < (int)sizeof(line) - 2) {
