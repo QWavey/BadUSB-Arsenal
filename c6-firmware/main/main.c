@@ -75,6 +75,7 @@ static const char *TAG = "c6ui";
 #define NVS_K_AUTODL     "adl"
 #define NVS_K_LEDMODE    "ledm"
 #define NVS_K_BOOTTR     "boottr"
+#define NVS_K_LAYOUT     "layout"
 
 // LED modes must match firmware/main/led.h
 #define LED_MODE_OFF       0
@@ -86,6 +87,7 @@ static const char *TAG = "c6ui";
 // SDIO scratch register position that the P4 polls. Range 0..27 or 32..63
 // (28..31 are the interrupt registers).
 #define SDIO_REG_LED_MODE  40
+#define SDIO_REG_LAYOUT    41   // 0=US 1=DE 2=UK (matches P4 kb_layout_t)
 
 // NVS boot-trace phases (kept in NVS_K_BOOTTR, surfaced in /status).
 #define BOOT_PHASE_BOOT      1
@@ -111,6 +113,7 @@ static bool s_mouse_present = false;
 static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
 static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER mode (also wire target)
+static uint8_t  s_layout   = 0;                    // keyboard layout, pushed to P4 reg 41
 static volatile uint8_t s_led_disp = LED_MODE_KEYFLASH; // what's currently on reg 40
 static SemaphoreHandle_t s_led_lock;
 static volatile int  s_bootphase = 0;
@@ -137,6 +140,7 @@ static void nvs_load_settings(void) {
     if (nvs_get_u8(h, NVS_K_REC,     &v) == ESP_OK) s_recording = v ? true : false;
     if (nvs_get_u8(h, NVS_K_AUTODL,  &v) == ESP_OK) s_auto_dl   = v ? true : false;
     if (nvs_get_u8(h, NVS_K_LEDMODE, &v) == ESP_OK) s_led_mode  = v > LED_MODE_BLUE ? LED_MODE_KEYFLASH : v;
+    if (nvs_get_u8(h, NVS_K_LAYOUT,  &v) == ESP_OK) s_layout    = v > 2 ? 0 : v;
     nvs_close(h);
 }
 static void nvs_save_settings(void) {
@@ -145,6 +149,7 @@ static void nvs_save_settings(void) {
     nvs_set_u8(h, NVS_K_REC,     s_recording ? 1 : 0);
     nvs_set_u8(h, NVS_K_AUTODL,  s_auto_dl   ? 1 : 0);
     nvs_set_u8(h, NVS_K_LEDMODE, s_led_mode);
+    nvs_set_u8(h, NVS_K_LAYOUT,  s_layout);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -197,6 +202,12 @@ static void led_task(void *arg) {
         if (m != last) { led_write_reg(m); last = m; }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
+}
+
+// Keyboard layout -> reg 41, which the P4 picks up and applies at runtime.
+static void push_layout(void) {
+    esp_err_t err = sdio_slave_write_reg(SDIO_REG_LAYOUT, s_layout);
+    if (err != ESP_OK) ESP_LOGW(TAG, "layout reg write: %s", esp_err_to_name(err));
 }
 
 static size_t file_size(const char *path) {
@@ -424,7 +435,7 @@ static esp_err_t h_status(httpd_req_t *r) {
          "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,"
          "\"wsFrames\":%u,\"pub\":%u,\"wsCalls\":%u,\"wsGated\":%u,"
          "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u,\"ledMode\":%d,"
-         "\"wifi\":%d,\"bootphase\":%d}",
+         "\"wifi\":%d,\"bootphase\":%d,\"layout\":%d}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
         s_recording?"true":"false", s_live_streaming?"true":"false", s_auto_dl?"true":"false",
         (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
@@ -433,7 +444,7 @@ static esp_err_t h_status(httpd_req_t *r) {
         (unsigned)s_publish_calls, (unsigned)s_ws_broadcast_calls,
         (unsigned)s_ws_gated_off, (unsigned)s_ws_no_clients,
         (unsigned)s_ws_queue_fail, (unsigned)s_client_count,
-        (int)s_led_mode, (int)s_wifi_up, (int)s_bootphase);
+        (int)s_led_mode, (int)s_wifi_up, (int)s_bootphase, (int)s_layout);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, body, n);
@@ -507,6 +518,21 @@ static esp_err_t h_led_set(httpd_req_t *r) {
     led_user_mode((uint8_t)m);        // persist + apply + put on the wire now
     httpd_resp_set_type(r, "application/json");
     char body[32]; int n = snprintf(body, sizeof(body), "{\"ledMode\":%d}", (int)s_led_mode);
+    return httpd_resp_send(r, body, n);
+}
+
+static esp_err_t h_layout_set(httpd_req_t *r) {
+    char q[16] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    char v[8] = { 0 };
+    httpd_query_key_value(q, "v", v, sizeof(v));
+    int val = atoi(v);
+    if (val < 0 || val > 2) val = 0;      // 0=US 1=DE 2=UK
+    s_layout = (uint8_t)val;
+    nvs_save_settings();
+    push_layout();                        // P4 applies it on its next poll
+    httpd_resp_set_type(r, "application/json");
+    char body[32]; int n = snprintf(body, sizeof(body), "{\"layout\":%d}", (int)s_layout);
     return httpd_resp_send(r, body, n);
 }
 
@@ -634,6 +660,7 @@ static esp_err_t http_up(void) {
         {"/live/start",    HTTP_POST, h_live_start, NULL, false, false, NULL},
         {"/live/stop",     HTTP_POST, h_live_stop,  NULL, false, false, NULL},
         {"/led",           HTTP_POST, h_led_set,    NULL, false, false, NULL},
+        {"/layout",        HTTP_POST, h_layout_set, NULL, false, false, NULL},
         {"/autodl",        HTTP_POST, h_autodl_set, NULL, false, false, NULL},
     };
     for (unsigned i = 0; i < sizeof(routes)/sizeof(routes[0]); i++)
@@ -794,6 +821,7 @@ void app_main(void) {
     } else {
         boot_trace(BOOT_PHASE_SDIO_UP);
         led_phase(LED_MODE_GREEN);        // alive + SDIO enumerated
+        push_layout();                    // runtime layout reaches the P4 at boot
     }
 
     // LED wire owner first so boot telemetry is on reg 40 before the wifi
