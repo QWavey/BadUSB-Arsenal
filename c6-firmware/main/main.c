@@ -181,8 +181,27 @@ static void led_phase(uint8_t m) {
     xSemaphoreGive(s_led_lock);
     led_write_reg(m);
 }
+// Locked-failure diagnostics. A dead wifi boot now BLINKS red N times (300 ms
+// on/off, 3 s pause, repeat) so the stage that locked up is readable with no
+// console: 1 netif/event loop, 2 AP netif, 3 wifi init, 4 mode/config,
+// 5 start failed, 6 AP_START never fired. Code also lands on scratch reg 42
+// for a future P4 readout.
+static volatile uint8_t s_fail_code = 0;
+static void led_fail_code(uint8_t code) {
+    s_fail_code = code;
+    led_phase(LED_MODE_RED);
+    sdio_slave_write_reg(42, code);
+    ESP_LOGE(TAG, "locked failure code %u", (unsigned)code);
+}
 // Adopt the user's saved mode (web /led endpoint or post-blue handover).
 static void led_user_mode(uint8_t m) {
+    if (m == LED_MODE_OFF && s_wifi_up != 1) {
+        // Never let a saved "off" make the LED go dark before the AP verdict
+        // landed — the LED is the only live health channel, and dark-on-boot
+        // is exactly the failure the user kept seeing ("green then dark").
+        ESP_LOGW(TAG, "refusing OFF before wifi confirmed");
+        return;
+    }
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_led_mode = m;
     s_led_disp = m;
@@ -194,7 +213,24 @@ static void led_user_mode(uint8_t m) {
 static void led_task(void *arg) {
     (void)arg;
     uint8_t last = 0xFF;
+    uint8_t last_fail = 0xFF;
     while (1) {
+        uint8_t code = s_fail_code;
+        if (code) {
+            // Locked failure: blink RED `code` times (300 ms on / 300 ms off),
+            // then a 3 s pause, forever.
+            TickType_t blip  = pdMS_TO_TICKS(600);
+            TickType_t pause = pdMS_TO_TICKS(3000);
+            TickType_t cycle = blip * code + pause;
+            TickType_t pos   = xTaskGetTickCount() % cycle;
+            uint8_t out = LED_MODE_OFF;
+            if (pos < blip * code) {
+                out = (pos % blip) < pdMS_TO_TICKS(300) ? LED_MODE_RED : LED_MODE_OFF;
+            }
+            if (out != last_fail) { led_write_reg(out); last_fail = out; }
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         uint8_t m;
         xSemaphoreTake(s_led_lock, portMAX_DELAY);
         m = s_led_disp;
@@ -555,6 +591,7 @@ static esp_err_t h_autodl_set(httpd_req_t *r) {
 // dedicated task with a big stack; the outcome drives the LED and the
 // /status "wifi" field.
 static volatile bool s_ap_ready = false;
+static esp_netif_t *s_ap_netif = NULL;
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg; (void)data;
@@ -570,19 +607,29 @@ static void wifi_task(void *arg) {
     esp_err_t err;
 
     err = esp_netif_init();
-    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err)); goto wifi_failed; }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err));
+        led_fail_code(1); goto wifi_failed;
+    }
     err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(err)); goto wifi_failed;
+        ESP_LOGE(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(err));
+        led_fail_code(1); goto wifi_failed;
     }
-    if (!esp_netif_create_default_wifi_ap()) {
-        ESP_LOGE(TAG, "esp_netif_create_default_wifi_ap failed"); goto wifi_failed;
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    if (!s_ap_netif) {
+        ESP_LOGE(TAG, "esp_netif_create_default_wifi_ap failed");
+        led_fail_code(2); goto wifi_failed;
     }
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&init);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err)); goto wifi_failed; }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err));
+        led_fail_code(3); goto wifi_failed;
+    }
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
+    esp_wifi_set_ps(WIFI_PS_NONE);      // AP is always on — no power handling needed
 
     wifi_config_t ap = { 0 };
     strncpy((char *)ap.ap.ssid, AP_SSID, sizeof(ap.ap.ssid) - 1);
@@ -593,27 +640,43 @@ static void wifi_task(void *arg) {
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
     err = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err)); goto wifi_failed; }
-    err = esp_wifi_set_config(WIFI_IF_AP, &ap);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err)); goto wifi_failed; }
-
-    // Bounded start with retries: a transient RF/PHY blip shouldn't be a
-    // one-shot death (and in v1 the error was ignored entirely).
-    err = ESP_FAIL;
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        err = esp_wifi_start();
-        if (err == ESP_OK) break;
-        ESP_LOGE(TAG, "esp_wifi_start #%d: %s", attempt, esp_err_to_name(err));
-        vTaskDelay(pdMS_TO_TICKS(500));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err));
+        led_fail_code(4); goto wifi_failed;
     }
-    if (err != ESP_OK) goto wifi_failed;
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err));
+        led_fail_code(4); goto wifi_failed;
+    }
 
-    // esp_wifi_start() returning OK does not prove the radio is broadcasting;
-    // wait for the driver's WIFI_EVENT_AP_START to confirm.
-    for (int i = 0; i < 40 && !s_ap_ready; i++) vTaskDelay(pdMS_TO_TICKS(50));
-    if (!s_ap_ready) {
-        ESP_LOGW(TAG, "esp_wifi_start()=OK but AP_START never fired");
-        goto wifi_failed;
+    // Bounded, self-recovering radio bring-up. A cold C6 can flake on the very
+    // first esp_wifi_start (PHY calibration racing the SDIO slave on the
+    // single core). Instead of dying, retry stop/start rounds until the driver
+    // CONFIRMS AP_START — an OK return alone doesn't prove the radio is
+    // broadcasting.
+    bool confirmed = false;
+    for (int r = 1; r <= 4 && !confirmed; r++) {
+        esp_wifi_stop();                     // clean slate each round
+        err = esp_wifi_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_start r%d: %s", r, esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        // Let the driver's AP_START event prove the radio is actually up.
+        for (int i = 0; i < 60 && !s_ap_ready; i++) vTaskDelay(pdMS_TO_TICKS(50));
+        confirmed = s_ap_ready;
+        if (!confirmed) ESP_LOGW(TAG, "round %d: start OK but AP_START never fired", r);
+    }
+    if (!confirmed) { led_fail_code(err == ESP_OK ? 6 : 5); goto wifi_failed; }
+
+    // AP is genuinely broadcasting. Hand out IPs explicitly so clients that
+    // grab the SSID always get an address (default AP netif starts DHCP on its
+    // own, but an explicit start removes every doubt).
+    err = esp_netif_dhcps_start(s_ap_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGW(TAG, "dhcps_start: %s", esp_err_to_name(err));
     }
 
     s_wifi_up = 1;
@@ -621,13 +684,18 @@ static void wifi_task(void *arg) {
     boot_trace(BOOT_PHASE_WIFI_OK);
     led_phase(LED_MODE_BLUE);
     vTaskDelay(pdMS_TO_TICKS(4000));     // visible "everything is fine" beat
-    led_user_mode(s_led_mode);           // hand the wire back to the saved mode
+    // Hand the wire back to the saved mode — but a saved OFF just means "no
+    // fancy mode", it must NOT make the evidence go dark. Stay blue instead.
+    if (s_led_mode == LED_MODE_OFF) {
+        led_phase(LED_MODE_BLUE);
+    } else {
+        led_user_mode(s_led_mode);
+    }
     vTaskDelete(NULL);
 
 wifi_failed:
     s_wifi_up = 0;
     boot_trace(BOOT_PHASE_WIFI_FAIL);
-    led_phase(LED_MODE_RED);             // stays red — the AP is genuinely down
     ESP_LOGE(TAG, "Wi-Fi AP NOT up");
     vTaskDelete(NULL);
 }
