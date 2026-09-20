@@ -18,6 +18,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -30,6 +31,13 @@
 #include "freertos/semphr.h"
 
 #define C6_RESET_PIN 54
+
+// After this many consecutive failed SDIO register reads (~6 s at the 500 ms
+// poll rate), the link to the C6 is considered dead and the P4 tears down and
+// re-probes it (see recover_sdio_link). This is what makes a C6 reboot
+// self-heal: before, a reset wedged the host side and the LED stayed frozen
+// at its last byte forever.
+#define RECOVER_AFTER_FAILS 12
 
 // The ESP32 sdio_slave receive path — the CMD53 write address must be
 // (0x1F800 - length) mod 0x20000. That’s the FIFO tail address convention
@@ -392,20 +400,64 @@ static void link_bringup_task(void *arg) {
 #define C6_REG_LED_MODE_CCCR_ADDR   (0x60 + 40)
 #define C6_REG_LAYOUT_CCCR_ADDR     (0x60 + 41)   // 0=US 1=DE 2=UK (== kb_layout_t)
 
+// The host side of the SDIO link died (typically because the C6 was reset or
+// its wifi crash forced a reboot — the slave re-enumerates with a fresh RCA
+// that our cached card context no longer matches). Tear the card context and
+// the sdmmc host driver down and re-run the full bring-up, including a fresh
+// C6 reset so the C6 re-asserts its boot telemetry on reg 40.
+static bool recover_sdio_link(void) {
+    ESP_LOGW(TAG, "C6 link lost (reads failing) — resetting C6 + re-probing SDIO");
+    if (s_card) { free(s_card); s_card = NULL; }
+    // Host already down (or never fully up) is fine — deinit is best-effort.
+    esp_err_t err = sdmmc_host_deinit();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "host deinit: %s", esp_err_to_name(err));
+    }
+    if (sdio_link_bring_up() != ESP_OK) {
+        ESP_LOGE(TAG, "re-probe failed — will retry later");
+        return false;
+    }
+    s_ready = true;
+    tx_line("EVT", "P4_READY");
+    ESP_LOGI(TAG, "SDIO link recovered");
+    return true;
+}
+
 // Definition follows below — link_bringup_task references it.
 static void led_poll_task(void *arg) {
     (void)arg;
     if (!s_card) { vTaskDelete(NULL); return; }
     uint8_t last_led = 0xFF;
     uint8_t last_lay = 0xFF;
+    int read_fails = 0;
+    TickType_t last_recover = 0;
     while (1) {
         uint8_t v = 0;
         esp_err_t err = sdmmc_io_read_byte(s_card, 0, C6_REG_LED_MODE_CCCR_ADDR, &v);
-        if (err == ESP_OK && v != last_led) {
-            // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
-            led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
-            last_led = v;
+        if (err == ESP_OK) {
+            read_fails = 0;
+            if (v != last_led) {
+                // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
+                led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
+                last_led = v;
+            }
+        } else if (read_fails < INT_MAX) {
+            read_fails++;
         }
+
+        // Heal a dead/wedged link automatically (a missing C6 reboot would
+        // otherwise freeze the LED on its last byte forever). Rate-limited so
+        // a hard-dead C6 doesn't reset it on a hot loop.
+        if (read_fails >= RECOVER_AFTER_FAILS &&
+            (int)(xTaskGetTickCount() - last_recover) >= (int)pdMS_TO_TICKS(15000)) {
+            last_recover = xTaskGetTickCount();
+            read_fails = 0;
+            if (recover_sdio_link()) {
+                last_led = 0xFF;   // re-arm so the telemetry that follows lands
+                last_lay = 0xFF;
+            }
+        }
+
         // Runtime layout switch straight from the web UI — no reflash.
         uint8_t lay = 0xFF;
         err = sdmmc_io_read_byte(s_card, 0, C6_REG_LAYOUT_CCCR_ADDR, &lay);
