@@ -1,4 +1,4 @@
-// ESP32-C6 firmware for the keylogger web UI (v1).
+// ESP32-C6 firmware for the keylogger web UI (v2 boot rearchitecture).
 //
 // - Wi-Fi soft AP "P4-KeyLogger" / "changeme123"
 // - Web UI at http://192.168.4.1
@@ -9,7 +9,22 @@
 //     KEY <text>\n
 //     EVT KBD_CONNECT | KBD_DISCONNECT | MOUSE_CONNECT | MOUSE_DISCONNECT\n
 //     RAW <hex bytes>\n
-// - Settings persisted in NVS (recording on/off, auto-download on/off)
+// - Settings persisted in NVS (recording on/off, auto-download on/off, LED mode)
+// - NVS boot-trace: a phase marker written on every boot so a crash can be
+//   reconstructed later from the flash contents, even without a console.
+//
+// Boot/LED architecture (v2):
+//   v1 ran the whole wifi bring-up on app_main's 3.5KB stack; esp_wifi_init/
+//   start nests deep enough to overflow it and kill the app seconds into
+//   boot, and every wifi error was *ignored* (it always logged "AP up").
+//   v2 moves all wifi work into a dedicated task, and makes the C6 LED the
+//   one trustworthy live channel via SDIO scratch reg 40, owned by a small
+//   task:
+//     GREEN   = SDIO slave up, booting
+//     BLUE    = Wi-Fi AP confirmed up (few seconds, then saved LED mode)
+//     RED     = something locked in failure (SDIO down, wifi down) — stays
+//               red, never silently returns to the user mode
+//   The saved LED mode is ONLY applied after a CONFIRMED wifi success.
 
 #include <string.h>
 #include <stdio.h>
@@ -59,6 +74,7 @@ static const char *TAG = "c6ui";
 #define NVS_K_REC        "rec"
 #define NVS_K_AUTODL     "adl"
 #define NVS_K_LEDMODE    "ledm"
+#define NVS_K_BOOTTR     "boottr"
 
 // LED modes must match firmware/main/led.h
 #define LED_MODE_OFF       0
@@ -70,6 +86,13 @@ static const char *TAG = "c6ui";
 // SDIO scratch register position that the P4 polls. Range 0..27 or 32..63
 // (28..31 are the interrupt registers).
 #define SDIO_REG_LED_MODE  40
+
+// NVS boot-trace phases (kept in NVS_K_BOOTTR, surfaced in /status).
+#define BOOT_PHASE_BOOT      1
+#define BOOT_PHASE_SDIO_UP   2
+#define BOOT_PHASE_WIFI_OK   3
+#define BOOT_PHASE_WIFI_FAIL 4
+#define BOOT_PHASE_RUNNING   5
 
 // --------------------------- state ------------------------------------
 extern const char WEB_UI_HTML[];
@@ -87,7 +110,11 @@ static bool s_kbd_present = false;
 static bool s_mouse_present = false;
 static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
-static uint8_t  s_led_mode = LED_MODE_KEYFLASH;
+static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER mode (also wire target)
+static volatile uint8_t s_led_disp = LED_MODE_KEYFLASH; // what's currently on reg 40
+static SemaphoreHandle_t s_led_lock;
+static volatile int  s_bootphase = 0;
+static volatile int  s_wifi_up   = -1;   // -1 pending, 1 = AP confirmed, 0 = failed
 static uint32_t s_uart_bytes_total = 0;
 static uint32_t s_sdio_bytes_total = 0;
 static uint32_t s_publish_calls    = 0;   // how many times publish() was entered
@@ -109,7 +136,7 @@ static void nvs_load_settings(void) {
     uint8_t v = 0;
     if (nvs_get_u8(h, NVS_K_REC,     &v) == ESP_OK) s_recording = v ? true : false;
     if (nvs_get_u8(h, NVS_K_AUTODL,  &v) == ESP_OK) s_auto_dl   = v ? true : false;
-    if (nvs_get_u8(h, NVS_K_LEDMODE, &v) == ESP_OK) s_led_mode  = v;
+    if (nvs_get_u8(h, NVS_K_LEDMODE, &v) == ESP_OK) s_led_mode  = v > LED_MODE_BLUE ? LED_MODE_KEYFLASH : v;
     nvs_close(h);
 }
 static void nvs_save_settings(void) {
@@ -122,11 +149,54 @@ static void nvs_save_settings(void) {
     nvs_close(h);
 }
 
-// Push the current LED mode over the SDIO scratch register so the P4 can
-// poll it. Safe to call from any context.
-static void push_led_mode(void) {
-    esp_err_t err = sdio_slave_write_reg(SDIO_REG_LED_MODE, s_led_mode);
-    if (err != ESP_OK) ESP_LOGW(TAG, "sdio_slave_write_reg(led): %s", esp_err_to_name(err));
+// One-byte NVS boot trace. Cheap (single u8/commit) and survives crashes, so
+// even with no console the flash itself shows which boot stage was reached last.
+static void boot_trace(uint8_t phase) {
+    s_bootphase = phase;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, NVS_K_BOOTTR, phase);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// -------------------- LED ownership (SDIO wire) -----------------------
+// The wire register (reg 40) is OWned by the LED functions below and
+// re-asserted by a dedicated task, so a transition can never be lost or
+// half-applied. The C6 LED mirrors reg 40 on the P4 every 500 ms; the C6
+// heartbeat re-writes the CURRENT display value on change.
+static void led_write_reg(uint8_t m) {
+    esp_err_t err = sdio_slave_write_reg(SDIO_REG_LED_MODE, m);
+    if (err != ESP_OK) ESP_LOGW(TAG, "led reg write: %s", esp_err_to_name(err));
+}
+// Telemetry/phase: BLUE/GREEN/RED for boot stages (never the saved mode).
+static void led_phase(uint8_t m) {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    s_led_disp = m;
+    xSemaphoreGive(s_led_lock);
+    led_write_reg(m);
+}
+// Adopt the user's saved mode (web /led endpoint or post-blue handover).
+static void led_user_mode(uint8_t m) {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    s_led_mode = m;
+    s_led_disp = m;
+    xSemaphoreGive(s_led_lock);
+    led_write_reg(m);
+    nvs_save_settings();
+}
+// Heartbeat owner task: keeps reg 40 in sync with the current display value.
+static void led_task(void *arg) {
+    (void)arg;
+    uint8_t last = 0xFF;
+    while (1) {
+        uint8_t m;
+        xSemaphoreTake(s_led_lock, portMAX_DELAY);
+        m = s_led_disp;
+        xSemaphoreGive(s_led_lock);
+        if (m != last) { led_write_reg(m); last = m; }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
 }
 
 static size_t file_size(const char *path) {
@@ -235,7 +305,9 @@ static void log_write(const char *line, size_t n) {
     if (warn) {
         s_warned_pending_dl = true;
         // Send an out-of-band control message the JS client watches for.
-        ws_broadcast_str("\x1eCTL autodownload\n");
+        // "\x1e" is a hex escape — "CTL" must be pasted as a separate string
+        // or "C" gets eaten as a hex digit and the prefix byte is corrupted.
+        ws_broadcast_str("\x1e" "CTL autodownload\n");
     }
 }
 static void log_delete_all(void) {
@@ -351,7 +423,8 @@ static esp_err_t h_status(httpd_req_t *r) {
          "\"logBytes\":%u,\"logMax\":%u,\"warnBytes\":%u,"
          "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,"
          "\"wsFrames\":%u,\"pub\":%u,\"wsCalls\":%u,\"wsGated\":%u,"
-         "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u,\"ledMode\":%d}",
+         "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u,\"ledMode\":%d,"
+         "\"wifi\":%d,\"bootphase\":%d}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
         s_recording?"true":"false", s_live_streaming?"true":"false", s_auto_dl?"true":"false",
         (unsigned)used, (unsigned)LOG_MAX_BYTES, (unsigned)LOG_WARN_BYTES,
@@ -360,7 +433,7 @@ static esp_err_t h_status(httpd_req_t *r) {
         (unsigned)s_publish_calls, (unsigned)s_ws_broadcast_calls,
         (unsigned)s_ws_gated_off, (unsigned)s_ws_no_clients,
         (unsigned)s_ws_queue_fail, (unsigned)s_client_count,
-        (int)s_led_mode);
+        (int)s_led_mode, (int)s_wifi_up, (int)s_bootphase);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, body, n);
@@ -431,9 +504,7 @@ static esp_err_t h_led_set(httpd_req_t *r) {
     httpd_query_key_value(q, "m", v, sizeof(v));
     int m = atoi(v);
     if (m < 0 || m > LED_MODE_BLUE) m = LED_MODE_KEYFLASH;
-    s_led_mode = (uint8_t)m;
-    nvs_save_settings();
-    push_led_mode();
+    led_user_mode((uint8_t)m);        // persist + apply + put on the wire now
     httpd_resp_set_type(r, "application/json");
     char body[32]; int n = snprintf(body, sizeof(body), "{\"ledMode\":%d}", (int)s_led_mode);
     return httpd_resp_send(r, body, n);
@@ -452,53 +523,56 @@ static esp_err_t h_autodl_set(httpd_req_t *r) {
     return httpd_resp_send(r, body, n);
 }
 
-// ------------------------- Wi-Fi AP + HTTP ----------------------------
+// ------------------------- Wi-Fi AP (own task) ------------------------
+// v1 ran ALL of this on app_main's stack and IGNORED every return value,
+// so a wifi failure was invisible yet always logged "AP up". Here it is a
+// dedicated task with a big stack; the outcome drives the LED and the
+// /status "wifi" field.
 static volatile bool s_ap_ready = false;
 
 static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg; (void)data;
     if (base != WIFI_EVENT) return;
-    if (id == WIFI_EVENT_AP_START)         { s_ap_ready = true;  ESP_LOGI(TAG, "WIFI_EVENT_AP_START"); }
+    if (id == WIFI_EVENT_AP_START)         { s_ap_ready = true; s_wifi_up = 1; ESP_LOGI(TAG, "WIFI_EVENT_AP_START"); }
     else if (id == WIFI_EVENT_AP_STOP)     { s_ap_ready = false; ESP_LOGW(TAG, "WIFI_EVENT_AP_STOP"); }
-    else if (id == WIFI_EVENT_AP_STACONNECTED)         { s_sta_count++; ESP_LOGI(TAG, "STA+"); }
+    else if (id == WIFI_EVENT_AP_STACONNECTED)    { s_sta_count++; ESP_LOGI(TAG, "STA+"); }
     else if (id == WIFI_EVENT_AP_STADISCONNECTED) { if (s_sta_count) s_sta_count--; ESP_LOGI(TAG, "STA-"); }
 }
 
-static esp_err_t wifi_ap_up(void) {
-    // Every return value checked and logged: the v1 code ignored them all and
-    // logged "AP up" even when esp_wifi_start() had failed — which is exactly
-    // how a permanently-invisible wifi failure looked.
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase(); err = nvs_flash_init();
-    }
-    if (err != ESP_OK) { ESP_LOGE(TAG, "nvs_flash_init: %s", esp_err_to_name(err)); return err; }
+static void wifi_task(void *arg) {
+    (void)arg;
+    esp_err_t err;
 
-    if ((err = esp_netif_init()) != ESP_OK) { ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err)); return err; }
-    if ((err = esp_event_loop_create_default()) != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(err)); return err;
+    err = esp_netif_init();
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err)); goto wifi_failed; }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(err)); goto wifi_failed;
     }
     if (!esp_netif_create_default_wifi_ap()) {
-        ESP_LOGE(TAG, "esp_netif_create_default_wifi_ap failed"); return ESP_FAIL;
+        ESP_LOGE(TAG, "esp_netif_create_default_wifi_ap failed"); goto wifi_failed;
     }
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    if ((err = esp_wifi_init(&init)) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err)); return err; }
+    err = esp_wifi_init(&init);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err)); goto wifi_failed; }
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL, NULL);
 
     wifi_config_t ap = { 0 };
     strncpy((char *)ap.ap.ssid, AP_SSID, sizeof(ap.ap.ssid) - 1);
-    ap.ap.ssid_len = strlen(AP_SSID);
+    ap.ap.ssid_len = (uint8_t)strlen(AP_SSID);
     strncpy((char *)ap.ap.password, AP_PASS, sizeof(ap.ap.password) - 1);
     ap.ap.channel = AP_CHANNEL;
     ap.ap.max_connection = AP_MAX_STA;
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    if ((err = esp_wifi_set_mode(WIFI_MODE_AP)) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err)); return err; }
-    if ((err = esp_wifi_set_config(WIFI_IF_AP, &ap)) != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err)); return err; }
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err)); goto wifi_failed; }
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_set_config: %s", esp_err_to_name(err)); goto wifi_failed; }
 
-    // Bounded start with retries: a transient RF/PHY failure shouldn't be a
-    // permanent one-shot death (it was invisible before — err was ignored).
+    // Bounded start with retries: a transient RF/PHY blip shouldn't be a
+    // one-shot death (and in v1 the error was ignored entirely).
     err = ESP_FAIL;
     for (int attempt = 1; attempt <= 3; attempt++) {
         err = esp_wifi_start();
@@ -506,18 +580,30 @@ static esp_err_t wifi_ap_up(void) {
         ESP_LOGE(TAG, "esp_wifi_start #%d: %s", attempt, esp_err_to_name(err));
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) goto wifi_failed;
 
-    // esp_wifi_start() returning OK does not prove the radio is hosting; wait
-    // briefly for the driver's AP_START event to confirm the frame is really
-    // being broadcast.
+    // esp_wifi_start() returning OK does not prove the radio is broadcasting;
+    // wait for the driver's WIFI_EVENT_AP_START to confirm.
     for (int i = 0; i < 40 && !s_ap_ready; i++) vTaskDelay(pdMS_TO_TICKS(50));
-    if (s_ap_ready) {
-        ESP_LOGI(TAG, "AP \"%s\" up on channel %d", AP_SSID, AP_CHANNEL);
-        return ESP_OK;
+    if (!s_ap_ready) {
+        ESP_LOGW(TAG, "esp_wifi_start()=OK but AP_START never fired");
+        goto wifi_failed;
     }
-    ESP_LOGW(TAG, "esp_wifi_start()=OK but WIFI_EVENT_AP_START never fired (channel %d)", AP_CHANNEL);
-    return ESP_ERR_INVALID_STATE;
+
+    s_wifi_up = 1;
+    ESP_LOGI(TAG, "AP \"%s\" up on channel %d", AP_SSID, AP_CHANNEL);
+    boot_trace(BOOT_PHASE_WIFI_OK);
+    led_phase(LED_MODE_BLUE);
+    vTaskDelay(pdMS_TO_TICKS(4000));     // visible "everything is fine" beat
+    led_user_mode(s_led_mode);           // hand the wire back to the saved mode
+    vTaskDelete(NULL);
+
+wifi_failed:
+    s_wifi_up = 0;
+    boot_trace(BOOT_PHASE_WIFI_FAIL);
+    led_phase(LED_MODE_RED);             // stays red — the AP is genuinely down
+    ESP_LOGE(TAG, "Wi-Fi AP NOT up");
+    vTaskDelete(NULL);
 }
 
 static esp_err_t http_up(void) {
@@ -680,55 +766,47 @@ static void uart_task(void *arg) {
 
 // ------------------------- app entry ---------------------------------
 void app_main(void) {
-    ESP_LOGI(TAG, "ESP32-C6 KeyLogger v1 starting");
+    ESP_LOGI(TAG, "ESP32-C6 KeyLogger v2 starting");
     s_ws_lock  = xSemaphoreCreateMutex();
     s_log_lock = xSemaphoreCreateMutex();
+    s_led_lock = xSemaphoreCreateMutex();
     s_live_ring = xRingbufferCreate(LIVE_RING_BYTES, RINGBUF_TYPE_BYTEBUF);
     // Live streaming defaults to OFF at boot so browsers connecting to the
     // AP after keystrokes happened don't get flooded with a backlog. The
     // user turns it on with the Start Live Logging button when they want it.
     s_live_streaming = false;
 
-    // NVS up front (idempotent — wifi_ap_up also initialises it) so that
-    // settings are loaded before anything is pushed to the P4.
     esp_err_t nerr = nvs_flash_init();
     if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase(); nerr = nvs_flash_init();
     }
     if (nerr != ESP_OK) ESP_LOGE(TAG, "nvs_flash_init: %s", esp_err_to_name(nerr));
 
-    // Bring SDIO slave up BEFORE Wi-Fi so the host CMD5/CMD3 enumeration
-    // isn't racing against Wi-Fi driver init on the C6's single core.
+    nvs_load_settings();          // recording / auto-download / LED mode
+    boot_trace(BOOT_PHASE_BOOT);
+
+    // Bring SDIO slave up BEFORE any wifi work so the P4's CMD5/CMD3 probe
+    // isn't racing wifi driver init on the C6's single core.
     if (sdio_slave_up() != ESP_OK) {
         ESP_LOGE(TAG, "SDIO slave failed (P4 link disabled)");
-        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_RED);   // best effort
+        boot_trace(BOOT_PHASE_WIFI_FAIL);
+        led_phase(LED_MODE_RED);          // no link = stay red forever
     } else {
-        // LED telemetry (the only live channel — the C6 has no usable serial
-        // console in this build). The P4 renders scratch reg 40 -> the RGB LED
-        // every 500 ms, so:
-        //   GREEN = SDIO up, booting          (frozen GREEN = crashed before wifi verdict)
-        //   BLUE  = Wi-Fi AP confirmed up     (held ~4 s, then saved mode)
-        //   RED   = Wi-Fi AP failed           (stays RED)
-        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_GREEN);
+        boot_trace(BOOT_PHASE_SDIO_UP);
+        led_phase(LED_MODE_GREEN);        // alive + SDIO enumerated
     }
-    nvs_load_settings();     // load first so push_led_mode publishes the SAVED mode
 
-    if (wifi_ap_up() == ESP_OK) {
-        // AP really hosts -> BLUE, hold it long enough to be seen, then
-        // restore the saved operating mode.
-        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_BLUE);
-        vTaskDelay(pdMS_TO_TICKS(4000));
-        push_led_mode();     // saved mode (default KEYFLASH = dim green idle)
-    } else {
-        ESP_LOGE(TAG, "Wi-Fi AP failed");
-        sdio_slave_write_reg(SDIO_REG_LED_MODE, LED_MODE_RED);   // stay RED
-    }
+    // LED wire owner first so boot telemetry is on reg 40 before the wifi
+    // verdict lands; wifi gets its own roomy task (never runs on main).
+    xTaskCreate(led_task,   "led_wire",  2048, NULL, 2, NULL);
+    xTaskCreate(wifi_task,  "wifi_up",   8192, NULL, 6, NULL);
+
     if (storage_up() != ESP_OK) ESP_LOGE(TAG, "SPIFFS failed (log persistence disabled)");
     if (http_up()   != ESP_OK) ESP_LOGE(TAG, "HTTP server failed");
-
     xTaskCreate(uart_task, "uart_rx", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "SSID \"%s\" PASS \"%s\" -> http://192.168.4.1  rec=%d adl=%d",
              AP_SSID, AP_PASS, s_recording, s_auto_dl);
+    boot_trace(BOOT_PHASE_RUNNING);
     while (1) vTaskDelay(pdMS_TO_TICKS(5000));
 }
