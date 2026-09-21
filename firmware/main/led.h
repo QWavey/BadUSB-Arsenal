@@ -11,6 +11,7 @@
 // the setting over the SDIO reverse channel when we add one.
 
 #include <stdint.h>
+#include "esp_err.h"
 
 // IDs mirror c6-firmware/main/main.c LED_MODE_* -- must stay in sync.
 typedef enum {
@@ -24,6 +25,7 @@ typedef enum {
 void led_init(void);
 void led_set_mode(led_mode_t m);
 led_mode_t led_get_mode(void);
+esp_err_t led_init_status(void);  // ESP_OK if LED driver initialized successfully
 
 // Call from any task when a HID keyboard event was received. Non-blocking.
 void led_pulse_key(void);

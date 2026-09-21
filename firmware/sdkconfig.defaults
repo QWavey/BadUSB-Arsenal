@@ -13,8 +13,11 @@ CONFIG_ESP32P4_REV_MIN_100=y
 CONFIG_TINYUSB_RHPORT_HS=n
 CONFIG_TINYUSB_RHPORT_FS=y
 
-# TinyUSB HID class enabled
-CONFIG_TINYUSB_HID_COUNT=1
+# TinyUSB HID class — TWO instances so the composite (keyboard on interface 0,
+# mouse on interface 1) can respond to control requests on BOTH interfaces.
+# With HID_COUNT=1, Windows' usbccgp fails the whole device with Code 10 /
+# STATUS_UNSUCCESSFUL because interface 1 STALLs its control transfers.
+CONFIG_TINYUSB_HID_COUNT=2
 CONFIG_TINYUSB_HID_BUFSIZE=64
 
 # We keep TinyUSB task at a decent priority
@@ -51,4 +54,6 @@ CONFIG_BT_ENABLED=n
 # Windows treat this as a brand-new device and bind it fresh.
 CONFIG_TINYUSB_DESC_USE_DEFAULT_PID=n
 CONFIG_TINYUSB_DESC_CUSTOM_PID=0x4B44
-CONFIG_TINYUSB_DESC_BCD_DEVICE=0x0201
+# bcdDevice is now set in the custom device_desc in main.c (0x0202).
+# Kconfig value below is no longer used since device_descriptor != NULL in tcfg.
+CONFIG_TINYUSB_DESC_BCD_DEVICE=0x0202

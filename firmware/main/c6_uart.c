@@ -382,15 +382,42 @@ static void tx_line(const char *prefix, const char *body) {
 // EVT frame at the moment it happens. Re-announcing on a timer just spammed
 // the log with duplicate KBD_CONNECT / MOUSE_CONNECT lines.
 
+// Called after s_ready flips true. Re-emits every "we are currently in state
+// X" EVT whose original edge may have fired BEFORE the SDIO link was up (and
+// been silently dropped by tx_line). Without this, a keyboard/mouse plugged
+// in at cold boot never gets a KBD_CONNECT / MOUSE_CONNECT on the wire and
+// the C6 web UI's pill sits permanently at "not attached".
+static void reannounce_state(void) {
+    tx_line("EVT", "P4_READY");
+    if (led_init_status() == ESP_OK) {
+        tx_line("EVT", "P4_LED_OK");
+    } else {
+        char body[48];
+        snprintf(body, sizeof(body), "P4_LED_FAIL %s", esp_err_to_name(led_init_status()));
+        tx_line("EVT", body);
+    }
+    if (s_kbd_seen_connected)   tx_line("EVT", "KBD_CONNECT");
+    if (s_mouse_seen_connected) tx_line("EVT", "MOUSE_CONNECT");
+}
+
 static void link_bringup_task(void *arg) {
     (void)arg;
-    if (sdio_link_bring_up() != ESP_OK) {
-        ESP_LOGE(TAG, "SDIO link failed — P4->C6 disabled");
-        vTaskDelete(NULL);
-        return;
+    // Retry forever on failure. A first-boot SDIO glitch used to permanently
+    // disable the P4->C6 link (task deleted itself and nothing else could
+    // recover it, because led_poll_task — which owns recover_sdio_link — is
+    // only spawned after the FIRST successful bring-up).
+    int backoff_ms = 500;
+    while (sdio_link_bring_up() != ESP_OK) {
+        ESP_LOGE(TAG, "SDIO link failed — retrying in %d ms", backoff_ms);
+        // Clean partial state left by the failed probe so the next attempt
+        // starts from a known-empty host.
+        if (s_card) { free(s_card); s_card = NULL; }
+        (void)sdmmc_host_deinit();
+        vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+        if (backoff_ms < 5000) backoff_ms *= 2;
     }
     s_ready = true;
-    tx_line("EVT", "P4_READY");
+    reannounce_state();
     // Now that SDIO is up, spin up the reverse-channel poller so the C6
     // web UI's LED mode changes reach us.
     xTaskCreate(led_poll_task, "led_poll", 3072, NULL, 2, NULL);
@@ -418,7 +445,9 @@ static bool recover_sdio_link(void) {
         return false;
     }
     s_ready = true;
-    tx_line("EVT", "P4_READY");
+    // Same re-announce logic as first-boot: after a C6 reboot the slave's
+    // state is fresh, so we must repaint every "currently attached" pill.
+    reannounce_state();
     ESP_LOGI(TAG, "SDIO link recovered");
     return true;
 }
@@ -427,7 +456,17 @@ static bool recover_sdio_link(void) {
 static void led_poll_task(void *arg) {
     (void)arg;
     if (!s_card) { vTaskDelete(NULL); return; }
-    uint8_t last_led = 0xFF;
+    // Start last_led at 0 (LED_MODE_OFF). C6's scratch reg 40 is 0 until the
+    // C6's led_task writes its first byte, so the FIRST poll after SDIO bring-
+    // up almost always returns 0 (a stale zero, not a C6 intent to darken).
+    // With last_led = 0xFF this triggered led_set_mode(LED_MODE_OFF) and the
+    // LED went dark ~2 s into boot. last_led = 0 skips that spurious edge.
+    // A real user-driven OFF still lands after we've seen any non-zero value
+    // once, and a failure-blink RED/OFF pattern still animates correctly.
+    uint8_t last_led = 0;
+    // Also require the first NON-ZERO value to arrive before treating any
+    // 0 as an OFF command. Until then, treat 0 as "C6 hasn't spoken yet."
+    bool seen_nonzero = false;
     uint8_t last_lay = 0xFF;
     int read_fails = 0;
     TickType_t last_recover = 0;
@@ -436,7 +475,10 @@ static void led_poll_task(void *arg) {
         esp_err_t err = sdmmc_io_read_byte(s_card, 0, C6_REG_LED_MODE_CCCR_ADDR, &v);
         if (err == ESP_OK) {
             read_fails = 0;
-            if (v != last_led) {
+            if (v != 0) seen_nonzero = true;
+            // Apply the change ONLY if it's a real user/telemetry byte from
+            // the C6. A pre-first-write 0 is silence, not an OFF command.
+            if (v != last_led && (v != 0 || seen_nonzero)) {
                 // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
                 led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
                 last_led = v;
@@ -453,7 +495,10 @@ static void led_poll_task(void *arg) {
             last_recover = xTaskGetTickCount();
             read_fails = 0;
             if (recover_sdio_link()) {
-                last_led = 0xFF;   // re-arm so the telemetry that follows lands
+                // After a C6 reset the slave's scratch is fresh — same first-
+                // read-is-zero window as boot. Reset the guard to match.
+                last_led = 0;
+                seen_nonzero = false;
                 last_lay = 0xFF;
             }
         }
@@ -623,6 +668,8 @@ void c6_uart_set_layout(const char *name) {
 // Public escape hatch so hid_host_task.c can push status events (like
 // ENUM_RETRY N/8) to the C6 web UI without pulling in c6_uart's internals.
 void c6_uart_send_evt(const char *body) { if (body) tx_line("EVT", body); }
+
+bool c6_uart_link_ready(void) { return s_ready; }
 
 void c6_uart_kbd_connect(void)     { s_kbd_interface_present = true; s_kbd_iface_up_ms = now_ms(); memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
 void c6_uart_kbd_disconnect(void) {

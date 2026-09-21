@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 // One-time init. Idempotent; safe to call from app_main after PHY swap.
 void c6_uart_init(void);
@@ -39,3 +40,9 @@ void c6_uart_send_evt(const char *body);
 // Set the active keyboard layout ("US", "DE", "UK"). Called by the SDIO RX
 // side of c6_uart.c when the C6 pushes a "SETLAYOUT <name>\n" packet.
 void c6_uart_set_layout(const char *name);
+
+// True once the SDIO link to the C6 is up and EVT/KEY frames actually leave
+// the P4. pc_watch_task in main.c uses this to defer PC_CONNECT until the
+// wire is live (so the "PC" pill isn't stuck red because the first mount
+// edge fired before SDIO bring-up).
+bool c6_uart_link_ready(void);

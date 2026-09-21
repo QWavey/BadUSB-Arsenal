@@ -50,11 +50,26 @@ static void usb_phy_swap_to_otgfs_on_core_typec(void)
 
 static const char *TAG = "hid_dev";
 
-enum { REPORT_ID_KEYBOARD = 1, REPORT_ID_MOUSE = 2 };
+// Each HID function gets its OWN interface (kbd on 0, mouse on 1), so there
+// is only ever one report per interface — a report-ID prefix is not needed
+// and is in fact WRONG for a Boot-subclass interface. TUD_HID_DESCRIPTOR
+// auto-sets bInterfaceSubClass = HID_SUBCLASS_BOOT (1) whenever the boot
+// protocol arg is non-zero (see TinyUSB usbd.h TUD_HID_DESCRIPTOR macro).
+// Windows' boot-HID driver expects 8-byte keyboard reports and 3-byte mouse
+// reports with NO leading report ID. Prepending one caused Windows to drop
+// or misinterpret every report — the "keys arrive in ESP but never reach
+// the PC" symptom.
+// Report ID 0 means "no ID byte on the wire" in TinyUSB's send helpers.
+enum { REPORT_ID_KEYBOARD = 0, REPORT_ID_MOUSE = 0 };
 
-static const uint8_t hid_report_desc[] = {
-    TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(REPORT_ID_KEYBOARD)),
-    TUD_HID_REPORT_DESC_MOUSE   (HID_REPORT_ID(REPORT_ID_MOUSE))
+// Keyboard boot report descriptor (interface 0) — no REPORT_ID.
+static const uint8_t hid_keyboard_report_desc[] = {
+    TUD_HID_REPORT_DESC_KEYBOARD()
+};
+
+// Mouse boot report descriptor (interface 1) — no REPORT_ID.
+static const uint8_t hid_mouse_report_desc[] = {
+    TUD_HID_REPORT_DESC_MOUSE()
 };
 
 // Serial string is chip-unique (filled from eFuse MAC in app_main) so two
@@ -66,7 +81,8 @@ static const char *string_desc[] = {
     "Spotpear",                   // 1: Manufacturer
     "ESP32-P4 HID Passthrough",   // 2: Product
     serial_str,                   // 3: Serial
-    "HID Passthrough"             // 4: HID interface
+    "HID Keyboard",               // 4: HID keyboard interface
+    "HID Mouse"                   // 5: HID mouse interface
 };
 
 // ---------------------------------------------------------------------------
@@ -122,18 +138,78 @@ static const uint8_t desc_ms_os_20[] = {
 
 _Static_assert(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "MS OS 2.0 table size mismatch");
 
-#define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_DESC_LEN)
+// ---------------------------------------------------------------------------
+// Custom device descriptor
+// ---------------------------------------------------------------------------
+// Windows binds any multi-interface device via USB\COMPOSITE → usbccgp.
+// usbccgp REQUIRES IADs to know which interfaces belong to which function;
+// without them it fails with 0xC0000001 (Code 10).
+// Setting bDeviceClass=0xEF / SubClass=0x02 / Protocol=0x01 (IAD-capable)
+// lets usbccgp read the IADs in the configuration descriptor and correctly
+// create one HID child device per interface.
+// bcdDevice bumped every time the HID descriptor changes shape (report-ID
+// present/absent, endpoint layout) so Windows discards its cached parse and
+// re-evaluates the descriptor fresh on the next plug-in.
+//   0x0201 -> original single-interface layout with report IDs 1+2
+//   0x0202 -> composite kbd+mouse WITH per-interface report ID 1
+//   0x0203 -> composite kbd+mouse WITHOUT report IDs (current — boot subclass
+//             requires 8-byte / 3-byte reports with no prefix)
+static const tusb_desc_device_t device_desc = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    // IAD-capable composite: bDeviceClass=0xEF, SubClass=0x02, Protocol=0x01
+    // Required by USB spec when IADs are present in the configuration.
+    .bDeviceClass       = 0xEF,
+    .bDeviceSubClass    = 0x02,
+    .bDeviceProtocol    = 0x01,
+    .bMaxPacketSize0    = 64,
+    .idVendor           = 0x303A,           // Espressif VID
+    .idProduct          = 0x4B44,           // custom PID "KD" (keyboard)
+    .bcdDevice          = 0x0203,           // bumped every time the HID report layout changes
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01,
+};
+
+// IAD length is 8 bytes (USB 2.0 spec §9.6.4)
+#define TUD_IAD_DESC_LEN  8
+// One IAD covers exactly one interface here (keyboard or mouse).
+// Class=0x03 (HID), SubClass/Protocol=0 (no boot override at the IAD level —
+// the HID interface descriptor already sets the subclass/protocol).
+#define TUD_IAD_DESCRIPTOR(_first_itf, _itf_count, _class, _subclass, _protocol, _stridx) \
+    TUD_IAD_DESC_LEN, TUSB_DESC_INTERFACE_ASSOCIATION,                               \
+    _first_itf, _itf_count, _class, _subclass, _protocol, _stridx
+
+// Total config length = config header + 2×(IAD + HID interface descriptor)
+#define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + \
+                       TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
+                       TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN)
 
 static const uint8_t configuration_desc[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, CFG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
-    // Interval byte = 1 ms poll instead of 10 ms — cuts one-way latency by 9 ms
-    TUD_HID_DESCRIPTOR(0, 4, HID_ITF_PROTOCOL_NONE, sizeof(hid_report_desc), 0x81, 16, 1),
+    // Configuration header: 2 interfaces, no string, total length, attributes, power
+    TUD_CONFIG_DESCRIPTOR(1, 2, 0, CFG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+
+    // --- Keyboard function (interface 0) ---
+    // IAD: first_iface=0, count=1, class=HID(0x03), subclass=Boot(0x01), proto=Keyboard(0x01)
+    TUD_IAD_DESCRIPTOR(0, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_KEYBOARD, 0),
+    // HID interface descriptor — bInterval = 1 ms (fastest legal FS poll,
+    // matches the pre-composite baseline for minimum keystroke latency).
+    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof(hid_keyboard_report_desc), 0x81, 16, 1),
+
+    // --- Mouse function (interface 1) ---
+    // IAD: first_iface=1, count=1, class=HID(0x03), subclass=Boot(0x01), proto=Mouse(0x02)
+    TUD_IAD_DESCRIPTOR(1, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_MOUSE, 0),
+    // HID interface descriptor — 1 ms poll (see above).
+    TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_MOUSE, sizeof(hid_mouse_report_desc), 0x82, 16, 1),
 };
 
 // TinyUSB required callbacks
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
-    (void)instance;
-    return hid_report_desc;
+    // instance 0 = keyboard interface, instance 1 = mouse interface
+    if (instance == 0) return hid_keyboard_report_desc;
+    return hid_mouse_report_desc;
 }
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen) {
@@ -142,11 +218,11 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_t
 }
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance;
-    // PC pushes Caps/Num/Scroll Lock state as an OUTPUT report on the keyboard
-    // interface. Boot layout is a single byte bitmap. Forward to the physical
-    // keyboard so its LEDs stay in sync with the PC.
-    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == REPORT_ID_KEYBOARD && bufsize >= 1) {
+    // Only keyboard interface (instance 0) receives LED output reports.
+    // With no report ID declared, TinyUSB calls this with report_id = 0 and
+    // buffer is the raw 1-byte LED bitmap.
+    if (instance != 0) return;
+    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == 0 && bufsize >= 1) {
         hid_host_set_kbd_leds(buffer[0]);
     }
 }
@@ -192,6 +268,14 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
 //     then send an explicit "all keys released" keyboard report before
 //     forwarding live input. Also handled on keyboard re-connect via
 //     HID_REP_KIND_KEYBOARD_RESET from hid_host_task.c.
+// CONFIG_FREERTOS_HZ = 100 in this build, so pdMS_TO_TICKS(1) == 0.
+// vTaskDelay(0) only yields to same-or-higher-priority tasks, so a prio-10
+// forward_task on core 1 that spins on pdMS_TO_TICKS(1) BLOCKS TinyUSB
+// (prio 5, also core 1) forever — the endpoint stays busy, kbd_ready stays
+// false, no key ever gets sent to Windows. Any retry-yield here must be at
+// least one full tick (10 ms at 100 Hz).
+#define FWD_RETRY_YIELD  pdMS_TO_TICKS(10)
+
 static void forward_task(void *arg) {
     hid_bridge_msg_t m;
     bool have_pending = false;
@@ -223,42 +307,47 @@ static void forward_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
-        if (!tud_hid_ready())  { vTaskDelay(pdMS_TO_TICKS(1)); continue; }
+        // Check HID ready per-interface (instance 0 = keyboard, 1 = mouse)
+        bool kbd_ready = tud_hid_n_ready(0);
+        bool mouse_ready = tud_hid_n_ready(1);
 
         // Settle window over: tell the PC no key is held, then forward live
         // input. Without this, a key-release that got dropped during the
         // window leaves Windows holding the key/modifier forever.
         if (reset_pending) {
             static const uint8_t all_zero[6] = {0};
-            if (tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, all_zero)) {
+            if (kbd_ready && tud_hid_n_keyboard_report(0, REPORT_ID_KEYBOARD, 0, all_zero)) {
                 reset_pending = false;
             } else {
-                vTaskDelay(pdMS_TO_TICKS(1));
+                vTaskDelay(FWD_RETRY_YIELD);
                 continue;
             }
         }
 
         bool sent = false;
         if (m.kind == HID_REP_KIND_KEYBOARD && m.len >= 8) {
+            if (!kbd_ready) { vTaskDelay(FWD_RETRY_YIELD); continue; }
             uint8_t mod = m.data[0];
             uint8_t kcs[6]; memcpy(kcs, &m.data[2], 6);
-            sent = tud_hid_keyboard_report(REPORT_ID_KEYBOARD, mod, kcs);
+            sent = tud_hid_n_keyboard_report(0, REPORT_ID_KEYBOARD, mod, kcs);
         } else if (m.kind == HID_REP_KIND_KEYBOARD_RESET) {
+            if (!kbd_ready) { vTaskDelay(FWD_RETRY_YIELD); continue; }
             static const uint8_t all_zero[6] = {0};
-            sent = tud_hid_keyboard_report(REPORT_ID_KEYBOARD, 0, all_zero);
+            sent = tud_hid_n_keyboard_report(0, REPORT_ID_KEYBOARD, 0, all_zero);
         } else if (m.kind == HID_REP_KIND_MOUSE && m.len >= 3) {
+            if (!mouse_ready) { vTaskDelay(FWD_RETRY_YIELD); continue; }
             uint8_t buttons = m.data[0];
             int8_t dx = (int8_t)m.data[1];
             int8_t dy = (int8_t)m.data[2];
             // Boot mouse report is 3 bytes; some report a 4th byte (wheel).
             // Forward it when present so scroll wheels work end-to-end.
             int8_t wheel = (m.len >= 4) ? (int8_t)m.data[3] : 0;
-            sent = tud_hid_mouse_report(REPORT_ID_MOUSE, buttons, dx, dy, wheel, 0);
+            sent = tud_hid_n_mouse_report(1, REPORT_ID_MOUSE, buttons, dx, dy, wheel, 0);
         } else {
             sent = true;   // unknown kind, drop
         }
         if (sent) have_pending = false;
-        else      vTaskDelay(pdMS_TO_TICKS(1));
+        else      vTaskDelay(FWD_RETRY_YIELD);
     }
 }
 
@@ -270,12 +359,22 @@ static void forward_task(void *arg) {
 static void pc_watch_task(void *arg) {
     (void)arg;
     bool was = false;
+    bool announced_ready = false;   // did we push the "current" state after SDIO came up?
     while (1) {
         bool now = tud_mounted();
+        bool link = c6_uart_link_ready();
         if (now != was) {
             was = now;
             c6_uart_send_evt(now ? "PC_CONNECT" : "PC_DISCONNECT");
             ESP_LOGI(TAG, "PC %s", now ? "mounted" : "unmounted");
+        }
+        // First time SDIO becomes ready after boot: re-emit the current PC
+        // state so an early mount edge that fired before the link was up
+        // (and got silently dropped by tx_line) is caught. Without this the
+        // web UI's "PC" pill stays permanently at DISCONNECT on cold boot.
+        if (link && !announced_ready) {
+            announced_ready = true;
+            c6_uart_send_evt(now ? "PC_CONNECT" : "PC_DISCONNECT");
         }
         vTaskDelay(pdMS_TO_TICKS(300));
     }
@@ -316,7 +415,11 @@ void app_main(void) {
     configASSERT(g_hid_bridge_q);
 
     const tinyusb_config_t tcfg = {
-        .device_descriptor = NULL,   // use default VID/PID from Kconfig
+        // Custom descriptor: bDeviceClass=0xEF/0x02/0x01 (IAD-capable composite)
+        // + bcdDevice=0x0202 to bust Windows' stale driver cache for 0x0201.
+        // Without this esp_tinyusb falls back to its own default descriptor
+        // (bDeviceClass=0x00) and the IADs in configuration_desc are ignored.
+        .device_descriptor = &device_desc,
         .string_descriptor = string_desc,
         .string_descriptor_count = sizeof(string_desc) / sizeof(string_desc[0]),
         .external_phy = false,
@@ -324,6 +427,7 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(tinyusb_driver_install(&tcfg));
     ESP_LOGI(TAG, "TinyUSB HID device up (FS port -> PC)");
+    c6_uart_send_evt("USB_UP");
 
     xTaskCreatePinnedToCore(pc_watch_task, "pc_watch", 2048, NULL, 6, NULL, 0);
 

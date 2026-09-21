@@ -196,10 +196,9 @@ static void led_fail_code(uint8_t code) {
 }
 // Adopt the user's saved mode (web /led endpoint or post-blue handover).
 static void led_user_mode(uint8_t m) {
-    if (m == LED_MODE_OFF && s_wifi_up != 1) {
-        // Never let a saved "off" make the LED go dark before the AP verdict
-        // landed — the LED is the only live health channel, and dark-on-boot
-        // is exactly the failure the user kept seeing ("green then dark").
+    if (m == LED_MODE_OFF && s_wifi_up == 1) {
+        m = LED_MODE_BLUE;  // never dark after WiFi up
+    } else if (m == LED_MODE_OFF && s_wifi_up != 1) {
         ESP_LOGW(TAG, "refusing OFF before wifi confirmed");
         return;
     }

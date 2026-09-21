@@ -7,6 +7,7 @@
 // usb_host_hid/include/usb/hid.h and tinyusb/src/class/hid/hid.h.
 
 #include <string.h>
+#include <limits.h>
 #include "esp_log.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
@@ -198,15 +199,26 @@ static void hid_device_cb(hid_host_device_handle_t hdev,
     if (err != ESP_OK) ESP_LOGW(TAG, "device_start: %s", esp_err_to_name(err));
 }
 
+// Notification value semantics for the creator (hid_host_task_start):
+//   1 = usb_host_install succeeded, event loop is running
+//   2 = usb_host_install failed, this task is exiting
+// Sending both values (instead of just the success signal) means the
+// creator can distinguish a real failure from a 2s notify-take timeout and
+// report it up to the web UI instead of silently proceeding to a doomed
+// hid_host_install call.
 static void usb_host_lib_task(void *arg) {
     const usb_host_config_t hcfg = { .skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LEVEL1 };
     esp_err_t err = usb_host_install(&hcfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "usb_host_install failed: %s — halting host task", esp_err_to_name(err));
+        char body[64];
+        snprintf(body, sizeof(body), "USB_HOST_FAIL %s", esp_err_to_name(err));
+        c6_uart_send_evt(body);
+        xTaskNotify((TaskHandle_t)arg, 2, eSetValueWithOverwrite);
         vTaskDelete(NULL);
         return;
     }
-    xTaskNotifyGive(arg);
+    xTaskNotify((TaskHandle_t)arg, 1, eSetValueWithOverwrite);
 
     while (1) {
         uint32_t flags;
@@ -309,8 +321,19 @@ static void port_flap_watchdog(void *arg) {
 
 void hid_host_task_start(void) {
     TaskHandle_t self = xTaskGetCurrentTaskHandle();
+    // Clear any pending notification so the take below only reflects the
+    // reply from usb_host_lib_task's install attempt.
+    xTaskNotifyStateClear(self);
     xTaskCreatePinnedToCore(usb_host_lib_task, "usb_host", 4096, self, 5, NULL, 0);
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+    // Wait up to 5 s for the host lib to say whether install succeeded (1)
+    // or failed (2). A timeout with no value means the host task is stuck.
+    uint32_t v = 0;
+    xTaskNotifyWait(0, ULONG_MAX, &v, pdMS_TO_TICKS(5000));
+    if (v != 1) {
+        ESP_LOGE(TAG, "usb_host lib did not come up (notify=%u); skipping hid_host_install", (unsigned)v);
+        c6_uart_send_evt(v == 2 ? "USB_HOST_DEAD" : "USB_HOST_TIMEOUT");
+        return;
+    }
 
     const hid_host_driver_config_t dcfg = {
         .create_background_task = true,
@@ -323,9 +346,13 @@ void hid_host_task_start(void) {
     esp_err_t err = hid_host_install(&dcfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "hid_host_install failed: %s", esp_err_to_name(err));
+        char body[64];
+        snprintf(body, sizeof(body), "HID_HOST_FAIL %s", esp_err_to_name(err));
+        c6_uart_send_evt(body);
         return;
     }
     ESP_LOGI(TAG, "USB host HID installed on HS port. Plug keyboard into U2/U3 (U4 switch = Host).");
+    c6_uart_send_evt("USB_HOST_UP");
 
     spawn_watchdog();
 }

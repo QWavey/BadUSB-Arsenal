@@ -9,7 +9,7 @@
 
 #define LED_GPIO           10
 #define LED_FLASH_MS      120
-#define LED_IDLE_BRIGHT   12    // dim so it's not glaring in a dark room
+#define LED_IDLE_BRIGHT   40    // dim idle glow — visible in ambient light, not glaring at night
 #define LED_TELE_BRIGHT   48    // boot/status colors MUST be readable
 #define LED_BRIGHT_MS   2000    // how long a verdict stays bright before fading
 
@@ -18,6 +18,7 @@ static led_strip_handle_t s_strip;
 static volatile led_mode_t s_mode = LED_MODE_KEY_FLASH;
 static volatile TickType_t s_mode_since;
 static SemaphoreHandle_t s_sig;
+static esp_err_t s_init_err = ESP_ERR_INVALID_STATE;  // track init result
 
 // The LED doubles as the C6 boot/wifi telemetry display (its only live
 // channel). Telemetry colors are rendered BRIGHT on change so a green/blue/
@@ -92,13 +93,26 @@ void led_init(void) {
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = 10 * 1000 * 1000,
     };
-    esp_err_t err = led_strip_new_rmt_device(&cfg, &rmt, &s_strip);
-    if (err != ESP_OK) { ESP_LOGE(TAG, "led_strip_new: %s", esp_err_to_name(err)); return; }
+    s_init_err = led_strip_new_rmt_device(&cfg, &rmt, &s_strip);
+    if (s_init_err != ESP_OK) { ESP_LOGE(TAG, "led_strip_new: %s", esp_err_to_name(s_init_err)); return; }
+
+    // Boot self-test: 3 bright green blinks (visible without C6)
+    for (int i = 0; i < 3; i++) {
+        led_strip_set_pixel(s_strip, 0, 0, 200, 0);
+        led_strip_refresh(s_strip);
+        vTaskDelay(pdMS_TO_TICKS(80));
+        led_strip_clear(s_strip);
+        led_strip_refresh(s_strip);
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
     s_sig = xSemaphoreCreateBinary();
     s_mode_since = xTaskGetTickCount();
     xTaskCreatePinnedToCore(led_task, "led", 2048, NULL, 3, NULL, 0);
-    ESP_LOGI(TAG, "status LED on GPIO%d ready", LED_GPIO);
+    ESP_LOGI(TAG, "status LED on GPIO%d ready (init=%s)", LED_GPIO, esp_err_to_name(s_init_err));
 }
+
+esp_err_t led_init_status(void) { return s_init_err; }
 
 void led_set_mode(led_mode_t m) {
     if ((int)m > (int)LED_MODE_BLUE_ONLY) m = LED_MODE_KEY_FLASH;
