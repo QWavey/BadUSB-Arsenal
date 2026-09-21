@@ -823,7 +823,17 @@ wifi_failed:
 
 static esp_err_t http_up(void) {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 16;
+    // Real count: main.c routes (~13) + badusb real[] (36) + stubs
+    // (54 × 2 methods = 108) + DELETE variants = ~160. IDF silently
+    // drops handlers past the cap, so 128 was still short and
+    // /api/tasks / /api/cancel-task / /api/factory-reset / /extensions
+    // all 404'd. 256 gives runway for future routes.
+    cfg.max_uri_handlers = 256;
+    // Enable wildcard URI matching so we can bind a single
+    // "/languages/?*" handler for all 26 Hak5 layout files instead of
+    // registering each one individually. Also lets a future "/scripts/*"
+    // slot in cleanly.
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.recv_wait_timeout = 5;
     cfg.send_wait_timeout = 10;
     cfg.stack_size = 8192;

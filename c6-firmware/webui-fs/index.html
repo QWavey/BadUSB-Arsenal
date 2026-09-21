@@ -24,6 +24,7 @@
             <button class="tablinks"        data-tour-tab="Settings"     onclick="openTab(event, 'Settings')">Settings</button>
             <button class="tablinks"        data-tour-tab="Statistics"   onclick="openTab(event, 'Statistics')">Stats</button>
             <button class="tablinks"        data-tour-tab="Wiki"         onclick="openTab(event, 'Wiki')">Syntaxes</button>
+            <button class="tablinks"        data-tour-tab="Keylog"       onclick="openTab(event, 'Keylog')">Keylog</button>
         </nav>
 
         <div id="tabContainer">
@@ -574,6 +575,18 @@
                 </p>
                 <input type="text" id="wikiSearch" placeholder="Filter... e.g. LED, WIFI, KEY, ATTACK" style="width: 100%; margin-bottom: 12px;" oninput="filterWiki()">
                 <div id="wikiTable" style="max-height: 70vh; overflow-y: auto;"></div>
+            </section>
+
+            <!-- Keylog Tab — hosts our original P4-KeyLogger dashboard via /klog inside an iframe so its live-log WebSocket, pill state and settings all keep working. -->
+            <section id="tab-Keylog" class="tabcontent">
+                <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                    <h3>Keylog — live keystrokes from the hub</h3>
+                    <a href="/klog" target="_blank" class="control-btn" style="text-decoration:none">Open in new tab ↗</a>
+                </div>
+                <p style="color: var(--muted); font-size: 13px; margin: 6px 0 12px;">
+                    Streams every key pressed on the USB keyboard attached to the CH334 hub. Pill state, live log, recording toggle, LED mode and layout are all controlled from inside this frame.
+                </p>
+                <iframe id="keylogFrame" src="/klog" style="width:100%; height:75vh; border:1px solid var(--bd); border-radius:8px; background:#0e1116;"></iframe>
             </section>
         </div>
     </div>

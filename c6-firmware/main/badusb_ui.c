@@ -65,13 +65,22 @@ static const char *TAG = "badusb_ui";
 // writes the next byte. Returns how many bytes actually landed.
 static int badusb_stream_ascii(const char *buf, int len) {
     int sent = 0;
+    // If the P4 side of the reg-44 link stalls (SDIO recovery, kbd
+    // enum flap, PC unmounted so HID buffers back up), we DO NOT
+    // want to pin the HTTPD worker for 200 * 10 ms = 2 s PER byte —
+    // that would blow past recv_wait_timeout and take out concurrent
+    // /api/stats polls, which is why the UI showed a "connection lost"
+    // banner even though the write succeeded. Cap the per-byte spin
+    // at 100 ms and abort the rest of the stream once any byte stalls
+    // (the caller can retry the tail on the next invocation).
     for (int i = 0; i < len; i++) {
         uint8_t c = (uint8_t)buf[i];
         // Strip \r so a CRLF paste (Windows/Mac clipboard) fires Enter
         // exactly once, not twice, on the target PC.
         if (c == 0 || c > 127 || c == '\r') continue;
-        for (int spin = 0; spin < 200; spin++) {
-            if (sdio_slave_read_reg(SDIO_REG_BADUSB_TYPE) == 0) break;
+        int spin = 0;
+        while (sdio_slave_read_reg(SDIO_REG_BADUSB_TYPE) != 0) {
+            if (++spin >= 10) return sent;   // 10 * 10 ms = 100 ms cap
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         if (sdio_slave_write_reg(SDIO_REG_BADUSB_TYPE, c) == ESP_OK) sent++;
@@ -261,6 +270,36 @@ static void ducky_key(uint8_t hid) {
     (void)hid;
 }
 
+// Runs the DuckyScript parser on a heap-owned buffer. This is the
+// former body of h_execute — extracted so we can spawn it as a task
+// and have h_execute return HTTP 200 immediately instead of tying up
+// the HTTPD worker for 5+ seconds. The task free()s the buffer when
+// done. Note: only one script runs at a time (a second POST while
+// this task is live will just append its bytes to reg 44 which will
+// interleave with the first — user-visible effect is scrambled text;
+// no crash).
+static void execute_task(void *arg) {
+    char *script = (char *)arg;
+    int lines = 0, executed = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(script, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
+        while (*line && isspace((unsigned char)*line)) line++;
+        if (!*line || line[0] == '#') continue;
+        if (!strncasecmp(line, "REM ", 4) || !strcasecmp(line, "REM")) { lines++; continue; }
+        lines++;
+        if (!strncasecmp(line, "STRINGLN ", 9)) { badusb_stream_ascii(line + 9, strlen(line + 9)); badusb_stream_ascii("\n", 1); executed++; }
+        else if (!strncasecmp(line, "STRING ", 7)) { badusb_stream_ascii(line + 7, strlen(line + 7)); executed++; }
+        else if (!strncasecmp(line, "DELAY ", 6)) { int ms = atoi(line + 6); if (ms > 0 && ms < 30000) vTaskDelay(pdMS_TO_TICKS(ms)); executed++; }
+        else if (!strcasecmp(line, "ENTER") || !strcasecmp(line, "RETURN")) { badusb_stream_ascii("\n", 1); executed++; }
+        else if (!strcasecmp(line, "TAB"))       { badusb_stream_ascii("\t", 1); executed++; }
+        else if (!strcasecmp(line, "SPACE"))     { badusb_stream_ascii(" ", 1);  executed++; }
+        else if (!strcasecmp(line, "BACKSPACE")) { char c = 0x08; badusb_stream_ascii(&c, 1); executed++; }
+    }
+    ESP_LOGI(TAG, "execute: %d lines, %d executed", lines, executed);
+    free(script);
+    vTaskDelete(NULL);
+}
+
 static esp_err_t h_execute(httpd_req_t *r) {
     // Same reason as h_api_live_type: keep 8 KB of buffers off the
     // HTTPD worker's 4 KB stack.
@@ -299,29 +338,20 @@ static esp_err_t h_execute(httpd_req_t *r) {
         }
         if (sl < 0) { memcpy(script, buf, n); script[n] = 0; sl = n; }
     }
-    // Parse line by line.
-    int lines = 0, executed = 0;
-    char *save = NULL;
-    for (char *line = strtok_r(script, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
-        while (*line && isspace((unsigned char)*line)) line++;
-        if (!*line || line[0] == '#') continue;
-        if (!strncasecmp(line, "REM ", 4) || !strcasecmp(line, "REM")) { lines++; continue; }
-        lines++;
-        if (!strncasecmp(line, "STRINGLN ", 9)) { ducky_send(line + 9); ducky_send("\n"); executed++; }
-        else if (!strncasecmp(line, "STRING ", 7)) { ducky_send(line + 7); executed++; }
-        else if (!strncasecmp(line, "DELAY ", 6)) { int ms = atoi(line + 6); if (ms > 0 && ms < 30000) vTaskDelay(pdMS_TO_TICKS(ms)); executed++; }
-        else if (!strcasecmp(line, "ENTER") || !strcasecmp(line, "RETURN")) { ducky_send("\n"); executed++; }
-        else if (!strcasecmp(line, "TAB"))        { ducky_send("\t"); executed++; }
-        else if (!strcasecmp(line, "SPACE"))      { ducky_send(" ");  executed++; }
-        else if (!strcasecmp(line, "BACKSPACE"))  { char c = 0x08; badusb_stream_ascii(&c, 1); executed++; }
-        else { /* unsupported — silently skip */ }
-        (void)ducky_key;  // silence unused-static warning until full protocol lands
+    // Hand the parsed body off to a background task and return HTTP
+    // 200 immediately. A ~500-byte script types in ~10 seconds, which
+    // is well past HTTPD's recv_wait_timeout (5 s) — before this the
+    // browser saw "Execution Failed" even when the typing succeeded.
+    // We only free `buf`; `script` is passed to the task which owns it.
+    free(buf);
+    if (xTaskCreate(execute_task, "ducky_run", 4096, script, 4, NULL) != pdPASS) {
+        free(script);
+        httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "spawn");
+        return ESP_OK;
     }
-    free(buf); free(script);
+    (void)ducky_key;   // silence unused-static warning until we wire a wider wire protocol
     httpd_resp_set_type(r, "application/json");
-    char body[96];
-    int bn = snprintf(body, sizeof(body), "{\"lines\":%d,\"executed\":%d}", lines, executed);
-    return httpd_resp_send(r, body, bn);
+    return httpd_resp_send(r, "{\"started\":true}", 16);
 }
 
 // -------- SPIFFS-backed script/file store --------
@@ -453,9 +483,12 @@ static esp_err_t h_api_languages(httpd_req_t *r) {
         int cn = dot - e->d_name;
         if (cn <= 0 || cn >= (int)sizeof(code)) continue;
         memcpy(code, e->d_name, cn);
+        // Reference JS iterates and calls `.toLowerCase()` on each
+        // element expecting a bare string; wrapping in {code,file}
+        // crashed the language dropdown with a TypeError. Ship a raw
+        // string array: ["en","de",...].
         int n = snprintf(body + bl, sizeof(body) - bl,
-                         "%s{\"code\":\"%s\",\"file\":\"%s\"}",
-                         first ? "" : ",", code, e->d_name);
+                         "%s\"%s\"", first ? "" : ",", code);
         if (n < 0 || bl + n >= (int)sizeof(body) - 2) break;
         bl += n; first = 0;
     }
@@ -656,6 +689,14 @@ static esp_err_t h_language(httpd_req_t *r) {
     return httpd_resp_send(r, "{\"ok\":true}", 11);
 }
 
+// /favicon.ico — browser autoloads this on every page. Return a 204
+// so it stops spamming the log; the tiny 16x16 default browser icon
+// is fine.
+static esp_err_t h_favicon(httpd_req_t *r) {
+    httpd_resp_set_status(r, "204 No Content");
+    return httpd_resp_send(r, NULL, 0);
+}
+
 // Called from main.c http_up() after the primary URI handlers register
 // so BadUSB routes overlay the existing site cleanly. We deliberately
 // re-register "/" so the ported UI takes over the root page — the old
@@ -672,7 +713,10 @@ static void reg_both(httpd_handle_t s, const char *uri, esp_err_t (*h)(httpd_req
 }
 
 void badusb_ui_register(httpd_handle_t s) {
-    if (esp_spiffs_mounted(NULL)) ensure_script_dir();
+    // storage_up() in main.c registers SPIFFS with partition_label
+    // "storage" — passing NULL always returned false, so the marker
+    // file was never created and script listings were empty.
+    if (esp_spiffs_mounted("storage")) ensure_script_dir();
 
     // REAL handlers — these have a working backend behind them today.
     httpd_uri_t real[] = {
@@ -688,18 +732,23 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/scripts",        HTTP_GET,  h_api_scripts,       NULL, false, false, NULL},
         {"/api/save",           HTTP_POST, h_api_save,          NULL, false, false, NULL},
         {"/api/load",           HTTP_GET,  h_api_load,          NULL, false, false, NULL},
-        {"/api/delete",         HTTP_POST, h_api_delete,        NULL, false, false, NULL},
-        {"/api/delete-file",    HTTP_POST, h_api_delete,        NULL, false, false, NULL},
+        {"/api/delete",         HTTP_POST,   h_api_delete,      NULL, false, false, NULL},
+        // Ported script.js at line 1998 uses `method:'DELETE'` on
+        // /api/delete — without this it 405/404s and file browser
+        // deletes are silent-fail.
+        {"/api/delete",         HTTP_DELETE, h_api_delete,      NULL, false, false, NULL},
+        {"/api/delete-file",    HTTP_POST,   h_api_delete,      NULL, false, false, NULL},
+        {"/api/delete-file",    HTTP_DELETE, h_api_delete,      NULL, false, false, NULL},
         {"/api/validate-script",HTTP_POST, h_api_validate,      NULL, false, false, NULL},
         // Languages
         {"/api/languages",      HTTP_GET,  h_api_languages,     NULL, false, false, NULL},
         {"/language",           HTTP_POST, h_language,          NULL, false, false, NULL},
-        {"/languages/en.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
-        {"/languages/de.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
-        {"/languages/es.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
-        {"/languages/fr.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
-        {"/languages/it.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
-        {"/languages/pt.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        // Single wildcard handler catches every Hak5 language layout
+        // (be/br/ca/ca-fr/ch/cz/de/de_mac/dk/es/es-la/fi/fr/gb/hr/hu/
+        // it/jp/mx/no/pt/se/si/sk/tr/us) without needing 26 entries.
+        // Requires cfg.uri_match_fn = httpd_uri_match_wildcard set in
+        // main.c http_up.
+        {"/languages/?*",       HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
         // Real state endpoints
         {"/api/stats",          HTTP_GET,  h_api_stats,         NULL, false, false, NULL},
         {"/api/temp",           HTTP_GET,  h_api_temp,          NULL, false, false, NULL},
@@ -719,6 +768,8 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/stop",               HTTP_POST, h_stop,              NULL, false, false, NULL},
         {"/selfdestruct",       HTTP_POST, h_selfdestruct,      NULL, false, false, NULL},
         {"/redirect",           HTTP_GET,  h_redirect,          NULL, false, false, NULL},
+        // Favicon — 204 so the browser stops retrying every 30 s.
+        {"/favicon.ico",        HTTP_GET,  h_favicon,           NULL, false, false, NULL},
     };
     for (unsigned i = 0; i < sizeof(real)/sizeof(real[0]); i++)
         httpd_register_uri_handler(s, &real[i]);
@@ -755,7 +806,10 @@ void badusb_ui_register(httpd_handle_t s) {
         "/api/list-files", "/api/download", "/api/upload",
         "/api/copy-file", "/api/cut-file", "/api/paste-file",
         "/api/create-directory", "/api/check-file", "/api/file-info",
-        "/api/use-file",
+        "/api/use-file", "/api/rename",
+        // Alias for the older `/api/self-destruct` path some JS still
+        // uses (parallel to the canonical `/selfdestruct`).
+        "/api/self-destruct",
         // Tasks / errors / OTA package updates
         "/api/tasks", "/api/cancel-task", "/api/clear-errors",
         "/api/update-status", "/api/update-package",
