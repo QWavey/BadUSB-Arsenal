@@ -708,6 +708,11 @@ void c6_uart_send_evt(const char *body) { if (body) tx_line("EVT", body); }
 
 bool c6_uart_link_ready(void) { return s_ready; }
 
+// Expose the SDIO card handle so live_type.c can share the transport
+// without ripping out the polling architecture here. Returns NULL until
+// sdio_link_bring_up() has succeeded.
+sdmmc_card_t *live_type_get_card(void) { return s_card; }
+
 void c6_uart_kbd_connect(void) {
     // Emit KBD_CONNECT the instant the interface enumerates so the pill
     // flips green immediately instead of waiting for the first real report

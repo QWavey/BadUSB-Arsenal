@@ -92,6 +92,19 @@ const char WEB_UI_HTML[] =
  "<button id=b_live_stop>Stop Live Logging</button>"
 "</div></div>"
 
+// BadUSB "live type" — paste any text (up to ~1 KB per submit) and the
+// P4 will type it on the connected PC as if the user typed each key.
+// Uses the same TinyUSB HID composite that the passthrough uses, so no
+// extra driver install on the target machine.
+"<div class=card>"
+"<h2>BadUSB — Live Type</h2>"
+"<div class=sub style='margin-bottom:8px'>Type text on the PC as if it came from the keyboard. US layout, Enter and Tab supported.</div>"
+"<textarea id=badusb_text rows=4 style='width:100%;background:#0b0e13;color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:8px;font:13px/1.4 ui-monospace,Menlo,monospace' placeholder='Paste or type text here, then hit Type Now.'></textarea>"
+"<div class=row style='margin-top:10px;justify-content:space-between'>"
+ "<button id=b_badusb_type>Type Now</button>"
+ "<span id=badusb_status style='color:var(--muted);font-size:13px'>idle</span>"
+"</div></div>"
+
 "<div class=card>"
 "<h2>Log file</h2>"
 "<div class=row>"
@@ -262,6 +275,18 @@ const char WEB_UI_HTML[] =
 "cbAdl.onchange=()=>fetch('/autodl?v='+(cbAdl.checked?1:0),{method:'POST'}).then(refreshStatus);"
 "$('sel_led').onchange=()=>fetch('/led?m='+$('sel_led').value,{method:'POST'}).then(refreshStatus);"
 "$('cb_led_off').onchange=()=>fetch('/led?off='+($('cb_led_off').checked?1:0),{method:'POST'}).then(refreshStatus);"
+// BadUSB Live Type: POST the textarea body to /badusb/type. C6 streams
+// each byte to the P4 over SDIO reg 44. Status pill flips while sending.
+"$('b_badusb_type').onclick=()=>{"
+" const t=$('badusb_text').value;"
+" if(!t){return;}"
+" const s=$('badusb_status');const b=$('b_badusb_type');"
+" s.textContent='typing '+t.length+' chars…';b.disabled=true;"
+" fetch('/badusb/type',{method:'POST',headers:{'Content-Type':'text/plain'},body:t})"
+"  .then(r=>r.json()).then(j=>{s.textContent='typed '+j.typed+' chars';})"
+"  .catch(_=>{s.textContent='error';})"
+"  .finally(()=>{b.disabled=false;});"
+"};"
 "$('cb_held').onchange=()=>fetch('/held?v='+($('cb_held').checked?1:0),{method:'POST'}).then(refreshStatus);"
 "$('sel_layout').onchange=()=>fetch('/layout?v='+$('sel_layout').value,{method:'POST'}).then(refreshStatus);"
 

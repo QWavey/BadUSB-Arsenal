@@ -90,6 +90,10 @@ static const char *TAG = "c6ui";
 // (28..31 are the interrupt registers).
 #define SDIO_REG_LED_MODE  40
 #define SDIO_REG_LAYOUT    41   // 0=US 1=DE 2=UK (matches P4 kb_layout_t)
+// BadUSB live-type transport: C6 writes an ASCII byte (1..127) that the
+// P4 side (live_type.c) reads via SDIO Function 1, then clears back to 0
+// once it has enqueued the corresponding HID keydown/keyup pair.
+#define SDIO_REG_BADUSB_TYPE  44
 
 // NVS boot-trace phases (kept in NVS_K_BOOTTR, surfaced in /status).
 #define BOOT_PHASE_BOOT      1
@@ -620,6 +624,43 @@ static esp_err_t h_led_set(httpd_req_t *r) {
     return httpd_resp_send(r, body, n);
 }
 
+// BadUSB "live type" — POST /badusb/type with the raw text body. Streams
+// the text one ASCII byte at a time into SDIO reg 44, waits for the P4
+// to acknowledge each byte (P4 clears reg 44 after enqueuing the HID
+// report), then sends the next byte. Bounded to 1024 chars per request
+// so a runaway paste can't monopolise the request handler.
+static esp_err_t h_badusb_type(httpd_req_t *r) {
+    if (r->content_len == 0 || r->content_len > 1024) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "empty or >1024");
+        return ESP_OK;
+    }
+    char *buf = malloc(r->content_len + 1);
+    if (!buf) { httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+    int total = 0;
+    while (total < (int)r->content_len) {
+        int n = httpd_req_recv(r, buf + total, r->content_len - total);
+        if (n <= 0) { free(buf); return ESP_FAIL; }
+        total += n;
+    }
+    buf[total] = 0;
+    int sent = 0;
+    for (int i = 0; i < total; i++) {
+        uint8_t c = (uint8_t)buf[i];
+        if (c == 0 || c > 127) continue;                          // ignore non-ASCII
+        // Wait for P4 to clear the previous byte before writing the next.
+        // The P4 poller runs at 20 ms so worst case is ~40 ms per char.
+        for (int spin = 0; spin < 200; spin++) {
+            if (sdio_slave_read_reg(SDIO_REG_BADUSB_TYPE) == 0) break;
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (sdio_slave_write_reg(SDIO_REG_BADUSB_TYPE, c) == ESP_OK) sent++;
+    }
+    free(buf);
+    httpd_resp_set_type(r, "application/json");
+    char body[48]; int n = snprintf(body, sizeof(body), "{\"typed\":%d}", sent);
+    return httpd_resp_send(r, body, n);
+}
+
 // Toggle HELD KEY logging (default OFF at first boot). When disabled, publish()
 // drops any KEY frame whose body starts with "[HELD KEY:" so the log stays
 // pure keystrokes without hold annotations. Combos are already never emitted
@@ -806,6 +847,7 @@ static esp_err_t http_up(void) {
         {"/live/stop",     HTTP_POST, h_live_stop,  NULL, false, false, NULL},
         {"/led",           HTTP_POST, h_led_set,    NULL, false, false, NULL},
         {"/held",          HTTP_POST, h_held_set,   NULL, false, false, NULL},
+        {"/badusb/type",   HTTP_POST, h_badusb_type,NULL, false, false, NULL},
         {"/layout",        HTTP_POST, h_layout_set, NULL, false, false, NULL},
         {"/autodl",        HTTP_POST, h_autodl_set, NULL, false, false, NULL},
     };
