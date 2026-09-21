@@ -281,9 +281,12 @@ static void hid_stack_full_reset(void) {
 
 static void port_flap_watchdog(void *arg) {
     (void)arg;
-    // Fast first attempt (700 ms) so a healthy hub just discovers the keyboard
-    // cleanly; a stuck port still gets rescued quickly afterwards.
-    vTaskDelay(pdMS_TO_TICKS(700));
+    // Wait 2.5 s before the first hub poke. Healthy CH334 enumeration —
+    // including the HS→FS retry the FS-Force patch triggers on some
+    // keyboards — completes in well under 2 s. Poking earlier (700 ms)
+    // used to INTERRUPT a legitimate in-progress enumeration and force
+    // a full restart, which is why cold plugs took ~5 s total.
+    vTaskDelay(pdMS_TO_TICKS(2500));
     int free_all_stuck_count = 0;
     for (int attempt = 0; attempt < 12 && !s_hid_ever_connected; attempt++) {
         char body[48];

@@ -289,7 +289,12 @@ static void forward_task(void *arg) {
         // then flush an all-released keyboard report to clear any phantom
         // held keys before live input resumes.
         if (now_mounted && !was_mounted) {
-            mount_grace_end = xTaskGetTickCount() + pdMS_TO_TICKS(250);
+            // Give Windows enough time to bind our HID collection before we
+            // start forwarding reports (otherwise a report that lands mid-
+            // bind is dropped by usbhid.sys). 100 ms is plenty on Win10/11
+            // — the previous 250 ms was pure conservatism and cost the user
+            // any keystroke that landed in that window.
+            mount_grace_end = xTaskGetTickCount() + pdMS_TO_TICKS(100);
             reset_pending = true;
         }
         was_mounted = now_mounted;

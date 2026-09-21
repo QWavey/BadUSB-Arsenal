@@ -708,7 +708,23 @@ void c6_uart_send_evt(const char *body) { if (body) tx_line("EVT", body); }
 
 bool c6_uart_link_ready(void) { return s_ready; }
 
-void c6_uart_kbd_connect(void)     { s_kbd_interface_present = true; s_kbd_iface_up_ms = now_ms(); memset(s_prev_keys, 0, sizeof(s_prev_keys)); s_prev_mod = 0; combo_reset(); memset(s_pressed, 0, sizeof(s_pressed)); }
+void c6_uart_kbd_connect(void) {
+    // Emit KBD_CONNECT the instant the interface enumerates so the pill
+    // flips green immediately instead of waiting for the first real report
+    // or a 300 ms grace timer. The old deferred emission was there to
+    // filter "phantom" kbd interfaces on composite mice, but that edge
+    // case is much rarer than users noticing a "still red after plug"
+    // pill — and a spurious CONNECT self-corrects via a later DISCONNECT.
+    s_kbd_interface_present = true;
+    s_kbd_iface_up_ms       = now_ms();
+    if (!s_kbd_seen_connected) {
+        s_kbd_seen_connected = true;
+        tx_line("EVT", "KBD_CONNECT");
+    }
+    memset(s_prev_keys, 0, sizeof(s_prev_keys));
+    s_prev_mod = 0; combo_reset();
+    memset(s_pressed, 0, sizeof(s_pressed));
+}
 void c6_uart_kbd_disconnect(void) {
     // Only emit DISCONNECT if we ever emitted CONNECT — otherwise a composite
     // mouse's phantom kbd interface unplug would flash the pill red for no
@@ -721,5 +737,12 @@ void c6_uart_kbd_disconnect(void) {
     s_prev_mod = 0; combo_reset();
     memset(s_pressed, 0, sizeof(s_pressed));
 }
-void c6_uart_mouse_connect(void)   { s_mouse_interface_present = true; /* wait for first report */ }
+void c6_uart_mouse_connect(void) {
+    // Same immediate-emit rationale as c6_uart_kbd_connect above.
+    s_mouse_interface_present = true;
+    if (!s_mouse_seen_connected) {
+        s_mouse_seen_connected = true;
+        tx_line("EVT", "MOUSE_CONNECT");
+    }
+}
 void c6_uart_mouse_disconnect(void){ s_mouse_interface_present = false; if (s_mouse_seen_connected) { s_mouse_seen_connected = false; tx_line("EVT", "MOUSE_DISCONNECT"); } }

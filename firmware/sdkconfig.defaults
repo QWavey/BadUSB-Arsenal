@@ -34,6 +34,11 @@ CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
 CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
 
+# USB spec requires >=100 ms hub port debounce; IDF's default is 250 ms.
+# Dropping to 100 ms shaves 150 ms off cold-plug enumeration on healthy
+# keyboards without sacrificing spec conformance.
+CONFIG_USB_HOST_DEBOUNCE_DELAY_MS=100
+
 # Log level: allow VERBOSE at runtime via esp_log_level_set (compiled-in max)
 CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=n
 CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y

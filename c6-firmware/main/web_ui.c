@@ -218,6 +218,15 @@ const char WEB_UI_HTML[] =
 "  else if(rest==='PC_DISCONNECT'){sp.textContent='(PC disconnected)\\n';}"
 "  else {sp.textContent='('+rest+')\\n';}"
 "  live.append(sp);"
+// Flip the affected pill directly from the EVT text — much faster than
+// waiting for the next /status fetch to round-trip. refreshStatus() is
+// still called to sync everything else (log bytes, wifi clients, etc.).
+"  if(rest==='KBD_CONNECT')     setPill($('p_kbd'),  'ok',  'Keyboard: connected');"
+"  else if(rest==='KBD_DISCONNECT')setPill($('p_kbd'),'warn','Keyboard: disconnected');"
+"  else if(rest==='MOUSE_CONNECT') setPill($('p_mouse'),'ok', 'Mouse: connected');"
+"  else if(rest==='MOUSE_DISCONNECT')setPill($('p_mouse'),'warn','Mouse: disconnected');"
+"  else if(rest==='PC_CONNECT')    setPill($('p_pc'), 'ok', 'PC: connected');"
+"  else if(rest==='PC_DISCONNECT') setPill($('p_pc'), 'warn','PC: not mounted');"
 "  refreshStatus();"
 " }"
 " while(live.childNodes.length>4000)live.removeChild(live.firstChild);"
