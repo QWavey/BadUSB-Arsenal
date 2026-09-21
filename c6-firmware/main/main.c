@@ -118,7 +118,8 @@ static bool s_kbd_present = false;
 static bool s_mouse_present = false;
 static bool s_pc_present   = false;   // PC (user's computer) bound the P4's HID device
 static bool s_warned_pending_dl = false;
-static uint32_t s_sta_count = 0;
+// Non-static so badusb_ui.c can read it for /api/stats.
+uint32_t s_sta_count = 0;
 static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
 static bool     s_led_off  = false;                // dedicated OFF switch — when true the LED is dark and the mode dropdown is disabled in the web UI
 static bool     s_held_enabled = false;            // whether HELD KEY events are shown/logged (default OFF)

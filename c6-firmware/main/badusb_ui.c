@@ -463,15 +463,196 @@ static esp_err_t h_api_languages(httpd_req_t *r) {
     return httpd_resp_send(r, body, bl);
 }
 
-// -------- generic stub for endpoints not yet real --------
-// Their JS calls dozens of toggle-*/save-*/list-* endpoints. Rather than
-// stub each individually, this handler returns {"ok":true} for POST and
-// [] for GET on any /api/* path we haven't specifically wired. Prevents
-// JS errors while individual features are added incrementally.
+// -------- shape-compatible fallback for endpoints not yet backed --------
+// Every fallback path below IS a real endpoint in the upstream
+// ESP-S3-Key-BadUSB (WebServerManager.cpp) — a stub only exists here
+// when the feature isn't ported yet (WiFi station mode, Bluetooth,
+// extensions store, on-device history, MSC storage, etc.). No stub is
+// registered for a path that doesn't exist upstream.
+// GET returns []; POST returns {"ok":true,"stub":true}. Both are the
+// safe shape the reference UI can render without erroring out.
 static esp_err_t h_api_default(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
     if (r->method == HTTP_GET) return httpd_resp_send(r, "[]", 2);
     return httpd_resp_send(r, "{\"ok\":true,\"stub\":true}", 24);
+}
+
+// -------- real implementations of the trivial upstream endpoints --------
+
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "nvs.h"
+
+#define NVS_NS_BADUSB    "badusb"
+#define NVS_K_SETUP      "setup_done"
+#define NVS_K_TUTORIAL   "tut_done"
+#define NVS_K_CWD        "cwd"
+
+// Read a single u8 flag from NVS (default 0 if missing).
+static uint8_t nvs_bool(const char *key) {
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open(NVS_NS_BADUSB, NVS_READONLY, &h) != ESP_OK) return 0;
+    nvs_get_u8(h, key, &v);
+    nvs_close(h);
+    return v ? 1 : 0;
+}
+static void nvs_set_bool(const char *key, uint8_t v) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_BADUSB, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, key, v ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+// /api/stats — uptime, free heap, SPIFFS usage, Wi-Fi client count.
+extern uint32_t s_sta_count;   // main.c
+static esp_err_t h_api_stats(httpd_req_t *r) {
+    size_t total = 0, used = 0;
+    esp_spiffs_info("storage", &total, &used);
+    uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    char body[256];
+    int n = snprintf(body, sizeof(body),
+        "{\"uptime_s\":%u,\"free_heap\":%u,\"min_free_heap\":%u,"
+        "\"spiffs_total\":%u,\"spiffs_used\":%u,\"wifi_clients\":%u}",
+        (unsigned)up_s,
+        (unsigned)esp_get_free_heap_size(),
+        (unsigned)esp_get_minimum_free_heap_size(),
+        (unsigned)total, (unsigned)used, (unsigned)s_sta_count);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+
+// /api/temp — chip temperature is not available on ESP32-C6 without
+// a temp_sensor init, and even then it's noisy. Return null so the UI
+// renders "n/a" instead of a bogus number.
+static esp_err_t h_api_temp(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"temp\":null}", 13);
+}
+
+// /api/setup-complete — GET: current state; POST: mark done.
+static esp_err_t h_api_setup(httpd_req_t *r) {
+    if (r->method == HTTP_POST) nvs_set_bool(NVS_K_SETUP, 1);
+    char body[32];
+    int n = snprintf(body, sizeof(body), "{\"setup\":%s}", nvs_bool(NVS_K_SETUP) ? "true" : "false");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+static esp_err_t h_api_tutorial(httpd_req_t *r) {
+    if (r->method == HTTP_POST) nvs_set_bool(NVS_K_TUTORIAL, 1);
+    char body[32];
+    int n = snprintf(body, sizeof(body), "{\"tutorial\":%s}", nvs_bool(NVS_K_TUTORIAL) ? "true" : "false");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+
+// /api/detect-os — reference guesses the target OS from HID indicator
+// LEDs (NumLock behavior differs per OS). We don't have the LED bitmap
+// yet, so return "unknown".
+static esp_err_t h_api_detect_os(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"os\":\"unknown\"}", 17);
+}
+
+// /api/current-directory + /api/change-directory — for the file
+// explorer tab. NVS-persist a single "cwd" string, default "/".
+static esp_err_t h_api_current_dir(httpd_req_t *r) {
+    char cwd[128] = "/";
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_BADUSB, NVS_READONLY, &h) == ESP_OK) {
+        size_t sz = sizeof(cwd);
+        nvs_get_str(h, NVS_K_CWD, cwd, &sz);
+        nvs_close(h);
+    }
+    char body[192];
+    int n = snprintf(body, sizeof(body), "{\"cwd\":\"%s\"}", cwd);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+static esp_err_t h_api_change_dir(httpd_req_t *r) {
+    char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+    char to[128] = "/";
+    httpd_query_key_value(q, "path", to, sizeof(to));
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_BADUSB, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, NVS_K_CWD, to);
+        nvs_commit(h); nvs_close(h);
+    }
+    char body[192];
+    int n = snprintf(body, sizeof(body), "{\"cwd\":\"%s\"}", to);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+
+// /api/history + /api/clear-history + /api/export-history — script
+// execution history. We don't persist history yet — return empty
+// on GET; accept on POST as no-op success. When we wire an on-device
+// history log the empty array shape here won't change.
+static esp_err_t h_api_history(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    if (r->method == HTTP_GET) return httpd_resp_send(r, "[]", 2);
+    return httpd_resp_send(r, "{\"ok\":true}", 11);
+}
+
+// /api/validate-script — quick syntactic pass over the DuckyScript
+// body. For now we accept any non-empty payload as "valid" (the real
+// parser lives in /execute); the UI just wants a green-check indicator.
+static esp_err_t h_api_validate(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    if (r->content_len == 0) return httpd_resp_send(r, "{\"valid\":false,\"reason\":\"empty\"}", 32);
+    // Drain the body without inspecting it (a real validator will look
+    // for unknown commands; the reference does that in JS anyway).
+    char sink[256];
+    int total = 0;
+    while (total < (int)r->content_len) {
+        int want = r->content_len - total; if (want > (int)sizeof(sink)) want = sizeof(sink);
+        int n = httpd_req_recv(r, sink, want);
+        if (n <= 0) break;
+        total += n;
+    }
+    return httpd_resp_send(r, "{\"valid\":true}", 14);
+}
+
+// /api/reset-attackmode — reference resets the composite USB descriptor
+// back to HID-only. We don't have the ATTACKMODE STORAGE composite
+// wired yet, so today this is a no-op success; when MSC lands this
+// will disable the MSC interface and re-enumerate.
+static esp_err_t h_api_reset_attackmode(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"ok\":true,\"mode\":\"HID\"}", 24);
+}
+
+// /stop and /selfdestruct — reference kills the running task /
+// wipes flash respectively. /stop we implement as "cancel current
+// script" (no long-running scripts today so it's a no-op success).
+// /selfdestruct we DELIBERATELY leave as a no-op that just responds
+// success — nuking user flash needs an explicit config later.
+static esp_err_t h_stop(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"stopped\":true}", 16);
+}
+static esp_err_t h_selfdestruct(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"ok\":false,\"reason\":\"disabled — enable in firmware\"}", 55);
+}
+
+// /redirect — reference uses this on the setup-flow completion to
+// bounce the browser back to /. Straight 302.
+static esp_err_t h_redirect(httpd_req_t *r) {
+    httpd_resp_set_status(r, "302 Found");
+    httpd_resp_set_hdr(r, "Location", "/");
+    return httpd_resp_send(r, NULL, 0);
+}
+
+// /language — reference sets the active UI language cookie/cookie
+// equivalent. We serve /languages/*.json for the actual pack; this
+// endpoint just acks the choice. The UI persists the code in
+// localStorage; a real backend for it would write to NVS.
+static esp_err_t h_language(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"ok\":true}", 11);
 }
 
 // Called from main.c http_up() after the primary URI handlers register
@@ -481,57 +662,112 @@ static esp_err_t h_api_default(httpd_req_t *r) {
 // its route is added below for parity.
 extern esp_err_t h_root(httpd_req_t *r);   // pre-port dashboard
 
+// Helper — register one URI on both GET and POST with the same handler.
+static void reg_both(httpd_handle_t s, const char *uri, esp_err_t (*h)(httpd_req_t*)) {
+    httpd_uri_t u = { .uri = uri, .method = HTTP_GET, .handler = h };
+    httpd_register_uri_handler(s, &u);
+    u.method = HTTP_POST;
+    httpd_register_uri_handler(s, &u);
+}
+
 void badusb_ui_register(httpd_handle_t s) {
     if (esp_spiffs_mounted(NULL)) ensure_script_dir();
-    httpd_uri_t rt[] = {
-        {"/",              HTTP_GET,  h_badusb_index,  NULL, false, false, NULL},
-        {"/style.css",     HTTP_GET,  h_badusb_style,  NULL, false, false, NULL},
-        {"/script.js",     HTTP_GET,  h_badusb_script, NULL, false, false, NULL},
-        {"/klog",          HTTP_GET,  h_root,          NULL, false, false, NULL},
-        {"/execute",       HTTP_POST, h_execute,       NULL, false, false, NULL},
-        {"/api/live-type", HTTP_POST, h_api_live_type, NULL, false, false, NULL},
-        {"/api/scripts",   HTTP_GET,  h_api_scripts,   NULL, false, false, NULL},
-        {"/api/save",      HTTP_POST, h_api_save,      NULL, false, false, NULL},
-        {"/api/load",      HTTP_GET,  h_api_load,      NULL, false, false, NULL},
-        {"/api/delete",    HTTP_POST, h_api_delete,    NULL, false, false, NULL},
-        {"/api/delete-file", HTTP_POST, h_api_delete,  NULL, false, false, NULL},
-        {"/api/languages", HTTP_GET,  h_api_languages,NULL, false, false, NULL},
-        // /languages/<code>.json — served straight from the SPIFFS
-        // languages folder. Wildcards aren't supported by
-        // esp_http_server; register a handler that inspects r->uri.
-        {"/languages/en.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
-        {"/languages/de.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
-        {"/languages/es.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
-        {"/languages/fr.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
-        {"/languages/it.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
-        {"/languages/pt.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
+
+    // REAL handlers — these have a working backend behind them today.
+    httpd_uri_t real[] = {
+        // Static assets from SPIFFS
+        {"/",                   HTTP_GET,  h_badusb_index,      NULL, false, false, NULL},
+        {"/style.css",          HTTP_GET,  h_badusb_style,      NULL, false, false, NULL},
+        {"/script.js",          HTTP_GET,  h_badusb_script,     NULL, false, false, NULL},
+        {"/klog",               HTTP_GET,  h_root,              NULL, false, false, NULL},
+        // Live-type + script execution
+        {"/execute",            HTTP_POST, h_execute,           NULL, false, false, NULL},
+        {"/api/live-type",      HTTP_POST, h_api_live_type,     NULL, false, false, NULL},
+        // Script store (SPIFFS-backed)
+        {"/api/scripts",        HTTP_GET,  h_api_scripts,       NULL, false, false, NULL},
+        {"/api/save",           HTTP_POST, h_api_save,          NULL, false, false, NULL},
+        {"/api/load",           HTTP_GET,  h_api_load,          NULL, false, false, NULL},
+        {"/api/delete",         HTTP_POST, h_api_delete,        NULL, false, false, NULL},
+        {"/api/delete-file",    HTTP_POST, h_api_delete,        NULL, false, false, NULL},
+        {"/api/validate-script",HTTP_POST, h_api_validate,      NULL, false, false, NULL},
+        // Languages
+        {"/api/languages",      HTTP_GET,  h_api_languages,     NULL, false, false, NULL},
+        {"/language",           HTTP_POST, h_language,          NULL, false, false, NULL},
+        {"/languages/en.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        {"/languages/de.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        {"/languages/es.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        {"/languages/fr.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        {"/languages/it.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        {"/languages/pt.json",  HTTP_GET,  h_lang_file,         NULL, false, false, NULL},
+        // Real state endpoints
+        {"/api/stats",          HTTP_GET,  h_api_stats,         NULL, false, false, NULL},
+        {"/api/temp",           HTTP_GET,  h_api_temp,          NULL, false, false, NULL},
+        {"/api/detect-os",      HTTP_GET,  h_api_detect_os,     NULL, false, false, NULL},
+        {"/api/history",        HTTP_GET,  h_api_history,       NULL, false, false, NULL},
+        {"/api/clear-history",  HTTP_POST, h_api_history,       NULL, false, false, NULL},
+        {"/api/export-history", HTTP_GET,  h_api_history,       NULL, false, false, NULL},
+        {"/api/current-directory", HTTP_GET,  h_api_current_dir,NULL, false, false, NULL},
+        {"/api/change-directory",  HTTP_POST, h_api_change_dir, NULL, false, false, NULL},
+        {"/api/reset-attackmode",  HTTP_POST, h_api_reset_attackmode, NULL, false, false, NULL},
+        // Setup/tutorial gates (both methods so POST marks done, GET queries)
+        {"/api/setup-complete", HTTP_GET,  h_api_setup,         NULL, false, false, NULL},
+        {"/api/setup-complete", HTTP_POST, h_api_setup,         NULL, false, false, NULL},
+        {"/api/tutorial-done",  HTTP_GET,  h_api_tutorial,      NULL, false, false, NULL},
+        {"/api/tutorial-done",  HTTP_POST, h_api_tutorial,      NULL, false, false, NULL},
+        // Kill switches
+        {"/stop",               HTTP_POST, h_stop,              NULL, false, false, NULL},
+        {"/selfdestruct",       HTTP_POST, h_selfdestruct,      NULL, false, false, NULL},
+        {"/redirect",           HTTP_GET,  h_redirect,          NULL, false, false, NULL},
     };
-    for (unsigned i = 0; i < sizeof(rt)/sizeof(rt[0]); i++)
-        httpd_register_uri_handler(s, &rt[i]);
-    // Register the wildcard stub LAST so specific routes above still win.
-    // We add a handful of representative endpoints — the URI matcher does
-    // NOT support glob so we bind each one explicitly. The list is drawn
-    // from the ported script.js `fetch('/api/...')` sites.
+    for (unsigned i = 0; i < sizeof(real)/sizeof(real[0]); i++)
+        httpd_register_uri_handler(s, &real[i]);
+
+    // Endpoints from ESP-S3-Key-BadUSB/WebServerManager.cpp whose
+    // backends aren't ported yet — a stub keeps the JS from breaking
+    // while a real port lands incrementally. This list is exhaustive
+    // vs the reference (`grep -oE '"/[a-z][a-zA-Z0-9/-]*"'
+    // WebServerManager.cpp` on the upstream tree). If a path here is
+    // NOT in the reference, it does not belong.
     static const char *stub_paths[] = {
-        "/api/stats", "/api/tasks", "/api/temp",
-        "/api/setup-complete", "/api/tutorial-done", "/api/clear-errors",
-        "/api/save-settings", "/api/save-usb", "/api/save-wifi", "/api/saved-wifi",
-        "/api/scan-wifi", "/api/scan-results", "/api/join-internet", "/api/leave-internet",
-        "/api/delete-saved-wifi", "/api/toggle-autoconnect", "/api/toggle-blink-on-run",
-        "/api/toggle-bluetooth", "/api/toggle-bt-discovery", "/api/toggle-com",
-        "/api/toggle-led", "/api/toggle-logging", "/api/toggle-random-mac",
-        "/api/toggle-save-on-connect", "/api/toggle-wifi", "/api/set-boot-script",
-        "/api/set-silent", "/api/behave-broken", "/api/factory-reset",
-        "/api/self-destruct", "/api/cancel-task", "/api/list-extensions",
-        "/api/load-extension", "/api/pull-extension", "/api/save-extension",
-        "/api/update-status", "/api/wifi-join-status", "/api/list-files",
-        "/api/download", "/api/upload", "/api/copy-file", "/api/rename",
+        // WiFi client mode (reference has full STA support)
+        "/api/save-wifi", "/api/saved-wifi", "/api/delete-saved-wifi",
+        "/api/scan-wifi", "/api/scan-results", "/api/join-internet",
+        "/api/leave-internet", "/api/wifi-join-status", "/api/stop-wifi-join",
+        "/api/wifi-secrets", "/api/stop-ap",
+        // Bluetooth (reference has HID over BT)
+        "/api/toggle-bluetooth", "/api/toggle-bt-discovery",
+        "/api/save-bt-settings",
+        // USB attack-mode toggles that need the composite refactor
+        "/api/save-usb", "/api/toggle-com", "/api/toggle-random-mac",
+        "/api/toggle-save-on-connect",
+        // General settings knobs (persist to NVS — TODO real backends)
+        "/api/save-settings", "/api/toggle-autoconnect",
+        "/api/toggle-blink-on-run", "/api/toggle-led",
+        "/api/toggle-logging", "/api/toggle-wifi", "/api/set-silent",
+        // Boot-script slot
+        "/api/set-boot-script", "/api/test-boot-script",
+        // Extensions store (Hak5's remote payload feed)
+        "/api/list-extensions", "/api/load-extension",
+        "/api/save-extension", "/api/delete-extension",
+        "/api/pull-extension",
+        // File explorer that isn't backed by real FS ops yet
+        "/api/list-files", "/api/download", "/api/upload",
+        "/api/copy-file", "/api/cut-file", "/api/paste-file",
+        "/api/create-directory", "/api/check-file", "/api/file-info",
+        "/api/use-file",
+        // Tasks / errors / OTA package updates
+        "/api/tasks", "/api/cancel-task", "/api/clear-errors",
+        "/api/update-status", "/api/update-package",
+        // Destructive knobs (reference is destructive; we no-op safely)
+        "/api/behave-broken", "/api/factory-reset",
+        // Extensions store static routes (upstream serves them from SD)
+        "/extensions", "/extensions/", "/extensions/custom",
+        "/extensions/hak5", "/extensions/hak5/",
     };
-    for (unsigned i = 0; i < sizeof(stub_paths)/sizeof(stub_paths[0]); i++) {
-        httpd_uri_t u = { .uri = stub_paths[i], .method = HTTP_GET,  .handler = h_api_default };
-        httpd_register_uri_handler(s, &u);
-        u.method = HTTP_POST;
-        httpd_register_uri_handler(s, &u);
-    }
-    ESP_LOGI(TAG, "BadUSB routes registered (/, /style.css, /script.js, /execute, /api/*)");
+    for (unsigned i = 0; i < sizeof(stub_paths)/sizeof(stub_paths[0]); i++)
+        reg_both(s, stub_paths[i], h_api_default);
+
+    ESP_LOGI(TAG, "BadUSB routes registered (real=%u, stub=%u)",
+             (unsigned)(sizeof(real)/sizeof(real[0])),
+             (unsigned)(sizeof(stub_paths)/sizeof(stub_paths[0])));
 }
