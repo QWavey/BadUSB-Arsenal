@@ -17,7 +17,7 @@
 //     needs no changes to accept it. Full 3.0 interpreter is roadmap.
 //   - /api/scripts, /api/save, /api/load, /api/list-files,
 //     /api/delete-file, /api/upload, /api/download — thin SPIFFS-backed
-//     script store. Files live under /spiffs/ducky/*.
+//     script store. Files live under /data/ducky/*.
 //   - /api/stats, /api/tasks, /api/languages, /api/setup-complete,
 //     /api/tutorial-done — safe defaults so the JS renders.
 //   - /api/toggle-*, /api/save-* — accept + persist to NVS or no-op.
@@ -57,7 +57,8 @@ static const char *TAG = "badusb_ui";
 // storage partition alone (idf.py partition-table build && idf.py
 // partition storage flash) without touching the app image.
 //
-// SPIFFS mount point comes from main.c storage_up() which uses "/spiffs".
+// SPIFFS is mounted at "/data" by main.c storage_up() — NOT "/spiffs".
+// Every filesystem access in this file must use "/data/..." accordingly.
 
 // -------- shared helper: stream one ASCII byte at a time to the P4 --------
 // Waits until the P4 has cleared reg 44 (200 ms max per byte) and then
@@ -120,17 +121,17 @@ static esp_err_t serve_spiffs(httpd_req_t *r, const char *spiffs_path) {
 }
 
 static esp_err_t h_badusb_index(httpd_req_t *r) {
-    return serve_spiffs(r, "/spiffs/index.html");
+    return serve_spiffs(r, "/data/index.html");
 }
 static esp_err_t h_badusb_style(httpd_req_t *r) {
-    return serve_spiffs(r, "/spiffs/style.css");
+    return serve_spiffs(r, "/data/style.css");
 }
 static esp_err_t h_badusb_script(httpd_req_t *r) {
-    return serve_spiffs(r, "/spiffs/script.js");
+    return serve_spiffs(r, "/data/script.js");
 }
 
 // GET /languages/<name>.json — serves language packs sitting under
-// /spiffs/languages/. Their JS calls fetch('/languages') to enumerate;
+// /data/languages/. Their JS calls fetch('/languages') to enumerate;
 // see h_api_languages below for the listing endpoint.
 static esp_err_t h_lang_file(httpd_req_t *r) {
     // r->uri is "/languages/xx.json" — take the leaf and sanitize.
@@ -143,7 +144,7 @@ static esp_err_t h_lang_file(httpd_req_t *r) {
         return ESP_OK;
     }
     char path[128];
-    snprintf(path, sizeof(path), "/spiffs/languages/%s", leaf);
+    snprintf(path, sizeof(path), "/data/languages/%s", leaf);
     return serve_spiffs(r, path);
 }
 
@@ -324,9 +325,9 @@ static esp_err_t h_execute(httpd_req_t *r) {
 }
 
 // -------- SPIFFS-backed script/file store --------
-// Scripts live under /spiffs/ducky/<name>. Uploaded via /api/save and
+// Scripts live under /data/ducky/<name>. Uploaded via /api/save and
 // /api/upload. Listed via /api/scripts and /api/list-files.
-#define SCRIPT_DIR "/spiffs/ducky"
+#define SCRIPT_DIR "/data/ducky"
 
 static void ensure_script_dir(void) {
     struct stat st;
@@ -431,13 +432,13 @@ static esp_err_t h_api_delete(httpd_req_t *r) {
 }
 
 // -------- /api/languages --------
-// Enumerates the language packs sitting under /spiffs/languages/ and
+// Enumerates the language packs sitting under /data/languages/ and
 // returns them as a JSON array [{"code":"en","file":"en.json"}, ...].
 // The actual translation strings live inside each file — the UI fetches
 // /languages/<file> to pull them on demand.
 static esp_err_t h_api_languages(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
-    DIR *d = opendir("/spiffs/languages");
+    DIR *d = opendir("/data/languages");
     if (!d) return httpd_resp_send(r, "[]", 2);
     char body[1024]; int bl = 0;
     body[bl++] = '[';
