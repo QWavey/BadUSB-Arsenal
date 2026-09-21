@@ -49,13 +49,15 @@ static const char *TAG = "badusb_ui";
 // Matches main.c's SDIO_REG_BADUSB_TYPE.
 #define SDIO_REG_BADUSB_TYPE  44
 
-// Embedded static assets (see CMakeLists.txt EMBED_FILES).
-extern const uint8_t index_html_start[]  asm("_binary_index_html_start");
-extern const uint8_t index_html_end[]    asm("_binary_index_html_end");
-extern const uint8_t style_css_start[]   asm("_binary_style_css_start");
-extern const uint8_t style_css_end[]     asm("_binary_style_css_end");
-extern const uint8_t script_js_start[]   asm("_binary_script_js_start");
-extern const uint8_t script_js_end[]     asm("_binary_script_js_end");
+// Static assets used to be baked into the binary via EMBED_FILES; now
+// they live on the "storage" SPIFFS partition (built from webui-fs/ at
+// flash time — see main/CMakeLists.txt spiffs_create_partition_image).
+// This mirrors the reference firmware's SD-card root layout so scripts,
+// language packs and UI patches can be updated by re-flashing the
+// storage partition alone (idf.py partition-table build && idf.py
+// partition storage flash) without touching the app image.
+//
+// SPIFFS mount point comes from main.c storage_up() which uses "/spiffs".
 
 // -------- shared helper: stream one ASCII byte at a time to the P4 --------
 // Waits until the P4 has cleared reg 44 (200 ms max per byte) and then
@@ -74,22 +76,73 @@ static int badusb_stream_ascii(const char *buf, int len) {
     return sent;
 }
 
-// -------- static asset serving --------
-static esp_err_t h_asset(httpd_req_t *r, const char *mime,
-                         const uint8_t *start, const uint8_t *end) {
-    httpd_resp_set_type(r, mime);
+// -------- static asset serving from SPIFFS --------
+// Serve a file from the SPIFFS root. Handles the tiny set of mime types
+// the reference UI uses; anything else falls back to application/octet-
+// stream. Missing files return 404 — the app never assumes an asset is
+// there, so a stripped-down SPIFFS image still boots.
+static const char *mime_for(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (!strcasecmp(dot, ".html")) return "text/html; charset=utf-8";
+    if (!strcasecmp(dot, ".css"))  return "text/css";
+    if (!strcasecmp(dot, ".js"))   return "text/javascript";
+    if (!strcasecmp(dot, ".json")) return "application/json";
+    if (!strcasecmp(dot, ".svg"))  return "image/svg+xml";
+    if (!strcasecmp(dot, ".png"))  return "image/png";
+    if (!strcasecmp(dot, ".ico"))  return "image/x-icon";
+    if (!strcasecmp(dot, ".txt"))  return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+// Stream a file from /spiffs into the response in 1 KB chunks. If the
+// file doesn't exist we return a 404 body the browser can display,
+// rather than the terse esp_http_server default.
+static esp_err_t serve_spiffs(httpd_req_t *r, const char *spiffs_path) {
+    FILE *f = fopen(spiffs_path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "serve_spiffs 404: %s", spiffs_path);
+        httpd_resp_set_status(r, "404 Not Found");
+        httpd_resp_set_type(r, "text/plain");
+        return httpd_resp_send(r, "not on flash storage", -1);
+    }
+    httpd_resp_set_type(r, mime_for(spiffs_path));
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
-    return httpd_resp_send(r, (const char *)start, end - start);
+    char buf[1024];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        if (httpd_resp_send_chunk(r, buf, n) != ESP_OK) { fclose(f); return ESP_FAIL; }
+    }
+    fclose(f);
+    return httpd_resp_send_chunk(r, NULL, 0);
 }
 
 static esp_err_t h_badusb_index(httpd_req_t *r) {
-    return h_asset(r, "text/html; charset=utf-8", index_html_start, index_html_end);
+    return serve_spiffs(r, "/spiffs/index.html");
 }
 static esp_err_t h_badusb_style(httpd_req_t *r) {
-    return h_asset(r, "text/css",  style_css_start, style_css_end);
+    return serve_spiffs(r, "/spiffs/style.css");
 }
 static esp_err_t h_badusb_script(httpd_req_t *r) {
-    return h_asset(r, "text/javascript", script_js_start, script_js_end);
+    return serve_spiffs(r, "/spiffs/script.js");
+}
+
+// GET /languages/<name>.json — serves language packs sitting under
+// /spiffs/languages/. Their JS calls fetch('/languages') to enumerate;
+// see h_api_languages below for the listing endpoint.
+static esp_err_t h_lang_file(httpd_req_t *r) {
+    // r->uri is "/languages/xx.json" — take the leaf and sanitize.
+    const char *leaf = strrchr(r->uri, '/');
+    if (!leaf) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK; }
+    leaf++;   // skip the '/'
+    // Reject path traversal and empty names.
+    if (!*leaf || strstr(leaf, "..") || strchr(leaf, '\\')) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad name");
+        return ESP_OK;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/spiffs/languages/%s", leaf);
+    return serve_spiffs(r, path);
 }
 
 // -------- POST body helper --------
@@ -358,6 +411,39 @@ static esp_err_t h_api_delete(httpd_req_t *r) {
     return httpd_resp_send(r, body, bn);
 }
 
+// -------- /api/languages --------
+// Enumerates the language packs sitting under /spiffs/languages/ and
+// returns them as a JSON array [{"code":"en","file":"en.json"}, ...].
+// The actual translation strings live inside each file — the UI fetches
+// /languages/<file> to pull them on demand.
+static esp_err_t h_api_languages(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    DIR *d = opendir("/spiffs/languages");
+    if (!d) return httpd_resp_send(r, "[]", 2);
+    char body[1024]; int bl = 0;
+    body[bl++] = '[';
+    int first = 1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        const char *dot = strrchr(e->d_name, '.');
+        if (!dot || strcasecmp(dot, ".json") != 0) continue;
+        // Language code = filename without .json (e.g. "en", "de", "es").
+        char code[16] = { 0 };
+        int cn = dot - e->d_name;
+        if (cn <= 0 || cn >= (int)sizeof(code)) continue;
+        memcpy(code, e->d_name, cn);
+        int n = snprintf(body + bl, sizeof(body) - bl,
+                         "%s{\"code\":\"%s\",\"file\":\"%s\"}",
+                         first ? "" : ",", code, e->d_name);
+        if (n < 0 || bl + n >= (int)sizeof(body) - 2) break;
+        bl += n; first = 0;
+    }
+    closedir(d);
+    body[bl++] = ']'; body[bl] = 0;
+    return httpd_resp_send(r, body, bl);
+}
+
 // -------- generic stub for endpoints not yet real --------
 // Their JS calls dozens of toggle-*/save-*/list-* endpoints. Rather than
 // stub each individually, this handler returns {"ok":true} for POST and
@@ -390,6 +476,16 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/load",      HTTP_GET,  h_api_load,      NULL, false, false, NULL},
         {"/api/delete",    HTTP_POST, h_api_delete,    NULL, false, false, NULL},
         {"/api/delete-file", HTTP_POST, h_api_delete,  NULL, false, false, NULL},
+        {"/api/languages", HTTP_GET,  h_api_languages,NULL, false, false, NULL},
+        // /languages/<code>.json — served straight from the SPIFFS
+        // languages folder. Wildcards aren't supported by
+        // esp_http_server; register a handler that inspects r->uri.
+        {"/languages/en.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
+        {"/languages/de.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
+        {"/languages/es.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
+        {"/languages/fr.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
+        {"/languages/it.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
+        {"/languages/pt.json", HTTP_GET, h_lang_file, NULL, false, false, NULL},
     };
     for (unsigned i = 0; i < sizeof(rt)/sizeof(rt[0]); i++)
         httpd_register_uri_handler(s, &rt[i]);
@@ -398,7 +494,7 @@ void badusb_ui_register(httpd_handle_t s) {
     // NOT support glob so we bind each one explicitly. The list is drawn
     // from the ported script.js `fetch('/api/...')` sites.
     static const char *stub_paths[] = {
-        "/api/stats", "/api/tasks", "/api/languages", "/api/temp",
+        "/api/stats", "/api/tasks", "/api/temp",
         "/api/setup-complete", "/api/tutorial-done", "/api/clear-errors",
         "/api/save-settings", "/api/save-usb", "/api/save-wifi", "/api/saved-wifi",
         "/api/scan-wifi", "/api/scan-results", "/api/join-internet", "/api/leave-internet",

@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-S3 BadUSB | Elite Control</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <link rel="stylesheet" href="style.css?v=4.36">
+</head>
+<body>
+    <div class="container">
+        <h1>ESP32-S3 BadUSB</h1>
+        
+        <nav class="tab">
+            <button class="tablinks active" data-tour-tab="Script"       onclick="openTab(event, 'Script')">Coding</button>
+            <button class="tablinks"        data-tour-tab="Live"         onclick="openTab(event, 'Live')">Live</button>
+            <button class="tablinks"        data-tour-tab="Scripts"      onclick="openTab(event, 'Scripts')">Scripts</button>
+            <button class="tablinks"        data-tour-tab="File_Manager" onclick="openTab(event, 'File_Manager')">Explorer</button>
+            <button class="tablinks"        data-tour-tab="Design"       onclick="openTab(event, 'Design')">Design</button>
+            <button class="tablinks"        data-tour-tab="Boot"         onclick="openTab(event, 'Boot')">Boot</button>
+            <button class="tablinks"        data-tour-tab="Extensions"   onclick="openTab(event, 'Extensions')">Extensions</button>
+            <button class="tablinks"        data-tour-tab="Settings"     onclick="openTab(event, 'Settings')">Settings</button>
+            <button class="tablinks"        data-tour-tab="Statistics"   onclick="openTab(event, 'Statistics')">Stats</button>
+            <button class="tablinks"        data-tour-tab="Wiki"         onclick="openTab(event, 'Wiki')">Syntaxes</button>
+        </nav>
+
+        <div id="tabContainer">
+            <!-- Script Tab -->
+            <section id="tab-Script" class="tabcontent" style="display:block">
+                <div class="flex-row" style="justify-content: space-between;">
+                    <h3>Script Execution</h3>
+                    <div id="scriptStatus" style="font-size: 12px; color: var(--primary);">Idle</div>
+                </div>
+
+                <div class="editor-wrapper">
+                    <div class="editor-gutter" id="editorGutter">1</div>
+                    <div class="editor-main">
+                        <div class="editor-highlights" id="editorHighlights"></div>
+                        <textarea id="scriptArea" spellcheck="false" placeholder="Enter DuckyScript..."></textarea>
+                        <div id="customScrollbar" class="custom-scrollbar-track">
+                            <div id="customScrollbarContent" class="custom-scrollbar-content"></div>
+                            <div id="customScrollbarThumb" class="custom-scrollbar-thumb"></div>
+                        </div>
+                        <div id="lineCounter" class="line-counter">0 Lines</div>
+                    </div>
+                </div>
+
+                <div id="issuesPanel" class="issues-panel" style="display: none;">
+            <div class="issues-header" onclick="toggleIssuesList()">
+                <div class="flex-row" style="gap: 10px;">
+                    <div id="issueStatus" class="issue-badge">Syntax Issues</div>
+                    <span id="issuesChevron" class="issues-chevron"></span>
+                </div>
+                <button id="fixAllBtn" class="fix-all-btn" style="display: none;" onclick="event.stopPropagation(); fixAllErrors()">Fix All</button>
+            </div>
+            <div class="collapsible-wrapper">
+                <div id="issuesList" class="issues-list"></div>
+            </div>
+        </div>
+                
+                <div class="progress-bar" id="progressBar" style="display:none">
+                    <div class="progress-fill" id="progressFill" style="width:0%"></div>
+                </div>
+                
+                <div class="control-panel flex-row" style="margin-top: 15px; flex-wrap: wrap;">
+                    <button class="control-btn" onclick="executeScript()"><span id="runBunny" class="run-bunny"></span> Run Script</button>
+                    <button class="control-btn" onclick="stopScript()">Stop</button>
+                    <button class="control-btn" onclick="clearScript()">Clear</button>
+                    <button class="control-btn" onclick="saveScriptPrompt()">Save</button>
+                    <button class="control-btn" onclick="loadFromHistory()">History</button>
+                    <!-- v4.17b: Extensions dropdown. Pops a picker of /extensions/
+                         files and lets the user insert one either COLLAPSED
+                         (single `EXTENSION NAME ˅` reference line) or INLINE
+                         (fully expanded body). ˅/^ toggles inline expansion. -->
+                    <button class="control-btn" onclick="openExtensionInsert(event)">Extensions ▾</button>
+                    <!-- v4.31: per-block ˅/^ toggle. Collapses / expands the
+                         EXTENSION block containing the caret. Keyboard: Ctrl+K.
+                         (Bulk expand/collapse still live in the Extensions ▾
+                         picker; this is the per-block arrow.) -->
+                    <button class="control-btn" onclick="toggleExtensionAtCursor()" title="Collapse/expand the EXTENSION block at the caret (Ctrl+K)">˅/^ Fold</button>
+                </div>
+
+                <div class="section" style="margin-top: 40px; border-top: 2px solid var(--glass-border); padding-top: 30px;">
+                    <div class="flex-row" style="justify-content: space-between;">
+                        <h3>Background Automation Queue</h3>
+                        <button onclick="refreshTasks()" style="padding: 5px 12px; font-size: 11px;">Refresh</button>
+                    </div>
+                    <div id="taskList" class="file-list" style="margin-top:10px"></div>
+                </div>
+            </section>
+
+            <!-- Live Typing Tab -->
+            <section id="tab-Live" class="tabcontent">
+                <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                    <h3>Live Keyboard</h3>
+                    <div style="text-align: right;">
+                        <div id="liveStatus" style="font-size: 12px; color: var(--primary);">● LIVE</div>
+                        <div id="silentIndicator" style="font-size: 10px; color: var(--text-muted); margin-top: 2px;">Silent start: -</div>
+                    </div>
+                </div>
+                <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">
+                    With <b>Live typing</b> enabled, every key you press below is sent to the target computer
+                    instantly over HID - like a wireless keyboard. Enter, Backspace, Tab, Esc and arrows are forwarded too.
+                </p>
+
+                <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <span>Live typing <span style="color: var(--text-muted); font-size: 11px;">(keys go to host as you press them)</span></span>
+                    <label class="switch"><input type="checkbox" id="liveEnabled" checked onchange="toggleLiveTyping()"><span class="slider round"></span></label>
+                </div>
+
+                <textarea id="liveInput" spellcheck="false" placeholder="Click here and type - keys are sent to the host live. Toggle off above to pause." style="height: 220px; width: 100%;"></textarea>
+
+                <div class="control-panel flex-row" style="margin-top: 15px; flex-wrap: wrap;">
+                    <button class="control-btn" onclick="sendLiveText()">Send All Text</button>
+                    <button class="control-btn" onclick="liveSendSpecial('ENTER')">Enter</button>
+                    <button class="control-btn" onclick="liveSendSpecial('BACKSPACE')">Backspace</button>
+                    <button class="control-btn" onclick="liveSendSpecial('TAB')">Tab</button>
+                    <button class="control-btn" onclick="document.getElementById('liveInput').value=''">Clear</button>
+                </div>
+            </section>
+
+            <!-- Scripts Tab (Renamed from Files) -->
+            <section id="tab-Scripts" class="tabcontent">
+                <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                    <h3>Script Library</h3>
+                    <button onclick="refreshFileBrowser()" style="padding: 5px 12px; font-size: 11px;">Refresh</button>
+                </div>
+                <div style="position: relative; height: 400px;">
+                    <div class="file-list" id="fileList" style="height: 100%;"></div>
+                    <div id="fileListScrollbar" class="custom-scrollbar-track">
+                        <div id="fileListScrollbarThumb" class="custom-scrollbar-thumb"></div>
+                    </div>
+                </div>
+                <div class="setting-row flex-row" style="margin-top: 20px;">
+                    <input type="text" id="newFilename" placeholder="New script name" class="flex-grow">
+                    <button onclick="saveScript()">Save Current</button>
+                </div>
+            </section>
+
+            <!-- File Manager Tab -->
+            <section id="tab-File_Manager" class="tabcontent">
+                <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                    <h3>System File Explorer</h3>
+                    <button onclick="refreshFileBrowser()" style="padding: 5px 12px; font-size: 11px;">Refresh 🔄</button>
+                </div>
+                <div class="section">
+                    <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
+                        <span id="currentDirDisplay" style="font-family: monospace; color: var(--primary);">/</span>
+                        <button onclick="goToParent()" style="padding: 5px 12px; font-size: 12px;">Up</button>
+                    </div>
+                    <div style="position: relative; height: 400px;">
+                        <div id="fileBrowser" class="file-browser" style="height: 100%;"></div>
+                        <div id="fileBrowserScrollbar" class="custom-scrollbar-track">
+                            <div id="fileBrowserScrollbarThumb" class="custom-scrollbar-thumb"></div>
+                        </div>
+                    </div>
+                </div>
+                <!-- v4.17: file preview panel (populated by JS on tap). Hidden until a file is chosen. -->
+                <div id="filePreviewPanel" style="display:none;margin-top:16px;padding:12px;background:var(--bg-input,#1a1a24);border:1px solid var(--glass-border,#333);border-radius:10px;">
+                    <div class="flex-row" style="justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <b id="filePreviewName" style="font-family:monospace;color:var(--primary);">preview</b>
+                        <button onclick="closeFilePreview()" style="padding:4px 10px;font-size:11px;">Close</button>
+                    </div>
+                    <pre id="filePreviewBody" style="max-height:280px;overflow:auto;font-size:12px;background:#0d0d14;padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;"></pre>
+                </div>
+                <!-- v4.17: long-press / right-click context menu. Positioned by JS at cursor. -->
+                <div id="fileContextMenu" style="display:none;position:fixed;z-index:99997;background:#1e1e28;color:#fff;border-radius:10px;box-shadow:0 12px 40px rgba(0,0,0,0.6);border:1px solid rgba(255,255,255,0.1);padding:6px 0;min-width:180px;">
+                    <div class="fcm-item" onclick="fcmAction('preview')"  style="padding:10px 14px;cursor:pointer;font-size:13px;">Preview</div>
+                    <div class="fcm-item" onclick="fcmAction('rename')"   style="padding:10px 14px;cursor:pointer;font-size:13px;">Rename</div>
+                    <div class="fcm-item" onclick="fcmAction('duplicate')"style="padding:10px 14px;cursor:pointer;font-size:13px;">Duplicate</div>
+                    <div class="fcm-item" onclick="fcmAction('download')" style="padding:10px 14px;cursor:pointer;font-size:13px;">Download</div>
+                    <div class="fcm-item" onclick="fcmAction('copy_path')"style="padding:10px 14px;cursor:pointer;font-size:13px;">Copy path</div>
+                    <div class="fcm-item" onclick="fcmAction('delete')"   style="padding:10px 14px;cursor:pointer;font-size:13px;color:#ef4444;">Delete</div>
+                </div>
+
+                <div class="setting-group">
+                    <h4>Upload & Folder Actions</h4>
+                    <!-- v4.15 mobile fix: transparent file input overlays the
+                         whole dropzone so a tap on the box lands on the
+                         input directly. `display:none` inputs cannot be
+                         clicked from JS on iOS Safari / Chrome captive-
+                         portal browsers - the tap must hit the input itself. -->
+                    <div id="uploadArea" class="section" style="border: 2px dashed var(--glass-border); text-align: center; cursor: pointer; position: relative;">
+                        <div class="folder-icon" style="font-size: 32px; margin-bottom: 10px; pointer-events: none;"></div>
+                        <p style="pointer-events: none;">Click or Drag & Drop to upload</p>
+                        <input type="file" id="fileInput" multiple
+                               style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;">
+                    </div>
+                    <div class="flex-row" style="margin-top: 15px;">
+                        <button onclick="createNewFolder()" class="flex-grow">New Folder</button>
+                        <button onclick="pasteFile()" class="flex-grow">Paste File</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Design Tab -->
+            <section id="tab-Design" class="tabcontent">
+                <h3>UI Design System</h3>
+                <div id="designList" class="file-list"></div>
+                <div class="control-panel flex-row" style="margin-top: 15px;">
+                    <button onclick="refreshDesigns()" class="flex-grow">Refresh</button>
+                    <button onclick="applySelectedDesign()" class="flex-grow">Apply</button>
+                    <button onclick="resetDesign()" class="flex-grow danger">Reset</button>
+                </div>
+            </section>
+
+            <section id="tab-Boot" class="tabcontent">
+                <h3>Boot Sequence</h3>
+                <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 15px;">Select multiple scripts to execute on boot.</p>
+                <div id="bootScriptsList" class="file-list" style="margin-bottom: 20px;"></div>
+                <button onclick="saveBootScripts()" style="width: 100%;">Save Boot Selection</button>
+
+                <div class="setting-group" style="margin-top: 20px;">
+                    <h4>Set Boot Script via Command</h4>
+                    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">Use <code>SET_BOOT_SCRIPT filename.txt</code> in any script to change the boot script programmatically.</p>
+                    <div class="flex-row">
+                        <input type="text" id="quickBootScript" placeholder="filename.txt" class="flex-grow">
+                        <button onclick="quickSetBootScript()">Set</button>
+                    </div>
+                </div>
+
+                <div class="section" style="margin-top: 20px;">
+                    <h4>Boot Preview</h4>
+                    <textarea id="bootScriptPreview" readonly style="height:150px"></textarea>
+                </div>
+            </section>
+
+            <!-- v4.17: Extensions Tab. Hak5 usbrubberducky-payloads-compatible
+                 reusable snippets stored on the SD under /extensions/. Edit,
+                 upload, delete, or pull-from-URL (WiFi required). -->
+            <section id="tab-Extensions" class="tabcontent">
+                <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                    <h3>Extensions</h3>
+                    <button onclick="refreshExtensions()" style="padding: 5px 12px; font-size: 11px;">Refresh</button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+                    Reusable DuckyScript snippets in <code>/extensions/</code>. Call from any payload with <code>RUN_EXTENSION &lt;name&gt;</code>.
+                    Pull directly from the Hak5 payloads repo (needs WiFi) or upload your own.
+                </p>
+
+                <div id="extList" class="file-list" style="max-height: 260px; margin-bottom: 12px;">Loading...</div>
+
+                <div style="margin-bottom: 12px;">
+                    <input type="text" id="extName" placeholder="Extension filename (e.g. OS_DETECTION.txt)" style="width: 100%; margin-bottom: 8px;">
+                    <textarea id="extEditor" spellcheck="false" placeholder="EXTENSION OS_DETECTION..." style="width: 100%; height: 260px; font-family: monospace; font-size: 12px;"></textarea>
+                    <div class="flex-row" style="gap: 6px; margin-top: 8px; flex-wrap: wrap;">
+                        <button onclick="saveExtension()" class="flex-grow">Save</button>
+                        <button onclick="deleteExtension()" class="flex-grow danger">Delete</button>
+                        <button onclick="clearExtEditor()" class="flex-grow">Clear</button>
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4>Upload from local file</h4>
+                    <div id="extUploadArea" class="section" style="border: 2px dashed var(--glass-border); text-align: center; cursor: pointer; position: relative;">
+                        <div style="font-size: 28px; margin-bottom: 6px; pointer-events: none;">📦</div>
+                        <p style="pointer-events: none;">Tap to pick a .txt/.dsx extension file</p>
+                        <input type="file" id="extFile" accept=".txt,.dsx,text/plain"
+                               style="position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer;"
+                               onchange="uploadExtensionFile()">
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4>Pull from URL (needs WiFi joined)</h4>
+                    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
+                        Paste any raw text URL, e.g. <code>https://raw.githubusercontent.com/hak5/usbrubberducky-payloads/master/payloads/extensions/OS_DETECTION/OS_DETECTION.dd</code>
+                    </p>
+                    <input type="text" id="extPullUrl" placeholder="https://raw.githubusercontent.com/..." style="width: 100%; margin-bottom: 8px;">
+                    <input type="text" id="extPullSaveAs" placeholder="Save as filename (e.g. OS_DETECTION.txt)" style="width: 100%; margin-bottom: 8px;">
+                    <button onclick="pullExtension()" style="width: 100%;">Download to /extensions/</button>
+                </div>
+            </section>
+
+            <!-- Settings Tab -->
+            <section id="tab-Settings" class="tabcontent">
+                <h3>System Configuration</h3>
+                
+                <div class="grid-2">
+                    <div class="setting-group">
+                        <h4>Internet Connection</h4>
+                        <input type="text" id="wifiSSIDJoin" placeholder="SSID" style="width: 100%; margin-bottom: 10px;">
+                        <input type="password" id="wifiPasswordJoin" placeholder="Password" style="width: 100%; margin-bottom: 10px;">
+                        <div class="flex-row">
+                            <button onclick="joinInternet()" class="flex-grow">Connect</button>
+                            <button onclick="leaveInternet()" class="danger">Leave</button>
+                        </div>
+                        <label class="custom-checkbox" style="margin-top: 8px; font-size: 12px;">
+                            <input type="checkbox" id="saveCredToggle" onchange="toggleSaveOnConnect()"> Save credentials
+                        </label>
+                        <div id="wifiStatus" style="margin-top: 10px; font-size: 12px;">Status: Idle</div>
+                        <div class="flex-row" style="margin-top: 15px;">
+                            <button onclick="scanNetworksForUI(this)" style="width: 100%;">Scan Networks</button>
+                        </div>
+                        <div id="wifiScanResults" class="file-list" style="margin-top: 10px; display: none; max-height: 200px; overflow-y: auto;"></div>
+                    </div>
+
+                    <div class="setting-group">
+                        <h4 data-tour="toggles-header">Toggles</h4>
+                        <div class="flex-row" data-setting="led" style="justify-content: space-between; margin-bottom: 10px;">
+                            <span>Hardware LED</span>
+                            <label class="switch"><input type="checkbox" id="ledToggle" checked onchange="toggleLED()"><span class="slider"></span></label>
+                        </div>
+                        <!-- v4.17: toggle whether the LED blinks fast during payload execution. -->
+                        <div class="flex-row" data-setting="led" style="justify-content: space-between; margin-bottom: 10px;">
+                            <span title="When ON, the LED fast-blinks blue while a DuckyScript payload is running. When OFF, it stays solid.">Blink LED while executing payloads</span>
+                            <label class="switch"><input type="checkbox" id="blinkOnRunToggle" checked onchange="toggleBlinkOnRun()"><span class="slider"></span></label>
+                        </div>
+                        <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
+                            <span>Logging</span>
+                            <label class="switch"><input type="checkbox" id="loggingToggle" onchange="toggleLogging()"><span class="slider"></span></label>
+                        </div>
+                        <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
+                            <span>Bluetooth</span>
+                            <label class="switch"><input type="checkbox" id="btToggle" onchange="toggleBluetooth()"><span class="slider"></span></label>
+                        </div>
+                        <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
+                            <span>Bluetooth Discovery</span>
+                            <label class="switch"><input type="checkbox" id="btDiscoveryToggle" onchange="toggleBluetoothDiscovery()"><span class="slider"></span></label>
+                        </div>
+                        <div class="flex-row" data-tour="silent-row" style="justify-content: space-between; align-items: center;">
+                            <span title="Default ON. The USB PHY is dead at boot; HID attaches only when a script or Live typing needs it, then detaches.">Silent Startup (stealth HID)</span>
+                            <label class="switch"><input type="checkbox" id="silentToggle" onchange="toggleSilentStartup()"><span class="slider"></span></label>
+                        </div>
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+                            <span title="Roll a new random VID/PID at every boot (and every silent-HID re-attach that involves a reboot).">Randomize USB VID/PID</span>
+                            <label class="switch"><input type="checkbox" id="rndUsbToggle" onchange="toggleRndUsb()"><span class="slider"></span></label>
+                        </div>
+                        <!-- v4.12: MAC randomization on STA connect. Router only sees the random MAC. -->
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+                            <span title="When the ESP joins another WiFi network (via Internet Connection), use a fresh random MAC address instead of the factory one. Router can't track the ESP across networks by hardware address.">Randomize WiFi MAC (STA)</span>
+                            <label class="switch"><input type="checkbox" id="rndMacToggle" onchange="toggleRndMac()"><span class="slider"></span></label>
+                        </div>
+                        <!-- v4.5: "Allow COM connections" - enables USB CDC so PuTTY
+                             (or any COM-port terminal) can talk to the ESP over
+                             the host's COM port. HID + STORAGE are disabled while
+                             on (composite USB is CDC-only). Toggling reboots. -->
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+                            <span title="Presents the ESP as a USB CDC serial device. Connect with PuTTY: Connection type = Serial, Serial line = the new COM port that appears in Device Manager, Speed = 115200. HID (keyboard) and STORAGE are DISABLED while this is on - reboot to re-enable them.">Allow COM connections</span>
+                            <label class="switch"><input type="checkbox" id="comToggle" onchange="toggleCom()"><span class="slider"></span></label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- v4.15: System Stats moved OUT of Settings and INTO the Stats tab.
+                     The IDs (#settCpu / settRam / settFlash / settSd / settUptime /
+                     settTempCard / settTemp) stay identical so the polling code that
+                     writes to them keeps working unchanged. -->
+
+                <div class="setting-group">
+                    <h4>Language</h4>
+                    <div class="flex-row">
+                        <select id="languageSelect" class="flex-grow"></select>
+                        <button onclick="saveLanguageSettings()">Apply</button>
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4>AP Settings</h4>
+                    <input type="text" id="wifiSSID" placeholder="AP SSID" style="width: 100%; margin-bottom: 10px;">
+                    <input type="password" id="wifiPassword" placeholder="AP Password" style="width: 100%; margin-bottom: 10px;">
+                    <div class="flex-row">
+                        <input type="number" id="wifiScanTime" value="5000" class="flex-grow">
+                        <button onclick="saveWiFiSettings()">Save & Reboot</button>
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4>USB Identity (VID/PID)</h4>
+                    <div class="grid-2" style="margin-bottom: 10px;">
+                        <div class="flex-row">
+                            <input type="text" id="usbVID" placeholder="VID" style="flex:1">
+                            <label class="custom-checkbox"><input type="checkbox" id="usbRndVID" onchange="handleRandomToggle()"> Random</label>
+                        </div>
+                        <div class="flex-row">
+                            <input type="text" id="usbPID" placeholder="PID" style="flex:1">
+                            <label class="custom-checkbox"><input type="checkbox" id="usbRndPID" onchange="handleRandomToggle()"> Random</label>
+                        </div>
+                    </div>
+                    <div class="flex-row">
+                        <input type="text" id="usbMfr" placeholder="Manufacturer" class="flex-grow">
+                        <input type="text" id="usbProd" placeholder="Product" class="flex-grow">
+                    </div>
+                    <button onclick="saveUSBSettings()" style="width: 100%; margin-top: 10px;">Apply & Reboot</button>
+                </div>
+
+                <div class="setting-group">
+                    <h4 data-tour="tutorial-header">Tutorial</h4>
+                    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
+                        Replay the guided walk-through with the focus spotlight and auto-clicks.
+                    </p>
+                    <button onclick="startTutorial()" style="width: 100%;">Restart tutorial</button>
+                </div>
+
+                <div class="setting-group">
+                    <h4>Editor Settings</h4>
+                    <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                        <span>Autocomplete Suggestions</span>
+                        <label class="switch">
+                            <input type="checkbox" id="settingAutocomplete" checked>
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <!-- v4.15: persist editor draft in browser localStorage. When
+                         on, whatever you type in the Coding tab is saved every
+                         second and restored on next page open, even if you never
+                         hit Save. Cleared by Clear button. -->
+                    <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+                        <span title="Persist unsaved editor content in this browser. Survives reloads and even closing the tab. Cleared by the editor's Clear button.">Keep unsaved draft in browser</span>
+                        <label class="switch">
+                            <input type="checkbox" id="settingKeepDraft" checked onchange="__persistDraftSettingChanged()">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4>Connectivity</h4>
+                    <div class="flex-row" style="justify-content: space-between; align-items: center;">
+                        <span>Automatic Reconnection</span>
+                        <label class="switch">
+                            <input type="checkbox" id="autoRetryToggle" onchange="toggleAutoRetry()">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                    <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+                        <span>Auto-connect to Saved WiFi on Reboot</span>
+                        <label class="switch">
+                            <input type="checkbox" id="autoConnectToggle" onchange="toggleAutoConnect()">
+                            <span class="slider round"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4 onclick="toggleSavedNetworksPanel()" style="cursor:pointer">Saved WiFi Networks ▼</h4>
+                    <div id="savedNetworksPanel" style="display:none;">
+                        <div id="savedNetworksList" class="file-list" style="margin-bottom: 10px; min-height: 40px; font-size: 12px;">Loading...</div>
+                        <button onclick="loadSavedNetworks()" style="width: 100%; font-size: 12px; padding: 6px;">Refresh List</button>
+                    </div>
+                </div>
+
+                <div class="setting-group">
+                    <h4 data-tour="attackmode-header">ATTACKMODE quick-set</h4>
+                    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 8px;">
+                        Choose the USB composition. The device reboots so the composite descriptor can be rebuilt.
+                    </p>
+                    <div class="flex-row" data-tour="attackmode-buttons" style="flex-wrap: wrap; gap: 6px;">
+                        <button onclick="setAttackMode('HID')" class="flex-grow">HID only</button>
+                        <button onclick="setAttackMode('STORAGE_ONLY')" class="flex-grow">STORAGE only (no HID)</button>
+                        <button onclick="setAttackMode('HID STORAGE')" class="flex-grow">HID + STORAGE</button>
+                        <button onclick="setAttackMode('BLANK')" class="flex-grow danger" title="Tear the device fully off the USB bus - no HID, no drive, nothing enumerates. Recover via any of the buttons above.">BLANK (unmount all)</button>
+                    </div>
+                    <p style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">
+                        Or use <code>ATTACKMODE ...</code> in a script for full Hak5 syntax
+                        (VID/PID/SIZE). New: <code>ATTACKMODE BLANK</code> = no USB at all.
+                    </p>
+                </div>
+
+                <div class="setting-group">
+                    <h4 data-tour="update-header">Firmware / Website Update (.espkg)</h4>
+                    <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">
+                        Drop or pick a bundled <code>.espkg</code> package to update the web UI and/or
+                        the firmware in one step. Website files are written first, firmware last.
+                        The LED blinks blue while applying and goes solid on success. <b>Do not unplug</b>
+                        during the update.
+                    </p>
+                    <!-- v4.6 mobile fix: the reliable cross-browser trick for a
+                         "click-anywhere-in-the-box" file picker on mobile is to
+                         put the <input type=file> DIRECTLY on top of the visible
+                         drop-zone at opacity:0. iOS Safari + Android Chrome
+                         both refuse click() forwarding from a hidden or
+                         off-screen input; a co-located transparent input works
+                         because the tap event literally hits the input first. -->
+                    <div id="espkgDropZone" style="position: relative; display: block; border: 2px dashed var(--glass-border); border-radius: 10px; padding: 20px; text-align: center; cursor: pointer; margin-bottom: 10px; transition: all 0.2s; -webkit-tap-highlight-color: rgba(76,175,80,0.2);">
+                        <div style="font-size: 26px; margin-bottom: 6px; pointer-events: none;">📦</div>
+                        <div id="espkgDropText" style="font-size: 13px; pointer-events: none;">Tap or drop a <code>.espkg</code> file here</div>
+                        <!-- The invisible input covers the entire drop-zone. Any
+                             tap/click on the box hits this input directly, which
+                             opens the OS file picker on every desktop AND every
+                             mobile browser without a JS shim. -->
+                        <input type="file" id="espkgFile" accept=".espkg,application/octet-stream"
+                               style="position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer;"
+                               onchange="onEspkgFileChosen()">
+                    </div>
+
+                    <div id="espkgPreview" style="display: none; background: var(--bg-input); border-radius: 8px;
+                         padding: 12px; margin-bottom: 10px; font-size: 12px;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+                            <b id="espkgPreviewName">package</b>
+                            <span id="espkgPreviewSize" style="color: var(--text-muted);"></span>
+                        </div>
+                        <div id="espkgPreviewVersion" style="color: var(--primary); margin-bottom: 6px;"></div>
+                        <div id="espkgPreviewContents" style="color: var(--text-muted); font-family: monospace; font-size: 11px; white-space: pre-wrap;"></div>
+                    </div>
+
+                    <div class="progress-bar" id="updateProgressBar" style="display:none; margin-bottom: 10px;">
+                        <div class="progress-fill" id="updateProgressFill" style="width:0%"></div>
+                    </div>
+                    <div id="updateStatusLine" style="font-size: 12px; color: var(--text-muted); margin-bottom: 10px;">Idle</div>
+                    <div class="flex-row" style="gap: 8px;">
+                        <button id="updateApplyBtn" onclick="uploadUpdatePackage()" style="flex: 3;" disabled>Upload &amp; Apply</button>
+                        <button onclick="resetEspkgPicker()" style="flex: 1;" class="secondary">Clear</button>
+                    </div>
+                </div>
+
+                <div class="setting-group danger">
+                    <h4 data-tour="danger-header" style="color: var(--danger);">Danger Zone</h4>
+                    <div class="flex-row" data-tour="danger-buttons" style="flex-wrap:wrap; gap:6px;">
+                        <button class="flex-grow" onclick="clearErrorLog()">Clear Errors</button>
+                        <button class="danger flex-grow" onclick="factoryReset()">Factory Reset</button>
+                        <button class="danger flex-grow" onclick="behaveBrokenPrompt()" title="Persistently reconfigure the device to look like a plain SD_READER USB stick. Web files stay on the SD but are hidden. Recovery: hold GPIO0 for 5 s at boot.">Behave Broken</button>
+                        <button class="danger flex-grow" onclick="selfDestructPrompt()" title="Corrupts the firmware. Device will not boot until reflashed with esptool.">Self Destruct</button>
+                    </div>
+                    <p style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">
+                        You can also trigger these from any DuckyScript with
+                        <code>FACTORY_RESET</code>, <code>BEHAVE_BROKEN</code>,
+                        or <code>SELF_DESTRUCT</code> (aliases: <code>FACTORYRESET</code>,
+                        <code>BEHAVEBROKEN</code>, <code>SELFDESTRUCT</code>).
+                    </p>
+                </div>
+            </section>
+
+            <!-- Statistics Tab -->
+            <section id="tab-Statistics" class="tabcontent">
+                <!-- v4.15: System Stats block moved here from the Settings tab.
+                     Same element IDs as before so the live poller keeps writing
+                     to them without any JS changes. -->
+                <h3 data-tour="stats-header">System</h3>
+                <div class="stats-grid" style="grid-template-columns: repeat(auto-fit,minmax(120px,1fr)); gap: 8px;">
+                    <div class="stat-card"><div class="stat-value" id="settCpu"     style="font-size:14px;">-</div><div class="stat-label">CPU</div></div>
+                    <div class="stat-card"><div class="stat-value" id="settRam"     style="font-size:14px;">-</div><div class="stat-label">RAM</div></div>
+                    <div class="stat-card"><div class="stat-value" id="settFlash"   style="font-size:14px;">-</div><div class="stat-label">Flash chip</div></div>
+                    <!-- v4.16: sketch (app partition) usage with % - shows how much of the
+                         3.4 MB app slot is consumed by the running firmware. -->
+                    <div class="stat-card"><div class="stat-value" id="settFlashUsed" style="font-size:14px;">-</div><div class="stat-label">Flash used</div></div>
+                    <div class="stat-card"><div class="stat-value" id="settSd"      style="font-size:14px;">-</div><div class="stat-label">SD</div></div>
+                    <div class="stat-card"><div class="stat-value" id="settUptime"  style="font-size:14px;">-</div><div class="stat-label">Uptime</div></div>
+                    <div class="stat-card" id="settTempCard" style="transition: background-color 1s ease, color 1s ease, border-color 1s ease;">
+                        <div class="stat-value" id="settTemp" style="font-size:14px; transition: color 1s ease;">-</div>
+                        <div class="stat-label">CPU Temp</div>
+                    </div>
+                </div>
+                <div style="text-align: right; font-size: 11px; color: var(--text-muted); margin-top: 6px; margin-bottom: 16px;">Live via /api/stats</div>
+
+                <h3 style="margin-top:16px;">Device Metrics</h3>
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="stat-value" id="errorCount">0</div><div class="stat-label">Errors</div></div>
+                    <div class="stat-card"><div class="stat-value" id="totalScripts">0</div><div class="stat-label">Scripts</div></div>
+                    <div class="stat-card"><div class="stat-value" id="totalCommands">0</div><div class="stat-label">Commands</div></div>
+                    <div class="stat-card"><div class="stat-value" id="clientCount">0</div><div class="stat-label">Clients</div></div>
+                    <div class="stat-card"><div class="stat-value" id="detectedOS" style="font-size: 16px;">Unknown</div><div class="stat-label">OS</div></div>
+                    <div class="stat-card"><div class="stat-value" id="attackModeChip" style="font-size: 14px;">HID</div><div class="stat-label">ATTACKMODE</div></div>
+                </div>
+                <div class="section">
+                    <h4>History</h4>
+                    <div id="historyList" class="history-list"></div>
+                </div>
+                <div class="setting-group">
+                    <div class="flex-row" style="justify-content: space-between;"><span>Last Error:</span><span id="lastError" style="color:var(--danger)">None</span></div>
+                    <div class="flex-row" style="justify-content: space-between;"><span>Uptime:</span><span id="uptime">0s</span></div>
+                    <div class="flex-row" style="justify-content: space-between;"><span>RAM:</span><span id="freeMemory">0 KB</span></div>
+                </div>
+            </section>
+
+            <!-- Wiki Tab: quick reference for every recognized command -->
+            <section id="tab-Wiki" class="tabcontent">
+                <h3>Syntaxes</h3>
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">
+                    Every command the firmware currently recognizes, with its arguments and one-line meaning.
+                    Click any row to copy the command to the clipboard.
+                </p>
+                <input type="text" id="wikiSearch" placeholder="Filter... e.g. LED, WIFI, KEY, ATTACK" style="width: 100%; margin-bottom: 12px;" oninput="filterWiki()">
+                <div id="wikiTable" style="max-height: 70vh; overflow-y: auto;"></div>
+            </section>
+        </div>
+    </div>
+    <!-- Connection Error Overlay -->
+    <div id="connectionError" class="overlay" style="display:none">
+        <div class="overlay-content">
+            <button class="close-overlay" onclick="hideConnectionError()">×</button>
+            <div class="error-icon"></div>
+            <h3>Connection Lost</h3>
+            <p>Unable to communicate with the ESP32-S3 hardware. Please check your connection and try again.</p>
+            
+            <div style="margin-bottom: 20px;">
+                <label class="custom-checkbox" style="justify-content: center;">
+                    <input type="checkbox" id="dontShowConnError"> Don't show again for this session
+                </label>
+            </div>
+
+            <div class="advanced-error-toggle" onclick="toggleAdvancedErrorOptions()">
+                Advanced Options <span id="advErrorArrow">▼</span>
+            </div>
+            <div id="advancedErrorOptions" style="display:none; margin: 10px 0; text-align: left; padding: 10px; background: rgba(0,0,0,0.2); border-radius: 8px;">
+                <label class="custom-checkbox">
+                    <input type="checkbox" id="retryConnToggle" checked> Retry connection to ESP
+                </label>
+            </div>
+
+            <div class="flex-row" style="gap: 10px;">
+                <button onclick="retryConnection()" class="flex-grow">Retry Connection</button>
+                <button onclick="hideConnectionError()" class="flex-grow secondary">Dismiss</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js?v=4.36"></script>
+</body>
+</html>
