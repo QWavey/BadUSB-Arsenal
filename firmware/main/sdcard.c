@@ -1,13 +1,20 @@
-// SD card scaffold — the P4 has a second SDMMC controller (SLOT_0) that
-// the M-EXT board leaves free (SLOT_1 is already the SDIO link to the
-// C6). This file mounts a MicroSD stack over SLOT_0 on user-configurable
-// pins so DuckyScript payloads can live on the card and survive reflash.
+// SD card over SPI (the "3V3 / CS / MOSI / CLK / MISO / GND" adapter
+// style, as opposed to the wider SDMMC 4-bit bus). Wired on the P4-
+// MINI-B-M-EXT to spare GPIO pins picked to not collide with the SDIO
+// link to the C6 (GPIO 14-19), the USB PHY (24-25), the status LED
+// (GPIO 10) or the C6 reset line (GPIO 54).
 //
-// Pin defaults below match the Spotpear MINI-B-M-EXT's exposed SDIO
-// header — override in sdkconfig or by editing SDCARD_PIN_* if your
-// build uses different pins. If the card doesn't mount (no card, wrong
-// pins, wiring fault) we log a warning and continue — the rest of the
-// firmware doesn't depend on the SD card being present.
+// Default wiring — override with -D or edit here:
+//   SD adapter -> P4 GPIO
+//   3V3        -> 3V3
+//   GND        -> GND
+//   CS         -> GPIO 21
+//   MOSI       -> GPIO 20
+//   CLK        -> GPIO 23
+//   MISO       -> GPIO 22
+//
+// The card mounts as /sdcard as a FATFS volume. Non-fatal if the card
+// isn't present at boot — call sdcard_present() before touching files.
 
 #include "sdcard.h"
 
@@ -15,57 +22,65 @@
 #include "esp_err.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
-#include "driver/sdmmc_host.h"
+#include "driver/spi_common.h"
+#include "driver/sdspi_host.h"
 
 static const char *TAG = "sdcard";
 
-// Adjust to match the board you're wiring the SD reader into. Defaults
-// pick spare GPIOs on the ESP32-P4-MINI-B-M-EXT header — the user said
-// "we have pins" but did not pin down which ones, so these are best-
-// guess defaults consistent with the board's SDMMC0 breakout. Edit as
-// needed and rebuild — no code changes needed beyond the four #defines.
+// User's SD adapter labels -> P4 GPIOs. Change here if you rewire.
+#ifndef SDCARD_PIN_CS
+#define SDCARD_PIN_CS    21
+#endif
+#ifndef SDCARD_PIN_MOSI
+#define SDCARD_PIN_MOSI  20
+#endif
 #ifndef SDCARD_PIN_CLK
-#define SDCARD_PIN_CLK   43
+#define SDCARD_PIN_CLK   23
 #endif
-#ifndef SDCARD_PIN_CMD
-#define SDCARD_PIN_CMD   44
-#endif
-#ifndef SDCARD_PIN_D0
-#define SDCARD_PIN_D0    39
-#endif
-#ifndef SDCARD_PIN_D1
-#define SDCARD_PIN_D1    40
-#endif
-#ifndef SDCARD_PIN_D2
-#define SDCARD_PIN_D2    41
-#endif
-#ifndef SDCARD_PIN_D3
-#define SDCARD_PIN_D3    42
+#ifndef SDCARD_PIN_MISO
+#define SDCARD_PIN_MISO  22
 #endif
 
-#define SDCARD_MOUNT_POINT   "/sdcard"
+// SPI2 is the general-purpose SPI on ESP32-P4 (SPI1 is flash). SPI3 is
+// also usable but we pick SPI2 for compatibility.
+#define SDCARD_SPI_HOST     SPI2_HOST
+#define SDCARD_MOUNT_POINT  "/sdcard"
 
 static sdmmc_card_t *s_card = NULL;
+static bool          s_bus_up = false;
 
-// Mount the SD card. Non-fatal on failure — a system without an SD
-// reader wired keeps running. Idempotent: multiple calls are no-ops
-// after the first success.
+// Bring up the SPI bus (once) then probe + mount the card. Returns
+// ESP_OK on success. Failure is logged as a warning — the rest of the
+// firmware runs fine without a card, so callers just check sdcard_present().
 esp_err_t sdcard_mount(void) {
     if (s_card) return ESP_OK;
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.slot = SDMMC_HOST_SLOT_0;      // SLOT_1 is the SDIO link to C6
-    host.flags = SDMMC_HOST_FLAG_4BIT | SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF;
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    esp_err_t err;
 
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.clk = SDCARD_PIN_CLK;
-    slot.cmd = SDCARD_PIN_CMD;
-    slot.d0  = SDCARD_PIN_D0;
-    slot.d1  = SDCARD_PIN_D1;
-    slot.d2  = SDCARD_PIN_D2;
-    slot.d3  = SDCARD_PIN_D3;
-    slot.width = 4;
-    slot.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+    if (!s_bus_up) {
+        spi_bus_config_t bus = {
+            .mosi_io_num     = SDCARD_PIN_MOSI,
+            .miso_io_num     = SDCARD_PIN_MISO,
+            .sclk_io_num     = SDCARD_PIN_CLK,
+            .quadwp_io_num   = -1,
+            .quadhd_io_num   = -1,
+            // Match esp_vfs_fat_sdspi_mount's internal buffer size so it can
+            // do full-sector reads/writes in one DMA transaction.
+            .max_transfer_sz = 4000,
+        };
+        err = spi_bus_initialize(SDCARD_SPI_HOST, &bus, SDSPI_DEFAULT_DMA);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "spi_bus_initialize: %s", esp_err_to_name(err));
+            return err;
+        }
+        s_bus_up = true;
+    }
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SDCARD_SPI_HOST;
+
+    sdspi_device_config_t dev = SDSPI_DEVICE_CONFIG_DEFAULT();
+    dev.gpio_cs = SDCARD_PIN_CS;
+    dev.host_id = SDCARD_SPI_HOST;
 
     esp_vfs_fat_sdmmc_mount_config_t mcfg = {
         .format_if_mount_failed = false,   // don't nuke an existing card
@@ -73,15 +88,16 @@ esp_err_t sdcard_mount(void) {
         .allocation_unit_size   = 16 * 1024,
     };
 
-    esp_err_t err = esp_vfs_fat_sdmmc_mount(SDCARD_MOUNT_POINT, &host, &slot, &mcfg, &s_card);
+    err = esp_vfs_fat_sdspi_mount(SDCARD_MOUNT_POINT, &host, &dev, &mcfg, &s_card);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SD mount failed: %s (no card or wrong pins?)", esp_err_to_name(err));
+        ESP_LOGW(TAG, "SD (SPI) mount failed: %s (no card / bad wiring?)", esp_err_to_name(err));
         s_card = NULL;
         return err;
     }
     sdmmc_card_print_info(stdout, s_card);
-    ESP_LOGI(TAG, "SD mounted at %s (%llu MiB)", SDCARD_MOUNT_POINT,
-             ((uint64_t)s_card->csd.capacity) * s_card->csd.sector_size / (1024 * 1024));
+    ESP_LOGI(TAG, "SD (SPI) mounted at %s — CS=%d MOSI=%d CLK=%d MISO=%d",
+             SDCARD_MOUNT_POINT, SDCARD_PIN_CS, SDCARD_PIN_MOSI,
+             SDCARD_PIN_CLK, SDCARD_PIN_MISO);
     return ESP_OK;
 }
 
