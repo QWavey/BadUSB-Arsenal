@@ -51,7 +51,7 @@ static const ascii_map_t s_ascii[128] = {
     // 0x00..0x1f: control chars — only Enter/Tab/Backspace mapped
     [0x08] = { 0x2a, 0 },   // Backspace
     ['\t'] = { 0x2b, 0 },
-    ['\n'] = { 0x28, 0 },   // Enter
+    ['\n'] = { 0x28, 0 },   // Enter (\r stripped upstream by badusb_stream_ascii)
     // Printables
     [' ']  = { 0x2c, 0 },
     ['!']  = { 0x1e, 1 }, ['"'] = { 0x34, 1 }, ['#'] = { 0x20, 1 },

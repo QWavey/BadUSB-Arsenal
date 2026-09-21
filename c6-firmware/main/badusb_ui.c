@@ -66,7 +66,9 @@ static int badusb_stream_ascii(const char *buf, int len) {
     int sent = 0;
     for (int i = 0; i < len; i++) {
         uint8_t c = (uint8_t)buf[i];
-        if (c == 0 || c > 127) continue;
+        // Strip \r so a CRLF paste (Windows/Mac clipboard) fires Enter
+        // exactly once, not twice, on the target PC.
+        if (c == 0 || c > 127 || c == '\r') continue;
         for (int spin = 0; spin < 200; spin++) {
             if (sdio_slave_read_reg(SDIO_REG_BADUSB_TYPE) == 0) break;
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -165,11 +167,18 @@ static int slurp_body(httpd_req_t *r, char *out, int max) {
 // Handles {"text":"...."} where the value is a JSON string. Supports \n,
 // \t, \r, \", \\ escapes. Returns bytes written to `out` (excluding NUL).
 static int extract_json_text(const char *body, char *out, int out_max) {
+    // Match the KEY "text" not any occurrence of the substring — otherwise
+    // a body like {"other":"text","real":"..."} would grab "..." from the
+    // wrong field. "text":\s* is the actual key.
     const char *p = strstr(body, "\"text\"");
+    while (p) {
+        const char *after = p + 6;
+        while (*after && isspace((unsigned char)*after)) after++;
+        if (*after == ':') { p = after; break; }
+        p = strstr(after, "\"text\"");
+    }
     if (!p) return -1;
-    p = strchr(p, ':');
-    if (!p) return -1;
-    p++;
+    p++;   // skip the ':'
     while (*p && isspace((unsigned char)*p)) p++;
     if (*p != '"') return -1;
     p++;
@@ -197,19 +206,24 @@ static int extract_json_text(const char *body, char *out, int out_max) {
 // -------- /api/live-type --------
 // The ported UI POSTs {"text":"..."} here for real-time typing.
 static esp_err_t h_api_live_type(httpd_req_t *r) {
-    char buf[2048];
-    int n = slurp_body(r, buf, sizeof(buf));
-    if (n < 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body"); return ESP_OK; }
-    char text[2048];
-    int tl = extract_json_text(buf, text, sizeof(text));
+    // Heap-allocate — HTTPD worker task defaults to a 4 KB stack, so
+    // two 2 KB locals here would blow it before the handler even runs.
+    const int BUFSZ = 2048;
+    char *buf = malloc(BUFSZ);
+    char *text = malloc(BUFSZ);
+    if (!buf || !text) { free(buf); free(text); httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+    int n = slurp_body(r, buf, BUFSZ);
+    if (n < 0) { free(buf); free(text); httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body"); return ESP_OK; }
+    int tl = extract_json_text(buf, text, BUFSZ);
     if (tl < 0) {
         // Fall back to raw body — some code paths in their JS post plain text.
         tl = n;
-        if (tl > (int)sizeof(text) - 1) tl = sizeof(text) - 1;
+        if (tl > BUFSZ - 1) tl = BUFSZ - 1;
         memcpy(text, buf, tl);
         text[tl] = 0;
     }
     int sent = badusb_stream_ascii(text, tl);
+    free(buf); free(text);
     httpd_resp_set_type(r, "application/json");
     char body[64];
     int bn = snprintf(body, sizeof(body), "{\"typed\":%d}", sent);
@@ -247,12 +261,16 @@ static void ducky_key(uint8_t hid) {
 }
 
 static esp_err_t h_execute(httpd_req_t *r) {
-    char buf[4096];
-    int n = slurp_body(r, buf, sizeof(buf));
-    if (n < 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body"); return ESP_OK; }
+    // Same reason as h_api_live_type: keep 8 KB of buffers off the
+    // HTTPD worker's 4 KB stack.
+    const int BUFSZ = 4096;
+    char *buf = malloc(BUFSZ);
+    char *script = malloc(BUFSZ);
+    if (!buf || !script) { free(buf); free(script); httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+    int n = slurp_body(r, buf, BUFSZ);
+    if (n < 0) { free(buf); free(script); httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body"); return ESP_OK; }
     // Allow either raw payload or {"script":"..."} form.
-    char script[4096];
-    int sl = extract_json_text(buf, script, sizeof(script));
+    int sl = extract_json_text(buf, script, BUFSZ);
     if (sl < 0) {
         const char *p = strstr(buf, "\"script\"");
         if (p) {
@@ -262,7 +280,7 @@ static esp_err_t h_execute(httpd_req_t *r) {
             if (p && *p == '"') {
                 p++;
                 sl = 0;
-                while (*p && *p != '"' && sl < (int)sizeof(script) - 1) {
+                while (*p && *p != '"' && sl < BUFSZ - 1) {
                     if (*p == '\\' && p[1]) {
                         switch (p[1]) {
                             case 'n': script[sl++]='\n'; break;
@@ -298,6 +316,7 @@ static esp_err_t h_execute(httpd_req_t *r) {
         else { /* unsupported — silently skip */ }
         (void)ducky_key;  // silence unused-static warning until full protocol lands
     }
+    free(buf); free(script);
     httpd_resp_set_type(r, "application/json");
     char body[96];
     int bn = snprintf(body, sizeof(body), "{\"lines\":%d,\"executed\":%d}", lines, executed);
