@@ -577,16 +577,118 @@
                 <div id="wikiTable" style="max-height: 70vh; overflow-y: auto;"></div>
             </section>
 
-            <!-- Keylog Tab — hosts our original P4-KeyLogger dashboard via /klog inside an iframe so its live-log WebSocket, pill state and settings all keep working. -->
+            <!-- Keylog Tab — native page (no iframe). Talks to the same
+                 /ws WebSocket the pre-port dashboard used, so live keys,
+                 pill state and settings all round-trip through the C6
+                 without leaving the ported UI's design system. -->
             <section id="tab-Keylog" class="tabcontent">
-                <div class="flex-row" style="justify-content: space-between; align-items: center;">
-                    <h3>Keylog — live keystrokes from the hub</h3>
-                    <a href="/klog" target="_blank" class="control-btn" style="text-decoration:none">Open in new tab ↗</a>
-                </div>
-                <p style="color: var(--muted); font-size: 13px; margin: 6px 0 12px;">
-                    Streams every key pressed on the USB keyboard attached to the CH334 hub. Pill state, live log, recording toggle, LED mode and layout are all controlled from inside this frame.
+                <h3>Keylog — live keystrokes from the hub</h3>
+                <p style="color:var(--text-muted); font-size:13px; margin:6px 0 12px;">
+                    Every keystroke on the USB keyboard attached to the CH334 hub, in real time. Recording persists to flash; download or clear the log below.
                 </p>
-                <iframe id="keylogFrame" src="/klog" style="width:100%; height:75vh; border:1px solid var(--bd); border-radius:8px; background:#0e1116;"></iframe>
+
+                <div id="kl_pills" class="flex-row" style="gap:6px; flex-wrap:wrap; margin-bottom:14px;">
+                    <span id="kl_p_ws"    class="pill">WebSocket: connecting</span>
+                    <span id="kl_p_kbd"   class="pill">Keyboard: unknown</span>
+                    <span id="kl_p_mouse" class="pill">Mouse: unknown</span>
+                    <span id="kl_p_pc"    class="pill">PC: unknown</span>
+                    <span id="kl_p_rec"   class="pill">Recording: —</span>
+                </div>
+
+                <pre id="kl_live" style="background:#000; color:#4CAF50; padding:12px; border-radius:8px; min-height:260px; max-height:440px; overflow:auto; font:13px/1.5 ui-monospace,Menlo,monospace; white-space:pre-wrap; word-break:break-all; margin:0 0 14px;">[waiting for keys from the hub…]</pre>
+
+                <div class="flex-row" style="gap:10px; flex-wrap:wrap;">
+                    <button class="control-btn" onclick="klRec(true)">Start Recording</button>
+                    <button class="control-btn" onclick="klRec(false)">Stop Recording</button>
+                    <button class="control-btn" onclick="klLive(true)">Start Live Stream</button>
+                    <button class="control-btn" onclick="klLive(false)">Stop Live Stream</button>
+                    <button class="control-btn" onclick="klDownload()">Download log</button>
+                    <button class="control-btn" onclick="klClearView()">Clear view</button>
+                    <button class="control-btn danger" onclick="klDelete()">Delete log</button>
+                </div>
+
+                <div class="flex-row" style="gap:14px; margin-top:14px; flex-wrap:wrap;">
+                    <label class="flex-row" style="gap:6px;">
+                        <span>Layout</span>
+                        <select id="kl_layout" onchange="klSetLayout()">
+                            <option value="0">US (QWERTY)</option>
+                            <option value="1">DE (QWERTZ)</option>
+                            <option value="2">UK (QWERTY)</option>
+                        </select>
+                    </label>
+                    <label class="flex-row" style="gap:6px;">
+                        <input type="checkbox" id="kl_held" onchange="klSetHeld()"> Log HELD KEY events (≥ 1.5 s)
+                    </label>
+                </div>
+
+                <script>
+                (function(){
+                    // Namespace everything under kl_* so the ported UI's
+                    // globals aren't touched. Uses the same /ws the pre-
+                    // port dashboard used — no second WebSocket needed.
+                    if (window.__klBooted) return; window.__klBooted = true;
+                    const $=id=>document.getElementById(id);
+                    const setPill=(el,cls,txt)=>{el.className='pill '+(cls||'');el.textContent=txt;};
+                    let kl_ws=null, kl_gotFirst=false;
+
+                    function klRefresh(){
+                        fetch('/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{
+                            setPill($('kl_p_kbd'),  j.kbd?'ok':'warn',  'Keyboard: '+(j.kbd?'connected':'disconnected'));
+                            setPill($('kl_p_mouse'),j.mouse?'ok':'warn','Mouse: '+(j.mouse?'connected':'disconnected'));
+                            setPill($('kl_p_pc'),   j.pc?'ok':'warn',   'PC: '+(j.pc?'connected':'not mounted'));
+                            setPill($('kl_p_rec'),  j.recording?'ok':'warn','Recording: '+(j.recording?'on':'off'));
+                            if (typeof j.layout==='number') $('kl_layout').value=j.layout;
+                            if (typeof j.heldEnabled==='boolean') $('kl_held').checked=j.heldEnabled;
+                        }).catch(()=>{});
+                    }
+                    window.klRec  = on => fetch(on?'/rec/start':'/rec/stop', {method:'POST'}).then(klRefresh);
+                    window.klLive = on => fetch(on?'/live/start':'/live/stop',{method:'POST'}).then(klRefresh);
+                    window.klDownload=()=>{const a=document.createElement('a');a.href='/log/download?t='+Date.now();a.download='keylog-'+new Date().toISOString().slice(0,19).replaceAll(':','-')+'.txt';document.body.appendChild(a);a.click();a.remove();};
+                    window.klDelete  =()=>{if(confirm('Delete all recorded log data?'))fetch('/log/delete',{method:'POST'}).then(klRefresh);};
+                    window.klClearView=()=>{$('kl_live').textContent='[cleared — waiting for keys…]';kl_gotFirst=false;};
+                    window.klSetLayout=()=>fetch('/layout?v='+$('kl_layout').value,{method:'POST'}).then(klRefresh);
+                    window.klSetHeld  =()=>fetch('/held?v='+($('kl_held').checked?1:0),{method:'POST'}).then(klRefresh);
+
+                    function klAppend(line){
+                        const live=$('kl_live');
+                        if(!kl_gotFirst){live.textContent='';kl_gotFirst=true;}
+                        const atBottom = live.scrollHeight - live.scrollTop - live.clientHeight < 40;
+                        if (line.startsWith('KEY ')) {
+                            let body = line.slice(4);
+                            if (body.endsWith('\n')) body = body.slice(0,-1);
+                            if (!body) return;
+                            if (body === '\\n') { live.append('\n'); }
+                            else if (body.startsWith('[') && body.endsWith(']')) {
+                                const sp=document.createElement('span'); sp.style.color='#58a6ff'; sp.textContent=body; live.append(sp);
+                            } else { live.append(body); }
+                        } else if (line.startsWith('EVT ')) {
+                            const rest=line.slice(4).trim();
+                            const sp=document.createElement('span'); sp.style.color='var(--text-muted)'; sp.style.fontStyle='italic';
+                            sp.textContent='('+rest+')\n'; live.append(sp);
+                            klRefresh();
+                        }
+                        while (live.childNodes.length > 4000) live.removeChild(live.firstChild);
+                        if (atBottom) live.scrollTop = live.scrollHeight;
+                    }
+
+                    function klConnect(){
+                        try { if (kl_ws && (kl_ws.readyState===0||kl_ws.readyState===1)) return; } catch(_){}
+                        kl_ws = new WebSocket('ws://'+location.host+'/ws');
+                        kl_ws.onopen  = () => setPill($('kl_p_ws'),'ok','WebSocket: connected');
+                        kl_ws.onmessage = e => {
+                            for (const line of e.data.split('\n')) {
+                                if (!line) continue;
+                                if (line.charCodeAt(0)===0x1e) { klRefresh(); continue; }
+                                klAppend(line+'\n');
+                            }
+                        };
+                        kl_ws.onclose = () => { setPill($('kl_p_ws'),'warn','WebSocket: disconnected'); setTimeout(klConnect, 2000); };
+                        kl_ws.onerror = () => setPill($('kl_p_ws'),'warn','WebSocket: error');
+                    }
+                    klConnect(); klRefresh();
+                    setInterval(klRefresh, 5000);
+                })();
+                </script>
             </section>
         </div>
     </div>

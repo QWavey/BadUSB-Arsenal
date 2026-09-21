@@ -28,15 +28,21 @@
 extern QueueHandle_t g_hid_bridge_q;   // main.c
 extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
 
-// The reg 44 (Function 1 raw address 0xAC) transport carries one byte per
-// keystroke request: 0x00 means "idle, ready for next" and any other byte
-// is an ASCII character we should type once and then ack by writing 0.
+// Two SDIO wire channels the C6 uses to drive us:
+//   reg 44 (Function 1 @ 0xA8) — one ASCII byte per keystroke request.
+//   reg 45 (Function 1 @ 0xA9) — HID modifier bitmap for the NEXT combo:
+//                                bit0=CTRL, bit1=SHIFT, bit2=ALT, bit3=GUI.
+//   reg 46 (Function 1 @ 0xAA) — raw HID scancode for combos & named keys.
+// When reg 46 is non-zero, it takes precedence over reg 44: we inject
+// (mod << SDIO reg 45, kc = reg 46) as a keydown/keyup pair, ack by
+// clearing reg 46. Plain ASCII (Live-Type text) still uses reg 44 alone.
 // Address arithmetic mirrors c6_uart.c's C6_REG_LED_MODE_ADDR derivation:
 //   offset = pos + (pos>23?4:0) + (pos>31?12:0)
 //   raw    = 0x6C + offset
-// For pos = 44: offset = 44+4+12 = 60 -> raw = 0xA8.
-// (Yes, this collides with none of the LED/layout regs at 0xA4/0xA5/0xA6.)
+// For pos 44/45/46: offsets 60/61/62 → raw 0xA8/0xA9/0xAA.
 #define BADUSB_TYPE_REG_ADDR   0xA8
+#define BADUSB_MOD_REG_ADDR    0xA9
+#define BADUSB_HID_REG_ADDR    0xAA
 
 static const char *TAG = "live_type";
 
@@ -90,41 +96,53 @@ static const ascii_map_t s_ascii[128] = {
     ['~']  = { 0x35, 1 },
 };
 
-// Enqueue a keydown for one HID code + modifier, then a keyup, both on
-// the shared bridge queue. forward_task in main.c hands them to TinyUSB
-// in order; the physical keyboard's traffic already goes through the
-// same queue so serialisation is inherent.
-static void inject_char(uint8_t kc, bool shift) {
+// Enqueue a keydown+keyup for one HID scancode with an arbitrary
+// modifier bitmap (bit0=CTRL, bit1=SHIFT, bit2=ALT, bit3=GUI — matches
+// the HID boot keyboard modifier byte layout, left-hand modifiers).
+// Sent through the same g_hid_bridge_q that the physical keyboard's
+// traffic goes through, so forward_task serialises them naturally.
+static void inject_hid(uint8_t kc, uint8_t mod) {
     if (!g_hid_bridge_q || kc == 0) return;
     hid_bridge_msg_t down = { .kind = HID_REP_KIND_KEYBOARD, .len = 8 };
-    down.data[0] = shift ? 0x02 : 0x00;
+    down.data[0] = mod;   // HID modifier byte (bit-per-mod key)
     down.data[2] = kc;
     hid_bridge_msg_t up = { .kind = HID_REP_KIND_KEYBOARD, .len = 8 };
     memset(up.data, 0, 8);
     xQueueSend(g_hid_bridge_q, &down, pdMS_TO_TICKS(50));
     xQueueSend(g_hid_bridge_q, &up,   pdMS_TO_TICKS(50));
 }
+static void inject_char(uint8_t kc, bool shift) { inject_hid(kc, shift ? 0x02 : 0x00); }
 
 static void live_type_task(void *arg) {
     (void)arg;
-    ESP_LOGI(TAG, "live-type task up (reg 44 poller)");
+    ESP_LOGI(TAG, "live-type task up (reg 44/46 poller)");
     while (1) {
         sdmmc_card_t *card = live_type_get_card();
         if (!card) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        // Prefer the combo path (reg 46) when set — combos are event-driven
+        // (rare) and the C6 waits for the ack, so keeping their latency low
+        // matters. Plain ASCII typing on reg 44 is a stream — one iteration
+        // handles either channel then falls through to the 20 ms delay so
+        // both keep progressing.
+        uint8_t kc = 0, mod = 0;
+        if (sdmmc_io_read_byte(card, 1, BADUSB_HID_REG_ADDR, &kc) == ESP_OK && kc != 0) {
+            (void)sdmmc_io_read_byte(card, 1, BADUSB_MOD_REG_ADDR, &mod);
+            inject_hid(kc, mod);
+            (void)sdmmc_io_write_byte(card, 1, BADUSB_HID_REG_ADDR, 0, NULL);
+            (void)sdmmc_io_write_byte(card, 1, BADUSB_MOD_REG_ADDR, 0, NULL);
+            continue;
+        }
+
         uint8_t v = 0;
         esp_err_t err = sdmmc_io_read_byte(card, 1, BADUSB_TYPE_REG_ADDR, &v);
         if (err != ESP_OK || v == 0) {
-            // No pending byte, or SDIO transient — poll again quickly. 20 ms
-            // gives ~50 chars/s throughput which is fine for a paste stream.
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
         if (v < 128 && s_ascii[v].kc) {
             inject_char(s_ascii[v].kc, s_ascii[v].shift);
         }
-        // Acknowledge — clear reg 44 so the C6 knows we're ready for the
-        // next byte. If this write fails we leave v in place and retry;
-        // the C6 side just keeps waiting.
         (void)sdmmc_io_write_byte(card, 1, BADUSB_TYPE_REG_ADDR, 0, NULL);
     }
 }

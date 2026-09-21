@@ -120,8 +120,13 @@ static bool s_pc_present   = false;   // PC (user's computer) bound the P4's HID
 static bool s_warned_pending_dl = false;
 // Non-static so badusb_ui.c can read it for /api/stats.
 uint32_t s_sta_count = 0;
-static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
-static bool     s_led_off  = false;                // dedicated OFF switch — when true the LED is dark and the mode dropdown is disabled in the web UI
+// Non-static so badusb_ui.c's /api/stats can read the current mode.
+uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
+// Exposed non-static so badusb_ui.c's /api/toggle-led + /api/stats can
+// read (and, via led_set_off below, flip) the LED-off switch — the
+// ported UI's Settings tab has its own hardware-LED toggle that we
+// need to bridge to this state.
+bool     s_led_off  = false;                // dedicated OFF switch — when true the LED is dark and the mode dropdown is disabled in the web UI
 static bool     s_held_enabled = false;            // whether HELD KEY events are shown/logged (default OFF)
 static uint8_t  s_layout   = 0;                    // keyboard layout, pushed to P4 reg 41
 static volatile uint8_t s_led_disp = LED_MODE_KEYFLASH; // what's currently on reg 40
@@ -249,7 +254,7 @@ static void led_user_mode(uint8_t m) {
 // Dedicated OFF switch (web /led?off= endpoint). Sets or clears the switch
 // and pushes the effective mode to the wire. Independent of s_led_mode so
 // the user can flip the LED dark and back without losing their color.
-static void led_set_off(bool off) {
+void led_set_off(bool off) {
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_led_off = off;
     xSemaphoreGive(s_led_lock);

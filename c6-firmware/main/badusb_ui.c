@@ -31,6 +31,7 @@
 #include "esp_err.h"
 #include "esp_http_server.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"           // esp_timer_get_time() for the dedupe
 #include "driver/sdio_slave.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -47,7 +48,176 @@
 static const char *TAG = "badusb_ui";
 
 // Matches main.c's SDIO_REG_BADUSB_TYPE.
-#define SDIO_REG_BADUSB_TYPE  44
+#define SDIO_REG_BADUSB_TYPE  44   // ASCII byte (live-type stream)
+#define SDIO_REG_BADUSB_MOD   45   // HID modifier bitmap for the next combo
+#define SDIO_REG_BADUSB_HID   46   // HID scancode for combo/named keys
+
+// Modifier bit mask constants (match the HID boot-report modifier byte
+// on the P4 side).
+#define MOD_CTRL   0x01
+#define MOD_SHIFT  0x02
+#define MOD_ALT    0x04
+#define MOD_GUI    0x08
+
+// C6-side mirror of firmware/main/live_type.c's s_ascii table — needed
+// so we can convert a single-char combo key (e.g. `CTRL a`) into the
+// right (HID scancode, shift-required) pair before we send the combo
+// over reg 45/46 to the P4. Only the printable slots are populated
+// here; unmapped bytes return kc=0 which the caller treats as "not a
+// key we can send as part of a combo".
+uint8_t badusb_ascii_to_hid(uint8_t c, uint8_t *out_shift) {
+    struct { uint8_t kc, sh; } m;
+    m.kc = 0; m.sh = 0;
+    if (c >= 'a' && c <= 'z') { m.kc = 0x04 + (c - 'a'); m.sh = 0; }
+    else if (c >= 'A' && c <= 'Z') { m.kc = 0x04 + (c - 'A'); m.sh = 1; }
+    else if (c >= '1' && c <= '9') { m.kc = 0x1e + (c - '1'); m.sh = 0; }
+    else if (c == '0') { m.kc = 0x27; m.sh = 0; }
+    else {
+        switch (c) {
+            case ' ':  m.kc = 0x2c; break;
+            case '\n': m.kc = 0x28; break;
+            case '\t': m.kc = 0x2b; break;
+            case '-':  m.kc = 0x2d; break;
+            case '=':  m.kc = 0x2e; break;
+            case '[':  m.kc = 0x2f; break;
+            case ']':  m.kc = 0x30; break;
+            case '\\': m.kc = 0x31; break;
+            case ';':  m.kc = 0x33; break;
+            case '\'': m.kc = 0x34; break;
+            case '`':  m.kc = 0x35; break;
+            case ',':  m.kc = 0x36; break;
+            case '.':  m.kc = 0x37; break;
+            case '/':  m.kc = 0x38; break;
+            case '!':  m.kc = 0x1e; m.sh = 1; break;
+            case '@':  m.kc = 0x1f; m.sh = 1; break;
+            case '#':  m.kc = 0x20; m.sh = 1; break;
+            case '$':  m.kc = 0x21; m.sh = 1; break;
+            case '%':  m.kc = 0x22; m.sh = 1; break;
+            case '^':  m.kc = 0x23; m.sh = 1; break;
+            case '&':  m.kc = 0x24; m.sh = 1; break;
+            case '*':  m.kc = 0x25; m.sh = 1; break;
+            case '(':  m.kc = 0x26; m.sh = 1; break;
+            case ')':  m.kc = 0x27; m.sh = 1; break;
+            case '_':  m.kc = 0x2d; m.sh = 1; break;
+            case '+':  m.kc = 0x2e; m.sh = 1; break;
+            case '{':  m.kc = 0x2f; m.sh = 1; break;
+            case '}':  m.kc = 0x30; m.sh = 1; break;
+            case '|':  m.kc = 0x31; m.sh = 1; break;
+            case ':':  m.kc = 0x33; m.sh = 1; break;
+            case '"':  m.kc = 0x34; m.sh = 1; break;
+            case '~':  m.kc = 0x35; m.sh = 1; break;
+            case '<':  m.kc = 0x36; m.sh = 1; break;
+            case '>':  m.kc = 0x37; m.sh = 1; break;
+            case '?':  m.kc = 0x38; m.sh = 1; break;
+        }
+    }
+    if (out_shift) *out_shift = m.sh;
+    return m.kc;
+}
+
+// Ducky/reference token -> HID scancode. Returns 0 if the token isn't a
+// known named key. Case-insensitive.
+static uint8_t ducky_key_to_hid(const char *tok) {
+    // F1..F12
+    if ((tok[0]=='F'||tok[0]=='f') && isdigit((unsigned char)tok[1])) {
+        int f = atoi(tok + 1);
+        if (f >= 1 && f <= 12) return 0x3a + (f - 1);
+    }
+    struct { const char *n; uint8_t k; } m[] = {
+        {"ENTER",     0x28}, {"RETURN",    0x28},
+        {"ESC",       0x29}, {"ESCAPE",    0x29},
+        {"BACKSPACE", 0x2a}, {"BKSP",      0x2a},
+        {"TAB",       0x2b},
+        {"SPACE",     0x2c},
+        {"CAPSLOCK",  0x39}, {"CAPS",      0x39},
+        {"PRINTSCREEN", 0x46}, {"PRTSC",   0x46},
+        {"SCROLLLOCK",0x47}, {"SCROLL",    0x47},
+        {"PAUSE",     0x48}, {"BREAK",     0x48},
+        {"INSERT",    0x49}, {"INS",       0x49},
+        {"HOME",      0x4a},
+        {"PAGEUP",    0x4b}, {"PGUP",      0x4b},
+        {"DELETE",    0x4c}, {"DEL",       0x4c},
+        {"END",       0x4d},
+        {"PAGEDOWN",  0x4e}, {"PGDN",      0x4e},
+        {"RIGHT",     0x4f}, {"RIGHTARROW",0x4f},
+        {"LEFT",      0x50}, {"LEFTARROW", 0x50},
+        {"DOWN",      0x51}, {"DOWNARROW", 0x51},
+        {"UP",        0x52}, {"UPARROW",   0x52},
+        {"NUMLOCK",   0x53},
+        {"APP",       0x65}, {"MENU",      0x65},
+        {"POWER",     0x66},
+    };
+    for (size_t i = 0; i < sizeof(m)/sizeof(m[0]); i++) {
+        if (!strcasecmp(tok, m[i].n)) return m[i].k;
+    }
+    return 0;
+}
+
+// Wait for P4 to ack + write (mod, kc) as a combo. The P4's live_type
+// task checks reg 46 first, so the modifier must land BEFORE the HID
+// byte to avoid a race where P4 sees kc but stale mod. Total round-trip
+// is ~20-40 ms (one P4 poll tick).
+static bool send_combo(uint8_t mod, uint8_t kc) {
+    if (kc == 0) return false;
+    // Wait for reg 46 to be idle so we don't stomp an in-flight combo.
+    for (int spin = 0; spin < 20; spin++) {
+        if (sdio_slave_read_reg(SDIO_REG_BADUSB_HID) == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    // Modifier goes down first (P4 checks reg 46 as the trigger).
+    if (sdio_slave_write_reg(SDIO_REG_BADUSB_MOD, mod) != ESP_OK) return false;
+    if (sdio_slave_write_reg(SDIO_REG_BADUSB_HID, kc)  != ESP_OK) return false;
+    // Wait for P4 to consume it before returning (bounded).
+    for (int spin = 0; spin < 20; spin++) {
+        if (sdio_slave_read_reg(SDIO_REG_BADUSB_HID) == 0) return true;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return true;   // even if ack didn't land in 200 ms, P4 will still inject
+}
+
+// Parse a Ducky-style combo line like "CTRL ALT DELETE", "GUI r",
+// "SHIFT F10". Modifier tokens are recognised: CTRL/CONTROL, SHIFT,
+// ALT, GUI/WIN/WINDOWS/COMMAND. Anything else is treated as the key.
+// A single-char key ('r', 'a', ...) is mapped via ASCII+SHIFT lookup so
+// upper-case gets its own SHIFT bit; a named key ("F4", "DELETE") is
+// mapped through ducky_key_to_hid. Returns true on success.
+static bool run_combo_line(const char *line) {
+    uint8_t mod = 0;
+    uint8_t kc  = 0;
+    char tok[24];
+    while (*line) {
+        while (*line && isspace((unsigned char)*line)) line++;
+        if (!*line) break;
+        int i = 0;
+        while (line[i] && !isspace((unsigned char)line[i]) && i < (int)sizeof(tok)-1) { tok[i] = line[i]; i++; }
+        tok[i] = 0; line += i;
+        if      (!strcasecmp(tok, "CTRL")     || !strcasecmp(tok, "CONTROL")) mod |= MOD_CTRL;
+        else if (!strcasecmp(tok, "SHIFT"))                                    mod |= MOD_SHIFT;
+        else if (!strcasecmp(tok, "ALT"))                                      mod |= MOD_ALT;
+        else if (!strcasecmp(tok, "GUI")      || !strcasecmp(tok, "WIN")
+              || !strcasecmp(tok, "WINDOWS")  || !strcasecmp(tok, "COMMAND"))  mod |= MOD_GUI;
+        else if (i == 1) {
+            // Single ASCII char — map through our known layout.
+            uint8_t c = (uint8_t)tok[0];
+            if (c < 128) {
+                extern uint8_t badusb_ascii_to_hid(uint8_t c, uint8_t *out_shift);
+                uint8_t sh = 0;
+                kc = badusb_ascii_to_hid(c, &sh);
+                if (sh) mod |= MOD_SHIFT;
+            }
+        }
+        else kc = ducky_key_to_hid(tok);
+    }
+    if (kc == 0 && mod != 0) {
+        // Modifier alone — e.g. bare "GUI" — send it as a lone tap of
+        // the GUI key (0xe3 = Left GUI).
+        static const uint8_t solo[4] = { 0xe0, 0xe1, 0xe2, 0xe3 };
+        int i = 0;
+        for (; i < 4; i++) if (mod & (1 << i)) { kc = solo[i]; mod = 0; break; }
+    }
+    if (kc == 0) return false;
+    return send_combo(mod, kc);
+}
 
 // Static assets used to be baked into the binary via EMBED_FILES; now
 // they live on the "storage" SPIFFS partition (built from webui-fs/ at
@@ -213,25 +383,126 @@ static int extract_json_text(const char *body, char *out, int out_max) {
     return i;
 }
 
+// Generalised JSON string-field extractor: pass the field name and it
+// pulls the value between the following pair of quotes into `out`.
+// Same escape handling as extract_json_text. Returns bytes written
+// (>=0) or -1 if the field is absent.
+static int extract_json_str(const char *body, const char *field, char *out, int out_max) {
+    char needle[24];
+    int nl = snprintf(needle, sizeof(needle), "\"%s\"", field);
+    if (nl <= 0) return -1;
+    const char *p = strstr(body, needle);
+    while (p) {
+        const char *after = p + nl;
+        while (*after && isspace((unsigned char)*after)) after++;
+        if (*after == ':') { p = after; break; }
+        p = strstr(after, needle);
+    }
+    if (!p) return -1;
+    p++;   // skip ':'
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return -1;
+    p++;
+    int i = 0;
+    while (*p && *p != '"' && i < out_max - 1) {
+        if (*p == '\\' && p[1]) {
+            switch (p[1]) {
+                case 'n': out[i++] = '\n'; break;
+                case 't': out[i++] = '\t'; break;
+                case 'r': out[i++] = '\r'; break;
+                case '"': out[i++] = '"';  break;
+                case '\\': out[i++] = '\\'; break;
+                default:  out[i++] = p[1]; break;
+            }
+            p += 2;
+        } else {
+            out[i++] = *p++;
+        }
+    }
+    out[i] = 0;
+    return i;
+}
+
 // -------- /api/live-type --------
-// The ported UI POSTs {"text":"..."} here for real-time typing.
+// The ported UI's Live tab POSTs one of these JSON payloads per event:
+//   {"text":"<string>"}    — input event, the string that was inserted
+//   {"k":"<char>"}         — keydown event, a single printable char
+//   {"combo":"CTRL SHIFT a"} — modifier + key combo (special-key wire not
+//                             ported yet — accepted as no-op success)
+//   {"key":"F4"}           — named key (see above)
+//   {"release":true}       — silent-mode release (no-op)
+// On desktop, keydown fires FIRST then input fires within a few ms with
+// the same char, and the JS dedupes the input event against a 40 ms
+// window. That dedupe only works if BOTH payloads reach the same
+// endpoint SEMANTICS — dropping the {"k":...} path made the server type
+// the raw JSON string, and treating them as separate would double every
+// press. We normalise both to "type this text", and a small
+// server-side dedupe catches any browser that still emits both.
 static esp_err_t h_api_live_type(httpd_req_t *r) {
-    // Heap-allocate — HTTPD worker task defaults to a 4 KB stack, so
-    // two 2 KB locals here would blow it before the handler even runs.
     const int BUFSZ = 2048;
     char *buf = malloc(BUFSZ);
     char *text = malloc(BUFSZ);
     if (!buf || !text) { free(buf); free(text); httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
     int n = slurp_body(r, buf, BUFSZ);
     if (n < 0) { free(buf); free(text); httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body"); return ESP_OK; }
-    int tl = extract_json_text(buf, text, BUFSZ);
+
+    // Silent-mode release — reference sends this on tab hide / kbd-off toggle.
+    // We don't have a live "detach USB HID" path yet; treat as no-op success.
+    if (strstr(buf, "\"release\"")) {
+        free(buf); free(text);
+        httpd_resp_set_type(r, "application/json");
+        return httpd_resp_send(r, "{\"ok\":true}", 11);
+    }
+
+    // Try the "text" field first (input events / longer pastes). If that
+    // misses, try the "k" field (physical-keyboard keydown, always 1 char).
+    // If BOTH are absent it might be a raw-body POST (some code paths do
+    // that) — fall back to the whole body as text.
+    int tl = extract_json_str(buf, "text", text, BUFSZ);
+    if (tl < 0) tl = extract_json_str(buf, "k", text, BUFSZ);
     if (tl < 0) {
-        // Fall back to raw body — some code paths in their JS post plain text.
+        // Reject anything that STILL looks like JSON at the front — better
+        // to say "unrecognised" than to type "{\"combo\":\"...\"}" on the PC.
+        if (buf[0] == '{' || buf[0] == '[') {
+            free(buf); free(text);
+            httpd_resp_set_type(r, "application/json");
+            return httpd_resp_send(r, "{\"ok\":true,\"note\":\"combo/named-key not wired\"}", 46);
+        }
         tl = n;
         if (tl > BUFSZ - 1) tl = BUFSZ - 1;
         memcpy(text, buf, tl);
         text[tl] = 0;
     }
+
+    // Server-side dedupe: Chrome desktop fires BOTH keydown ({"k":"h"})
+    // and input ({"text":"h"}) within ~5 ms and the JS's 40 ms client
+    // dedupe misses because __lastKeydownAt is set AFTER liveSend fires
+    // — the input event's fetch is already in-flight. We collapse the
+    // pair with an "arm once" pattern: after we accept a keystroke we
+    // arm the dedupe; the very next matching same-char within 30 ms is
+    // dropped and the dedupe disarms. This handles the keydown/input
+    // twin without eating fast repeated presses (aa, holding a key,
+    // etc.) — a real second 'a' 30-100 ms later still lands.
+    static char     last_text[32];
+    static int      last_tl = 0;
+    static uint32_t last_ms = 0;
+    static bool     dedup_armed = false;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (dedup_armed && tl > 0 && tl == last_tl && tl < (int)sizeof(last_text) &&
+        memcmp(text, last_text, tl) == 0 &&
+        (now - last_ms) < 30) {
+        dedup_armed = false;   // one-shot; a real second press comes through
+        free(buf); free(text);
+        httpd_resp_set_type(r, "application/json");
+        return httpd_resp_send(r, "{\"typed\":0,\"dedup\":true}", 24);
+    }
+    if (tl > 0 && tl < (int)sizeof(last_text)) {
+        memcpy(last_text, text, tl);
+        last_tl = tl;
+        last_ms = now;
+        dedup_armed = true;
+    }
+
     int sent = badusb_stream_ascii(text, tl);
     free(buf); free(text);
     httpd_resp_set_type(r, "application/json");
@@ -294,6 +565,23 @@ static void execute_task(void *arg) {
         else if (!strcasecmp(line, "TAB"))       { badusb_stream_ascii("\t", 1); executed++; }
         else if (!strcasecmp(line, "SPACE"))     { badusb_stream_ascii(" ", 1);  executed++; }
         else if (!strcasecmp(line, "BACKSPACE")) { char c = 0x08; badusb_stream_ascii(&c, 1); executed++; }
+        // Combos: CTRL/ALT/GUI/SHIFT prefix, plus GUI-alias WIN/WINDOWS/
+        // COMMAND. Named keys F1..F12/ENTER/ESC/DELETE/HOME/etc. also
+        // route through the combo path so the P4 gets the HID scancode
+        // instead of an ASCII byte. Ductape for a full DuckyScript 3.0
+        // interpreter but covers the load-bearing 95% of payloads.
+        else if (!strncasecmp(line, "CTRL",    4) || !strncasecmp(line, "CONTROL", 7) ||
+                 !strncasecmp(line, "ALT",     3) ||
+                 !strncasecmp(line, "SHIFT",   5) ||
+                 !strncasecmp(line, "GUI",     3) || !strncasecmp(line, "WIN",     3) ||
+                 !strncasecmp(line, "WINDOWS", 7) || !strncasecmp(line, "COMMAND", 7)) {
+            if (run_combo_line(line)) executed++;
+        }
+        else {
+            // Bare named-key line: "F4", "DELETE", "UPARROW", ...
+            uint8_t kc = ducky_key_to_hid(line);
+            if (kc && send_combo(0, kc)) executed++;
+        }
     }
     ESP_LOGI(TAG, "execute: %d lines, %d executed", lines, executed);
     free(script);
@@ -540,20 +828,50 @@ static void nvs_set_bool(const char *key, uint8_t v) {
     nvs_close(h);
 }
 
-// /api/stats — uptime, free heap, SPIFFS usage, Wi-Fi client count.
+// /api/stats — uptime, free heap, SPIFFS usage, Wi-Fi client count,
+// hardware LED state. The `ledEnabled` field is what the Settings tab's
+// hardware-LED toggle mirrors — before this fix the toggle sat "off"
+// because the stub said so, while the real LED (on the P4 via SDIO
+// reg 40) was actually lit.
 extern uint32_t s_sta_count;   // main.c
+extern bool     s_led_off;     // main.c (dedicated OFF switch)
+extern uint8_t  s_led_mode;    // main.c (color/pattern when not off)
 static esp_err_t h_api_stats(httpd_req_t *r) {
     size_t total = 0, used = 0;
     esp_spiffs_info("storage", &total, &used);
     uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-    char body[256];
+    char body[320];
     int n = snprintf(body, sizeof(body),
         "{\"uptime_s\":%u,\"free_heap\":%u,\"min_free_heap\":%u,"
-        "\"spiffs_total\":%u,\"spiffs_used\":%u,\"wifi_clients\":%u}",
+        "\"spiffs_total\":%u,\"spiffs_used\":%u,\"wifi_clients\":%u,"
+        "\"ledEnabled\":%s,\"ledMode\":%u}",
         (unsigned)up_s,
         (unsigned)esp_get_free_heap_size(),
         (unsigned)esp_get_minimum_free_heap_size(),
-        (unsigned)total, (unsigned)used, (unsigned)s_sta_count);
+        (unsigned)total, (unsigned)used, (unsigned)s_sta_count,
+        s_led_off ? "false" : "true", (unsigned)s_led_mode);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+
+// /api/toggle-led — reference UI's Settings tab has a single hardware-
+// LED toggle. Bridge it to our LED-off switch: POST flips, GET returns
+// the current state. Accepts optional `?on=0|1` for explicit set. This
+// exposes the same state the /led endpoint owns, so the two UIs stay
+// in sync (the pre-port keylog dashboard's LED switch and the ported
+// Settings LED toggle both mutate `s_led_off`).
+extern void led_set_off(bool off);   // main.c
+static esp_err_t h_api_toggle_led(httpd_req_t *r) {
+    if (r->method == HTTP_POST) {
+        char q[32] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+        char v[8] = { 0 };
+        bool have_explicit = (httpd_query_key_value(q, "on", v, sizeof(v)) == ESP_OK);
+        bool want_on = have_explicit ? (v[0] == '1') : s_led_off;   // toggle if no explicit
+        led_set_off(!want_on);
+    }
+    char body[48];
+    int n = snprintf(body, sizeof(body),
+        "{\"ledEnabled\":%s}", s_led_off ? "false" : "true");
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, body, n);
 }
@@ -752,6 +1070,9 @@ void badusb_ui_register(httpd_handle_t s) {
         // Real state endpoints
         {"/api/stats",          HTTP_GET,  h_api_stats,         NULL, false, false, NULL},
         {"/api/temp",           HTTP_GET,  h_api_temp,          NULL, false, false, NULL},
+        // /api/toggle-led — real backend (bridges to led_set_off in main.c).
+        {"/api/toggle-led",     HTTP_GET,  h_api_toggle_led,    NULL, false, false, NULL},
+        {"/api/toggle-led",     HTTP_POST, h_api_toggle_led,    NULL, false, false, NULL},
         {"/api/detect-os",      HTTP_GET,  h_api_detect_os,     NULL, false, false, NULL},
         {"/api/history",        HTTP_GET,  h_api_history,       NULL, false, false, NULL},
         {"/api/clear-history",  HTTP_POST, h_api_history,       NULL, false, false, NULL},
@@ -792,9 +1113,11 @@ void badusb_ui_register(httpd_handle_t s) {
         // USB attack-mode toggles that need the composite refactor
         "/api/save-usb", "/api/toggle-com", "/api/toggle-random-mac",
         "/api/toggle-save-on-connect",
-        // General settings knobs (persist to NVS — TODO real backends)
+        // General settings knobs (persist to NVS — TODO real backends).
+        // Note: /api/toggle-led is REAL (registered above with a live
+        // backend that flips led_set_off).
         "/api/save-settings", "/api/toggle-autoconnect",
-        "/api/toggle-blink-on-run", "/api/toggle-led",
+        "/api/toggle-blink-on-run",
         "/api/toggle-logging", "/api/toggle-wifi", "/api/set-silent",
         // Boot-script slot
         "/api/set-boot-script", "/api/test-boot-script",
