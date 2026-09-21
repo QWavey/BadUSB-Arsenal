@@ -51,7 +51,7 @@ const char WEB_UI_HTML[] =
 "</style></head><body>"
 
 "<h1>ESP32-P4 KeyLogger</h1>"
-"<div class=sub>Web UI on ESP32-C6 &middot; AP <b>P4-KeyLogger</b> &middot; UART GPIO4=RX from P4 TX (GPIO37)</div>"
+"<div class=sub>Web UI on ESP32-C6 &middot; AP <b>P4-KeyLogger</b> &middot; P4 &harr; C6 link over SDIO</div>"
 
 "<div class=card>"
 "<h2>Status</h2>"
@@ -68,22 +68,14 @@ const char WEB_UI_HTML[] =
  "<div>Log size <b id=st_size>–</b> / <b id=st_max>–</b></div>"
  "<div>Warn threshold <b id=st_warn>–</b></div>"
  "<div>Wi-Fi clients <b id=st_clients>–</b></div>"
- "<div>UART RX bytes <b id=st_uart>–</b></div>"
- "<div>SDIO RX bytes <b id=st_sdio>–</b></div>"
- "<div>WS frames <b id=st_ws>–</b></div>"
- "<div>Publish calls <b id=st_pub>–</b></div>"
- "<div>WS calls <b id=st_wsc>–</b></div>"
- "<div>WS gated <b id=st_wsg>–</b></div>"
- "<div>WS noClient <b id=st_wsn>–</b></div>"
- "<div>WS queueFail <b id=st_wsq>–</b></div>"
- "<div>WS fds <b id=st_wsf>–</b></div>"
+ "<div>SDIO bytes <b id=st_sdio>–</b></div>"
 "</div>"
 "<div id=barwrap class=bar><span id=bar></span></div>"
 "</div>"
 
 "<div class=card>"
 "<h2>Live stream</h2>"
-"<pre id=live>[waiting for keys from the P4 over UART GPIO4…]</pre>"
+"<pre id=live>[waiting for keys from the P4 over SDIO…]</pre>"
 "</div>"
 
 "<div class=card>"
@@ -114,15 +106,20 @@ const char WEB_UI_HTML[] =
  "<label class=sw><input type=checkbox id=cb_adl> Auto-download log before rotate</label>"
 "</div>"
 "<div class=row style='margin-top:10px'>"
+ "<label class=sw><input type=checkbox id=cb_led_off> LED off (disables mode)</label>"
+"</div>"
+"<div class=row style='margin-top:10px'>"
  "<label>Status LED "
   "<select id=sel_led>"
-   "<option value=0>Off</option>"
    "<option value=1>Green (steady)</option>"
    "<option value=2>Green idle, red on key</option>"
    "<option value=3>Red (steady)</option>"
    "<option value=4>Blue (steady)</option>"
   "</select>"
  "</label>"
+"</div>"
+"<div class=row style='margin-top:10px'>"
+ "<label class=sw><input type=checkbox id=cb_held> Log HELD KEY events (solo key held &ge; 1.5&nbsp;s)</label>"
 "</div>"
 "<div class=row style='margin-top:10px'>"
   "<label>Keyboard layout "
@@ -134,7 +131,7 @@ const char WEB_UI_HTML[] =
   "</label>"
 "</div></div>"
 
-"<footer>C6 firmware v3 &middot; UART @ 115200 8N1 &middot; log budget 1.6&nbsp;MB (fits 2&nbsp;MB SPIFFS), warning at 90%</footer>"
+"<footer>C6 firmware v4 &middot; P4&harr;C6 over SDIO &middot; log budget 1.5&nbsp;MB (fits 2&nbsp;MB SPIFFS), warning at 90%</footer>"
 
 "<script>"
 "const $=id=>document.getElementById(id);"
@@ -155,15 +152,7 @@ const char WEB_UI_HTML[] =
 "  $('st_max').textContent=fmtB(j.logMax);"
 "  $('st_warn').textContent=fmtB(j.warnBytes);"
 "  $('st_clients').textContent=j.clients;"
-"  $('st_uart').textContent=j.uartRxBytes;"
-"  $('st_sdio').textContent=j.sdioRxBytes;"
-"  $('st_ws').textContent=j.wsFrames;"
-"  $('st_pub').textContent=j.pub;"
-"  $('st_wsc').textContent=j.wsCalls;"
-"  $('st_wsg').textContent=j.wsGated;"
-"  $('st_wsn').textContent=j.wsNoClient;"
-"  $('st_wsq').textContent=j.wsQueueFail;"
-"  $('st_wsf').textContent=j.wsFds;"
+"  $('st_sdio').textContent=fmtB(j.sdioRxBytes);"
 "  const pct=Math.min(100,j.logBytes*100/j.logMax);"
 "  bar.style.width=pct+'%';"
 "  barwrap.className='bar'+(j.logBytes>j.warnBytes?' warn':'');"
@@ -181,6 +170,15 @@ const char WEB_UI_HTML[] =
 "  paintPair($('b_live_start'),$('b_live_stop'),!!j.live);"
 " cbAdl.checked=!!j.autoDownload;"
 " if(typeof j.ledMode==='number')$('sel_led').value=j.ledMode;"
+" const ledOff=!!j.ledOff;"
+" $('cb_led_off').checked=ledOff;"
+// When the LED-off switch is on, the color/pattern dropdown is meaningless —
+// disable it visually AND functionally so the user can't set an unreachable
+// value while the LED is dark.
+" $('sel_led').disabled=ledOff;"
+" $('sel_led').style.opacity=ledOff?0.4:1;"
+" $('sel_led').style.pointerEvents=ledOff?'none':'auto';"
+" $('cb_held').checked=!!j.heldEnabled;"
 " if(typeof j.layout==='number')$('sel_layout').value=j.layout;"
 " }).catch(()=>{});"
 "}"
@@ -195,12 +193,16 @@ const char WEB_UI_HTML[] =
 
 "function appendFrame(line){"
 " if(!gotFirstKey){live.textContent='';gotFirstKey=true}"
+// Sample scroll position BEFORE appending so we can preserve the user's
+// view when they've scrolled up to read older keystrokes. Only auto-anchor
+// to the bottom when the user was already there (within ~1 line of slop).
+" const wasAtBottom = live.scrollHeight - live.scrollTop - live.clientHeight < 40;"
 " if(line.startsWith('KEY ')){"
 "  let body=line.slice(4);"
 "  if(body.endsWith('\\n'))body=body.slice(0,-1);"    // drop wire terminator
 "  if(!body)return;"
-"  if(body==='\\\\n'){live.append('\\n');return;}"    // real Enter -> newline
-"  if(body.startsWith('[')&&body.endsWith(']')){"
+"  if(body==='\\\\n'){live.append('\\n');}"    // real Enter -> newline
+"  else if(body.startsWith('[')&&body.endsWith(']')){"
 "   const sp=document.createElement('span');sp.className='s';sp.textContent=body;live.append(sp);"
 "  } else {"
 "   live.append(body);"
@@ -219,7 +221,7 @@ const char WEB_UI_HTML[] =
 "  refreshStatus();"
 " }"
 " while(live.childNodes.length>4000)live.removeChild(live.firstChild);"
-" live.scrollTop=live.scrollHeight;"
+" if(wasAtBottom)live.scrollTop=live.scrollHeight;"
 "}"
 
 "function onWsData(txt){"
@@ -250,6 +252,8 @@ const char WEB_UI_HTML[] =
 "$('b_live_stop').onclick =()=>fetch('/live/stop', {method:'POST'}).then(refreshStatus);"
 "cbAdl.onchange=()=>fetch('/autodl?v='+(cbAdl.checked?1:0),{method:'POST'}).then(refreshStatus);"
 "$('sel_led').onchange=()=>fetch('/led?m='+$('sel_led').value,{method:'POST'}).then(refreshStatus);"
+"$('cb_led_off').onchange=()=>fetch('/led?off='+($('cb_led_off').checked?1:0),{method:'POST'}).then(refreshStatus);"
+"$('cb_held').onchange=()=>fetch('/held?v='+($('cb_held').checked?1:0),{method:'POST'}).then(refreshStatus);"
 "$('sel_layout').onchange=()=>fetch('/layout?v='+$('sel_layout').value,{method:'POST'}).then(refreshStatus);"
 
 "function download(){"

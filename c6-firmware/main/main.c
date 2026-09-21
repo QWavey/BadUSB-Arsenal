@@ -74,6 +74,8 @@ static const char *TAG = "c6ui";
 #define NVS_K_REC        "rec"
 #define NVS_K_AUTODL     "adl"
 #define NVS_K_LEDMODE    "ledm"
+#define NVS_K_LEDOFF     "ledoff"    // dedicated OFF switch (independent of mode)
+#define NVS_K_HELD       "heldon"    // whether HELD KEY events are surfaced
 #define NVS_K_BOOTTR     "boottr"
 #define NVS_K_LAYOUT     "layout"
 
@@ -113,7 +115,9 @@ static bool s_mouse_present = false;
 static bool s_pc_present   = false;   // PC (user's computer) bound the P4's HID device
 static bool s_warned_pending_dl = false;
 static uint32_t s_sta_count = 0;
-static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER mode (also wire target)
+static uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
+static bool     s_led_off  = false;                // dedicated OFF switch — when true the LED is dark and the mode dropdown is disabled in the web UI
+static bool     s_held_enabled = false;            // whether HELD KEY events are shown/logged (default OFF)
 static uint8_t  s_layout   = 0;                    // keyboard layout, pushed to P4 reg 41
 static volatile uint8_t s_led_disp = LED_MODE_KEYFLASH; // what's currently on reg 40
 static SemaphoreHandle_t s_led_lock;
@@ -140,16 +144,26 @@ static void nvs_load_settings(void) {
     uint8_t v = 0;
     if (nvs_get_u8(h, NVS_K_REC,     &v) == ESP_OK) s_recording = v ? true : false;
     if (nvs_get_u8(h, NVS_K_AUTODL,  &v) == ESP_OK) s_auto_dl   = v ? true : false;
-    if (nvs_get_u8(h, NVS_K_LEDMODE, &v) == ESP_OK) s_led_mode  = v > LED_MODE_BLUE ? LED_MODE_KEYFLASH : v;
-    if (nvs_get_u8(h, NVS_K_LAYOUT,  &v) == ESP_OK) s_layout    = v > 2 ? 0 : v;
+    // s_led_mode is the color/pattern (1..4). Legacy NVS may hold 0 (OFF) from
+    // the older schema where OFF was a mode value. Coerce to KEYFLASH so we
+    // never leave the mode dropdown pointing at nothing; the dedicated
+    // s_led_off switch below carries the "LED dark" state instead.
+    if (nvs_get_u8(h, NVS_K_LEDMODE, &v) == ESP_OK) {
+        s_led_mode = (v == 0 || v > LED_MODE_BLUE) ? LED_MODE_KEYFLASH : v;
+    }
+    if (nvs_get_u8(h, NVS_K_LEDOFF,  &v) == ESP_OK) s_led_off       = v ? true : false;
+    if (nvs_get_u8(h, NVS_K_HELD,    &v) == ESP_OK) s_held_enabled  = v ? true : false;
+    if (nvs_get_u8(h, NVS_K_LAYOUT,  &v) == ESP_OK) s_layout        = v > 2 ? 0 : v;
     nvs_close(h);
 }
 static void nvs_save_settings(void) {
     nvs_handle_t h;
     if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u8(h, NVS_K_REC,     s_recording ? 1 : 0);
-    nvs_set_u8(h, NVS_K_AUTODL,  s_auto_dl   ? 1 : 0);
+    nvs_set_u8(h, NVS_K_REC,     s_recording     ? 1 : 0);
+    nvs_set_u8(h, NVS_K_AUTODL,  s_auto_dl       ? 1 : 0);
     nvs_set_u8(h, NVS_K_LEDMODE, s_led_mode);
+    nvs_set_u8(h, NVS_K_LEDOFF,  s_led_off       ? 1 : 0);
+    nvs_set_u8(h, NVS_K_HELD,    s_held_enabled  ? 1 : 0);
     nvs_set_u8(h, NVS_K_LAYOUT,  s_layout);
     nvs_commit(h);
     nvs_close(h);
@@ -175,8 +189,12 @@ static void led_write_reg(uint8_t m) {
     esp_err_t err = sdio_slave_write_reg(SDIO_REG_LED_MODE, m);
     if (err != ESP_OK) ESP_LOGW(TAG, "led reg write: %s", esp_err_to_name(err));
 }
-// Telemetry/phase: BLUE/GREEN/RED for boot stages (never the saved mode).
+// Telemetry/phase: BLUE/GREEN/RED for boot stages (never the saved color).
+// If the user has flipped the dedicated OFF switch, we respect it — boot
+// telemetry does NOT override "user wants LED dark". Real failures still
+// blink via led_task's s_fail_code branch which writes reg 40 directly.
 static void led_phase(uint8_t m) {
+    if (s_led_off) return;
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_led_disp = m;
     xSemaphoreGive(s_led_lock);
@@ -194,19 +212,43 @@ static void led_fail_code(uint8_t code) {
     sdio_slave_write_reg(42, code);
     ESP_LOGE(TAG, "locked failure code %u", (unsigned)code);
 }
-// Adopt the user's saved mode (web /led endpoint or post-blue handover).
+// Compute what SHOULD be on reg 40 right now: OFF if the user's dedicated
+// switch is on, otherwise the user's chosen color/pattern mode. Updates
+// s_led_disp under the lock and writes reg 40 immediately.
+static void led_apply_effective(void) {
+    uint8_t effective;
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    effective = s_led_off ? LED_MODE_OFF : s_led_mode;
+    s_led_disp = effective;
+    xSemaphoreGive(s_led_lock);
+    led_write_reg(effective);
+}
+
+// Adopt the user's saved color/pattern mode (web /led?m= endpoint or post-
+// blue handover). Only accepts real modes (1..4) — the LED-off state is
+// carried by led_set_off() and does NOT overwrite the last chosen mode, so
+// toggling OFF then back ON restores whatever color the user picked.
+// Also clears the OFF switch: explicitly choosing a color is an implicit
+// "turn the LED back on" — otherwise a stale off=true silently masks every
+// color change (which is exactly how a UI race can trap the user in dark).
 static void led_user_mode(uint8_t m) {
-    if (m == LED_MODE_OFF && s_wifi_up == 1) {
-        m = LED_MODE_BLUE;  // never dark after WiFi up
-    } else if (m == LED_MODE_OFF && s_wifi_up != 1) {
-        ESP_LOGW(TAG, "refusing OFF before wifi confirmed");
-        return;
-    }
+    if (m < LED_MODE_GREEN || m > LED_MODE_BLUE) return;   // reject OFF and out-of-range
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_led_mode = m;
-    s_led_disp = m;
+    s_led_off  = false;
     xSemaphoreGive(s_led_lock);
-    led_write_reg(m);
+    led_apply_effective();
+    nvs_save_settings();
+}
+
+// Dedicated OFF switch (web /led?off= endpoint). Sets or clears the switch
+// and pushes the effective mode to the wire. Independent of s_led_mode so
+// the user can flip the LED dark and back without losing their color.
+static void led_set_off(bool off) {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    s_led_off = off;
+    xSemaphoreGive(s_led_lock);
+    led_apply_effective();
     nvs_save_settings();
 }
 // Heartbeat owner task: keeps reg 40 in sync with the current display value.
@@ -411,6 +453,11 @@ static void publish(const char *line) {
     size_t n = strlen(line);
     if (!n) return;
     s_publish_calls++;
+    // HELD KEY events are a user-toggled feature (OFF by default). When the
+    // toggle is off, drop the frame BEFORE it hits the ring buffer, the WS,
+    // or the log — the user sees nothing about hold detection.
+    // Frame layout: "KEY [HELD KEY: <name>, <n>.<t> Seconds]\n"
+    if (!s_held_enabled && !strncmp(line, "KEY [HELD KEY:", 14)) return;
     xRingbufferSend(s_live_ring, line, n, 0);
     bool is_key = !strncmp(line, "KEY ", 4);
     if (!(is_key && !s_live_streaming)) {
@@ -472,6 +519,7 @@ static esp_err_t h_status(httpd_req_t *r) {
          "\"clients\":%u,\"uartRxBytes\":%u,\"sdioRxBytes\":%u,"
          "\"wsFrames\":%u,\"pub\":%u,\"wsCalls\":%u,\"wsGated\":%u,"
          "\"wsNoClient\":%u,\"wsQueueFail\":%u,\"wsFds\":%u,\"ledMode\":%d,"
+         "\"ledOff\":%s,\"heldEnabled\":%s,"
          "\"wifi\":%d,\"bootphase\":%d,\"layout\":%d}",
         AP_SSID, s_kbd_present?"true":"false", s_mouse_present?"true":"false",
         s_pc_present?"true":"false",
@@ -482,7 +530,9 @@ static esp_err_t h_status(httpd_req_t *r) {
         (unsigned)s_publish_calls, (unsigned)s_ws_broadcast_calls,
         (unsigned)s_ws_gated_off, (unsigned)s_ws_no_clients,
         (unsigned)s_ws_queue_fail, (unsigned)s_client_count,
-        (int)s_led_mode, (int)s_wifi_up, (int)s_bootphase, (int)s_layout);
+        (int)s_led_mode,
+        s_led_off ? "true" : "false", s_held_enabled ? "true" : "false",
+        (int)s_wifi_up, (int)s_bootphase, (int)s_layout);
     httpd_resp_set_type(r, "application/json");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, body, n);
@@ -546,16 +596,44 @@ static esp_err_t h_live_stop(httpd_req_t *r) {
     return httpd_resp_sendstr(r, "{\"live\":false}");
 }
 
+// Web UI LED control. Two orthogonal parameters:
+//   ?m=N   — color/pattern mode (1=GREEN 2=KEYFLASH 3=RED 4=BLUE). Rejects
+//            0 and out-of-range. The mode is remembered even while the LED
+//            is switched off, so toggling OFF/ON restores this color.
+//   ?off=X — dedicated LED-off switch (1 = LED dark, 0 = LED shows mode).
+// Either or both may be provided in one POST.
 static esp_err_t h_led_set(httpd_req_t *r) {
-    char q[32] = { 0 };
+    char q[48] = { 0 };
     httpd_req_get_url_query_str(r, q, sizeof(q));
     char v[8] = { 0 };
-    httpd_query_key_value(q, "m", v, sizeof(v));
-    int m = atoi(v);
-    if (m < 0 || m > LED_MODE_BLUE) m = LED_MODE_KEYFLASH;
-    led_user_mode((uint8_t)m);        // persist + apply + put on the wire now
+    if (httpd_query_key_value(q, "off", v, sizeof(v)) == ESP_OK) {
+        led_set_off(v[0] == '1');
+    }
+    if (httpd_query_key_value(q, "m", v, sizeof(v)) == ESP_OK) {
+        int m = atoi(v);
+        if (m >= LED_MODE_GREEN && m <= LED_MODE_BLUE) led_user_mode((uint8_t)m);
+    }
     httpd_resp_set_type(r, "application/json");
-    char body[32]; int n = snprintf(body, sizeof(body), "{\"ledMode\":%d}", (int)s_led_mode);
+    char body[64];
+    int n = snprintf(body, sizeof(body), "{\"ledMode\":%d,\"ledOff\":%s}",
+                     (int)s_led_mode, s_led_off ? "true" : "false");
+    return httpd_resp_send(r, body, n);
+}
+
+// Toggle HELD KEY logging (default OFF at first boot). When disabled, publish()
+// drops any KEY frame whose body starts with "[HELD KEY:" so the log stays
+// pure keystrokes without hold annotations. Combos are already never emitted
+// as HELD by the P4 (only solo presses >= HOLD_MS qualify).
+static esp_err_t h_held_set(httpd_req_t *r) {
+    char q[16] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    char v[8] = { 0 };
+    httpd_query_key_value(q, "v", v, sizeof(v));
+    s_held_enabled = (v[0] == '1');
+    nvs_save_settings();
+    httpd_resp_set_type(r, "application/json");
+    char body[32]; int n = snprintf(body, sizeof(body), "{\"heldEnabled\":%s}",
+                                    s_held_enabled ? "true" : "false");
     return httpd_resp_send(r, body, n);
 }
 
@@ -686,13 +764,10 @@ static void wifi_task(void *arg) {
     boot_trace(BOOT_PHASE_WIFI_OK);
     led_phase(LED_MODE_BLUE);
     vTaskDelay(pdMS_TO_TICKS(4000));     // visible "everything is fine" beat
-    // Hand the wire back to the saved mode — but a saved OFF just means "no
-    // fancy mode", it must NOT make the evidence go dark. Stay blue instead.
-    if (s_led_mode == LED_MODE_OFF) {
-        led_phase(LED_MODE_BLUE);
-    } else {
-        led_user_mode(s_led_mode);
-    }
+    // Hand the wire back to the user's persisted state. s_led_mode is always
+    // a real mode (1..4) after NVS load; s_led_off (persisted switch) may
+    // override to LED_MODE_OFF. led_apply_effective encapsulates that.
+    led_apply_effective();
     vTaskDelete(NULL);
 
 wifi_failed:
@@ -730,6 +805,7 @@ static esp_err_t http_up(void) {
         {"/live/start",    HTTP_POST, h_live_start, NULL, false, false, NULL},
         {"/live/stop",     HTTP_POST, h_live_stop,  NULL, false, false, NULL},
         {"/led",           HTTP_POST, h_led_set,    NULL, false, false, NULL},
+        {"/held",          HTTP_POST, h_held_set,   NULL, false, false, NULL},
         {"/layout",        HTTP_POST, h_layout_set, NULL, false, false, NULL},
         {"/autodl",        HTTP_POST, h_autodl_set, NULL, false, false, NULL},
     };
@@ -882,6 +958,12 @@ void app_main(void) {
     if (nerr != ESP_OK) ESP_LOGE(TAG, "nvs_flash_init: %s", esp_err_to_name(nerr));
 
     nvs_load_settings();          // recording / auto-download / LED mode
+    // Seed the "current LED wire target" (s_led_disp) from the persisted
+    // switch state BEFORE led_task starts. Otherwise led_task's first tick
+    // would write the default KEYFLASH byte to reg 40 and the LED would
+    // flash green for one poll cycle on every boot even when the user
+    // saved OFF. led_phase (boot telemetry) also honours s_led_off.
+    s_led_disp = s_led_off ? LED_MODE_OFF : s_led_mode;
     boot_trace(BOOT_PHASE_BOOT);
 
     // Bring SDIO slave up BEFORE any wifi work so the P4's CMD5/CMD3 probe

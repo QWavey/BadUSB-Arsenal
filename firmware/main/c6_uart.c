@@ -15,6 +15,7 @@
 #include "c6_uart.h"
 #include "kb_layouts.h"
 #include "led.h"
+#include "hid_bridge.h"     // hid_host_kbd_leds() for Caps Lock in the log
 
 #include <string.h>
 #include <stdio.h>
@@ -186,8 +187,9 @@ static const char kb_unshifted[128] = {
     // 0x1e..0x27: 1..0
     [0x1e]='1',[0x1f]='2',[0x20]='3',[0x21]='4',[0x22]='5',[0x23]='6',
     [0x24]='7',[0x25]='8',[0x26]='9',[0x27]='0',
-    // 0x2c..0x38: punctuation
-    [0x2c]=' ',[0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x31]='\\',
+    // 0x2c..0x38: punctuation (SPACE 0x2c intentionally omitted so it
+    // renders as "[SPACE]" via kb_special even in combo capture).
+    [0x2d]='-',[0x2e]='=',[0x2f]='[',[0x30]=']',[0x31]='\\',
     [0x33]=';',[0x34]='\'',[0x35]='`',[0x36]=',',[0x37]='.',[0x38]='/',
     // 0x54..0x63: keypad printable (assumes NumLock ON)
     [0x54]='/',[0x55]='*',[0x56]='-',[0x57]='+',
@@ -206,7 +208,7 @@ static const char kb_shifted[128] = {
     [0x1c]='Y',[0x1d]='Z',
     [0x1e]='!',[0x1f]='@',[0x20]='#',[0x21]='$',[0x22]='%',[0x23]='^',
     [0x24]='&',[0x25]='*',[0x26]='(',[0x27]=')',
-    [0x2c]=' ',[0x2d]='_',[0x2e]='+',[0x2f]='{',[0x30]='}',[0x31]='|',
+    [0x2d]='_',[0x2e]='+',[0x2f]='{',[0x30]='}',[0x31]='|',
     [0x33]=':',[0x34]='"',[0x35]='~',[0x36]='<',[0x37]='>',[0x38]='?',
     // Keypad ignores shift on Windows — mirror unshifted so we don't lie
     [0x54]='/',[0x55]='*',[0x56]='-',[0x57]='+',
@@ -223,6 +225,7 @@ static const char *kb_special(uint8_t kc) {
     case 0x29: return "[ESC]";
     case 0x2a: return "[BACKSPACE]";
     case 0x2b: return "[TAB]";
+    case 0x2c: return "[SPACE]";      // render space as a named token, not a literal ' '
     case 0x39: return "[CAPS]";
     case 0x3a: return "[F1]";  case 0x3b: return "[F2]";  case 0x3c: return "[F3]";
     case 0x3d: return "[F4]";  case 0x3e: return "[F5]";  case 0x3f: return "[F6]";
@@ -362,7 +365,12 @@ static void tx_line(const char *prefix, const char *body) {
     // "[HELD KEY: J, 2 Seconds]") get a trailing space so subsequent typed
     // text doesn't concatenate visually: "[LCTRL + a + x] s" instead of
     // "[LCTRL + a + x]s". Non-bracket KEYs (single characters) stay tight.
+    // Exception: "[SPACE]" is a Space keystroke — consecutive presses must
+    // render as "[SPACE][SPACE][SPACE]" without gaps, so treat it like a
+    // printable character (no trailing separator).
+    bool is_space = body && body[0] == '[' && body[1] == 'S' && body[2] == 'P';
     bool wants_sep = body && body[0] == '['
+                     && !is_space
                      && !strcmp(prefix, "KEY");
     if (body && *body) {
         n = snprintf((char*)s_tx_dma, TX_DMA_SZ,
@@ -424,8 +432,21 @@ static void link_bringup_task(void *arg) {
     vTaskDelete(NULL);
 }
 
-#define C6_REG_LED_MODE_CCCR_ADDR   (0x60 + 40)
-#define C6_REG_LAYOUT_CCCR_ADDR     (0x60 + 41)   // 0=US 1=DE 2=UK (== kb_layout_t)
+// On the ESP32-C6 SDIO slave, `sdio_slave_write_reg(pos, val)` writes into
+// the SLCHOST_CONF_W scratch region on FUNCTION 1. The slave HAL translates
+// pos into a byte offset from conf_w0 as
+//     offset = pos + (pos > 23 ? 4 : 0) + (pos > 31 ? 12 : 0)
+// (see hal/esp32c6 sdio_slave_ll_host_get_w_reg). conf_w0 itself lives at
+// SLCHOST offset 0x6C, so the master (P4) reads via CMD52 on FUNCTION 1
+// at raw address (0x6C + offset) masked to 10 bits.
+// For pos=40 (LED):    offset = 40 + 4 + 12 = 56 → raw addr = 0x6C + 56 = 0xA4
+// For pos=41 (layout): offset = 41 + 4 + 12 = 57 → raw addr = 0x6C + 57 = 0xA5
+// The earlier addresses (0x60+pos on Function 0, later 0xA8/0xA9 on
+// Function 1) were reading nearby but WRONG bytes, so every LED and layout
+// write from the C6 web UI silently missed — the LED stayed KEY_FLASH and
+// the layout stayed at whatever the P4 read on cold boot.
+#define C6_REG_LED_MODE_ADDR   0xA4   // slave scratch reg 40 → Function 1 @ 0xA4
+#define C6_REG_LAYOUT_ADDR     0xA5   // slave scratch reg 41 → Function 1 @ 0xA5 (0=US 1=DE 2=UK)
 
 // The host side of the SDIO link died (typically because the C6 was reset or
 // its wifi crash forced a reboot — the slave re-enumerates with a fresh RCA
@@ -456,29 +477,24 @@ static bool recover_sdio_link(void) {
 static void led_poll_task(void *arg) {
     (void)arg;
     if (!s_card) { vTaskDelete(NULL); return; }
-    // Start last_led at 0 (LED_MODE_OFF). C6's scratch reg 40 is 0 until the
-    // C6's led_task writes its first byte, so the FIRST poll after SDIO bring-
-    // up almost always returns 0 (a stale zero, not a C6 intent to darken).
-    // With last_led = 0xFF this triggered led_set_mode(LED_MODE_OFF) and the
-    // LED went dark ~2 s into boot. last_led = 0 skips that spurious edge.
-    // A real user-driven OFF still lands after we've seen any non-zero value
-    // once, and a failure-blink RED/OFF pattern still animates correctly.
+    // Start last_led at 0 (LED_MODE_OFF) — matches the value the poller
+    // sees before any real telemetry so no spurious first-edge fires. The
+    // C6's led_task now seeds s_led_disp from the persisted OFF-switch
+    // state BEFORE its first tick, so by the time the P4's SDIO probe
+    // completes (~3 s after C6 reset), reg 40 already carries the user's
+    // intended byte — including an intentional 0 for OFF. No seen_nonzero
+    // gate needed: if the user saved OFF, we honour it immediately at boot.
     uint8_t last_led = 0;
-    // Also require the first NON-ZERO value to arrive before treating any
-    // 0 as an OFF command. Until then, treat 0 as "C6 hasn't spoken yet."
-    bool seen_nonzero = false;
     uint8_t last_lay = 0xFF;
     int read_fails = 0;
     TickType_t last_recover = 0;
     while (1) {
         uint8_t v = 0;
-        esp_err_t err = sdmmc_io_read_byte(s_card, 0, C6_REG_LED_MODE_CCCR_ADDR, &v);
+        // Function 1 (SLCHOST scratch space), NOT Function 0 (CCCR).
+        esp_err_t err = sdmmc_io_read_byte(s_card, 1, C6_REG_LED_MODE_ADDR, &v);
         if (err == ESP_OK) {
             read_fails = 0;
-            if (v != 0) seen_nonzero = true;
-            // Apply the change ONLY if it's a real user/telemetry byte from
-            // the C6. A pre-first-write 0 is silence, not an OFF command.
-            if (v != last_led && (v != 0 || seen_nonzero)) {
+            if (v != last_led) {
                 // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
                 led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
                 last_led = v;
@@ -495,17 +511,17 @@ static void led_poll_task(void *arg) {
             last_recover = xTaskGetTickCount();
             read_fails = 0;
             if (recover_sdio_link()) {
-                // After a C6 reset the slave's scratch is fresh — same first-
-                // read-is-zero window as boot. Reset the guard to match.
-                last_led = 0;
-                seen_nonzero = false;
+                // After a C6 reset the slave's scratch is fresh — force a
+                // re-apply on the next successful read by breaking the equality.
+                last_led = 0xFF;
                 last_lay = 0xFF;
             }
         }
 
         // Runtime layout switch straight from the web UI — no reflash.
+        // Same Function-1 space as the LED reg.
         uint8_t lay = 0xFF;
-        err = sdmmc_io_read_byte(s_card, 0, C6_REG_LAYOUT_CCCR_ADDR, &lay);
+        err = sdmmc_io_read_byte(s_card, 1, C6_REG_LAYOUT_ADDR, &lay);
         if (err == ESP_OK && lay != last_lay && lay < KL_COUNT) {
             kb_layout_set((kb_layout_t)lay);
             ESP_LOGI(TAG, "layout set to %s", kb_layout_name((kb_layout_t)lay));
@@ -549,6 +565,11 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
     const uint8_t *keys = &buf[2];
     uint32_t now  = now_ms();
     bool shift    = (mod & 0x22) != 0;
+    // Caps Lock (LED bit1) XORs the shift state — but ONLY for letters.
+    // Windows sends the LED bitmap back via SET_REPORT on every toggle;
+    // hid_host_kbd_leds() reflects the cached value. Non-letter keys keep
+    // their normal shift behaviour so "shift+1" still renders '!'.
+    bool caps     = (hid_host_kbd_leds() & 0x02) != 0;
     // AltGr on DE == RALT, or the rare LCTRL+LALT combo. When active, the key
     // is a printable AltGr composition (render_key uses the altgr glyph), so it
     // must NOT be swallowed into a combo like [RALT + e].
@@ -578,7 +599,11 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
         if (keycode_was_pressed(kc)) continue;    // still held from prev report
 
         char tok[24];
-        render_key(kc, shift, altgr, tok, sizeof(tok));
+        // Caps Lock inverts shift for LETTERS only (HID 0x04..0x1d); punctuation
+        // and number-row keys keep their normal shift semantics.
+        bool letter = (kc >= 0x04 && kc <= 0x1d);
+        bool eff_shift = (caps && letter) ? !shift : shift;
+        render_key(kc, eff_shift, altgr, tok, sizeof(tok));
 
         if (any_mod_now) {
             combo_append(tok);
@@ -623,10 +648,22 @@ void c6_uart_feed_kbd_report(const uint8_t *buf, size_t len) {
             s_pressed[j].kc = 0;
             // Only report HELD for solo (no-modifier) press >= HOLD_MS.
             if (!any_mod_now && !any_mod_prev && !s_combo_active && dur >= HOLD_MS) {
-                char tok[24]; render_key(kc, shift, altgr, tok, sizeof(tok));
+                bool held_letter = (kc >= 0x04 && kc <= 0x1d);
+                bool held_shift = (caps && held_letter) ? !shift : shift;
+                char tok[24]; render_key(kc, held_shift, altgr, tok, sizeof(tok));
                 char body[64];
-                snprintf(body, sizeof(body), "[HELD KEY: %s, %u.%u Seconds]",
-                         tok, (unsigned)(dur / 1000), (unsigned)((dur % 1000) / 100));
+                // Format the duration: whole seconds drop the ".0", and
+                // "1 Second" is singular. Everything else is "N.T Seconds".
+                unsigned whole = (unsigned)(dur / 1000);
+                unsigned tenth = (unsigned)((dur % 1000) / 100);
+                const char *unit = (whole == 1 && tenth == 0) ? "Second" : "Seconds";
+                if (tenth == 0) {
+                    snprintf(body, sizeof(body), "[HELD KEY: %s, %u %s]",
+                             tok, whole, unit);
+                } else {
+                    snprintf(body, sizeof(body), "[HELD KEY: %s, %u.%u Seconds]",
+                             tok, whole, tenth);
+                }
                 tx_line("KEY", body);
             }
             break;

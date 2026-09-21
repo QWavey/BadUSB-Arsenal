@@ -28,5 +28,9 @@ void hid_host_task_start(void);
 // Push a keyboard LED-state byte back to the physical keyboard (bit0=NumLock,
 // bit1=CapsLock, bit2=ScrollLock, bit3=Compose, bit4=Kana). No-op if no
 // keyboard is currently connected. Safe to call from the tinyusb set-report
-// callback (short, non-blocking).
+// callback (short, non-blocking). Always caches the value so the key logger
+// on the C6 side can render Caps Lock correctly.
 void hid_host_set_kbd_leds(uint8_t leds);
+// Last LED bitmap Windows pushed at us (or 0 at boot). Read by c6_uart's
+// letter renderer so Caps Lock upper-cases letters in the web-UI log.
+uint8_t hid_host_kbd_leds(void);

@@ -20,8 +20,12 @@ const char *kb_layout_name(kb_layout_t layout) {
 // ---------------- German QWERTZ overrides ----------------
 // Only the keys whose glyph differs from US ANSI are listed. Everything else
 // falls through to the default US table.
-static const kb_layout_entry_t de_1c = { "y",  "Y", "" };     // 0x1c Z-position on QWERTZ (US Y)
-static const kb_layout_entry_t de_1d = { "z",  "Z", "" };     // 0x1d Y-position (US Z)
+// HID keycodes are US-QWERTY position based. On QWERTZ, the physical Z key
+// sits at the US-Y position (HID 0x1c) and the physical Y key sits at the
+// US-Z position (HID 0x1d). So the DE mapping for those two HID codes must
+// output the letter the user actually pressed on the QWERTZ keyboard.
+static const kb_layout_entry_t de_1c = { "z",  "Z", "" };     // HID 0x1c = physical Z on QWERTZ
+static const kb_layout_entry_t de_1d = { "y",  "Y", "" };     // HID 0x1d = physical Y on QWERTZ
 
 // Row: 1 2 3 4 5 6 7 8 9 0 ß ´
 static const kb_layout_entry_t de_1e = { "1", "!",  "" };
@@ -45,6 +49,10 @@ static const kb_layout_entry_t de_33 = { "\xc3\xb6", "\xc3\x96", "" }; // ö Ö
 static const kb_layout_entry_t de_34 = { "\xc3\xa4", "\xc3\x84", "" }; // ä Ä
 static const kb_layout_entry_t de_35 = { "^", "\xc2\xb0", "" };       // ^ °
 static const kb_layout_entry_t de_31 = { "#", "'", "" };              // # '
+// Some German keyboards report the #/' key as HID 0x32 (Non-US Hash and
+// Tilde) instead of the more common 0x31. Mirror the mapping so both codes
+// render as # (unshifted) / ' (shifted) instead of a bare "0x32".
+static const kb_layout_entry_t de_32 = { "#", "'", "" };              // # '
 
 // AltGr glyphs (RALT on DE = AltGr): € @ ç. Without these, AltGr+key
 // renders as plain letters or a spurious [RALT + ...] combo.
@@ -89,6 +97,7 @@ const kb_layout_entry_t *kb_layout_lookup(kb_layout_t layout, uint8_t kc) {
         case 0x2f: return &de_2f;
         case 0x30: return &de_30;
         case 0x31: return &de_31;
+        case 0x32: return &de_32;
         case 0x33: return &de_33;
         case 0x34: return &de_34;
         case 0x35: return &de_35;

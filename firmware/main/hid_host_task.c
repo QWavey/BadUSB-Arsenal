@@ -54,7 +54,16 @@ static void spawn_watchdog(void) {
                             NULL, 0);
 }
 
+// Cache the last LED bitmap the PC pushed at us so the KEY logger can honour
+// Caps Lock — otherwise the web-UI log shows "hello" while the PC actually
+// types "HELLO". Bit layout: bit0=NumLock, bit1=CapsLock, bit2=ScrollLock,
+// bit3=Compose, bit4=Kana.
+static volatile uint8_t s_kbd_leds = 0;
+
+uint8_t hid_host_kbd_leds(void) { return s_kbd_leds; }
+
 void hid_host_set_kbd_leds(uint8_t leds) {
+    s_kbd_leds = leds;                       // cache for c6_uart's letter-render
     if (!s_kbd_hdev) return;
     // HID Output report ID 0 for boot keyboard, single byte LED bitmap.
     esp_err_t err = hid_class_request_set_report(s_kbd_hdev,
