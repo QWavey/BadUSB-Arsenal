@@ -828,28 +828,105 @@ static void nvs_set_bool(const char *key, uint8_t v) {
     nvs_close(h);
 }
 
-// /api/stats — uptime, free heap, SPIFFS usage, Wi-Fi client count,
-// hardware LED state. The `ledEnabled` field is what the Settings tab's
-// hardware-LED toggle mirrors — before this fix the toggle sat "off"
-// because the stub said so, while the real LED (on the P4 via SDIO
-// reg 40) was actually lit.
-extern uint32_t s_sta_count;   // main.c
-extern bool     s_led_off;     // main.c (dedicated OFF switch)
-extern uint8_t  s_led_mode;    // main.c (color/pattern when not off)
+// /api/stats — full shape the ported UI expects. Every field the
+// upstream WebServerHandlers.cpp returns is included here, populated
+// with real values where we have them and honest defaults otherwise.
+// Missing/undefined fields would show up in the UI as "undefineds",
+// "NaN KB", etc. (which is what the user reported before this pass).
+// Field reference: webui-fs/script.js:2013-2118 (updateStats) and
+// script.js:3815-3831 (Settings System card).
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+extern uint32_t s_sta_count;    // main.c
+extern bool     s_led_off;      // main.c (dedicated OFF switch)
+extern uint8_t  s_led_mode;     // main.c (color/pattern when not off)
+extern bool     s_recording;    // main.c
+extern bool     s_auto_dl;      // main.c
+extern bool     s_held_enabled; // main.c
+extern uint8_t  s_layout;       // main.c
+extern volatile int s_wifi_up;  // main.c
 static esp_err_t h_api_stats(httpd_req_t *r) {
-    size_t total = 0, used = 0;
-    esp_spiffs_info("storage", &total, &used);
+    // SPIFFS
+    size_t sp_total = 0, sp_used = 0;
+    esp_spiffs_info("storage", &sp_total, &sp_used);
+    // Flash chip
+    uint32_t fl_bytes = 0;
+    esp_flash_get_size(NULL, &fl_bytes);
+    // Chip info (CPU cores, MHz)
+    esp_chip_info_t ci = { 0 };
+    esp_chip_info(&ci);
     uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-    char body[320];
+    uint32_t free_heap = esp_get_free_heap_size();
+    uint32_t min_free  = esp_get_minimum_free_heap_size();
+    // Total heap is free + a rough estimate of what's allocated. IDF
+    // doesn't expose "total heap" cheaply so we report free_heap +
+    // min_free as an approximation (better than "NaN KB").
+    uint32_t total_heap = free_heap + (free_heap - min_free);
+
+    char body[1024];
     int n = snprintf(body, sizeof(body),
-        "{\"uptime_s\":%u,\"free_heap\":%u,\"min_free_heap\":%u,"
-        "\"spiffs_total\":%u,\"spiffs_used\":%u,\"wifi_clients\":%u,"
-        "\"ledEnabled\":%s,\"ledMode\":%u}",
+        "{"
+        // --- CPU / RAM / flash / uptime (Settings System card) ---
+        "\"cpuMhz\":%u,\"cpuCores\":%u,\"cpuBusyPct\":0,\"cpuTempC\":null,"
+        "\"freeMemory\":%u,\"totalMemory\":%u,"
+        "\"flashSize\":%u,\"sdUsed\":%u,\"sdTotal\":%u,"
+        "\"uptime\":%u,"
+        // --- Stats tab tiles ---
+        "\"errorCount\":0,\"totalScripts\":0,\"totalCommands\":0,"
+        "\"clientCount\":%u,\"detectedOS\":\"unknown\","
+        "\"lastError\":\"\","
+        // --- ATTACKMODE state (chip in the Live tab / Settings) ---
+        "\"attackMode\":{\"hid\":true,\"storage\":false,"
+                        "\"vid\":\"0x303A\",\"pid\":\"0x4B44\",\"sizeBytes\":0},"
+        // --- Wi-Fi ---
+        "\"wifiConnected\":false,\"staSSID\":\"\","
+        "\"apActive\":%s,"
+        // --- Settings toggles (mirror our real NVS state) ---
+        "\"ledEnabled\":%s,\"ledMode\":%u,"
+        "\"loggingEnabled\":%s,\"btToggleEnabled\":false,\"btDiscoveryEnabled\":false,"
+        "\"autoConnectEnabled\":false,\"saveOnConnectEnabled\":false,"
+        "\"randomMac\":false,\"comEnabled\":false,"
+        "\"usbRndVid\":false,\"usbRndPid\":false,"
+        // --- Recording / live / layout / held ---
+        "\"recording\":%s,\"autoDownload\":%s,"
+        "\"layout\":%u,\"heldEnabled\":%s,"
+        // --- Language + UI hide-list. We keep BT / MSC / attack-mode
+        //     rows visible so the color picker etc. render; add "com"
+        //     because we don't emulate a serial port. ---
+        "\"currentLanguage\":\"us\","
+        "\"hidden_settings\":[\"com\"]"
+        "}",
+        (unsigned)(ci.revision == 0 ? 160 : 160),
+        (unsigned)ci.cores,
+        (unsigned)free_heap, (unsigned)total_heap,
+        (unsigned)fl_bytes,
+        (unsigned)sp_used, (unsigned)sp_total,
         (unsigned)up_s,
-        (unsigned)esp_get_free_heap_size(),
-        (unsigned)esp_get_minimum_free_heap_size(),
-        (unsigned)total, (unsigned)used, (unsigned)s_sta_count,
-        s_led_off ? "false" : "true", (unsigned)s_led_mode);
+        (unsigned)s_sta_count,
+        s_wifi_up == 1 ? "true" : "false",
+        s_led_off ? "false" : "true", (unsigned)s_led_mode,
+        s_recording ? "true" : "false",
+        s_recording ? "true" : "false",
+        s_auto_dl ? "true" : "false",
+        (unsigned)s_layout,
+        s_held_enabled ? "true" : "false");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+
+// /api/led-mode?m=1..4 — set the LED color/pattern. Bridges to
+// s_led_mode via a light wrapper that respects the /led endpoint
+// mechanism (led_user_mode does the NVS-persist + wire-write).
+extern void led_user_mode_ext(uint8_t m);   // wrapper declared in main.c
+static esp_err_t h_api_led_mode(httpd_req_t *r) {
+    char q[24] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+    char v[8] = { 0 };
+    httpd_query_key_value(q, "m", v, sizeof(v));
+    int m = atoi(v);
+    if (m >= 1 && m <= 4) led_user_mode_ext((uint8_t)m);
+    char body[48]; int n = snprintf(body, sizeof(body),
+        "{\"ledMode\":%u,\"ledEnabled\":%s}",
+        (unsigned)s_led_mode, s_led_off ? "false" : "true");
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, body, n);
 }
@@ -946,6 +1023,83 @@ static esp_err_t h_api_history(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
     if (r->method == HTTP_GET) return httpd_resp_send(r, "[]", 2);
     return httpd_resp_send(r, "{\"ok\":true}", 11);
+}
+
+// /api/list-files?path=/some/dir — Explorer tab. Enumerates the
+// SPIFFS filesystem, returning [{name,size,isDir}, ...]. SPIFFS is
+// flat namespace so "directories" are just path prefixes — we filter
+// files whose name starts with the requested path prefix and, for the
+// simple case, list every root-level entry when path is "/".
+// Ordinary files render size in bytes; the pseudo-dirs (languages/,
+// ducky/, etc.) get isDir:true so the JS shows them with a folder icon.
+static esp_err_t h_api_list_files(httpd_req_t *r) {
+    char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+    char path[64] = "/";
+    httpd_query_key_value(q, "path", path, sizeof(path));
+    // Normalize: strip leading /, trailing / (except root).
+    char *p = path;
+    while (*p == '/') p++;
+    int pl = strlen(p);
+    if (pl > 0 && p[pl-1] == '/') { p[pl-1] = 0; pl--; }
+
+    DIR *d = opendir("/data");
+    httpd_resp_set_type(r, "application/json");
+    if (!d) return httpd_resp_send(r, "[]", 2);
+    char body[2048]; int bl = 0;
+    body[bl++] = '[';
+    int first = 1;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        const char *name = e->d_name;
+        // Root listing (path empty): collect immediate children only —
+        // if a name contains '/', emit only its first segment as a dir.
+        if (pl == 0) {
+            const char *slash = strchr(name, '/');
+            if (slash) {
+                int seg = slash - name;
+                // Dedupe: only emit each dir once per listing. Keep it
+                // simple by scanning body for the already-written name.
+                char probe[80];
+                int pn = snprintf(probe, sizeof(probe), "\"name\":\"%.*s\"", seg, name);
+                if (memmem(body, bl, probe, pn) != NULL) continue;
+                int nn = snprintf(body + bl, sizeof(body) - bl,
+                    "%s{\"name\":\"%.*s\",\"size\":0,\"isDir\":true}",
+                    first ? "" : ",", seg, name);
+                if (nn < 0 || bl + nn >= (int)sizeof(body) - 2) break;
+                bl += nn; first = 0;
+            } else {
+                char full[320]; snprintf(full, sizeof(full), "/data/%s", name);
+                struct stat st;
+                long sz = (stat(full, &st) == 0) ? (long)st.st_size : 0;
+                int nn = snprintf(body + bl, sizeof(body) - bl,
+                    "%s{\"name\":\"%s\",\"size\":%ld,\"isDir\":false}",
+                    first ? "" : ",", name, sz);
+                if (nn < 0 || bl + nn >= (int)sizeof(body) - 2) break;
+                bl += nn; first = 0;
+            }
+        } else {
+            // Path prefix filter: name must start with "<path>/"
+            int need = pl + 1;
+            if (strncmp(name, p, pl) != 0 || name[pl] != '/') continue;
+            const char *sub = name + need;
+            const char *slash = strchr(sub, '/');
+            int is_dir = (slash != NULL);
+            int seg = is_dir ? (slash - sub) : (int)strlen(sub);
+            if (seg <= 0) continue;
+            char full[320]; snprintf(full, sizeof(full), "/data/%s", name);
+            struct stat st;
+            long sz = (!is_dir && stat(full, &st) == 0) ? (long)st.st_size : 0;
+            int nn = snprintf(body + bl, sizeof(body) - bl,
+                "%s{\"name\":\"%.*s\",\"size\":%ld,\"isDir\":%s}",
+                first ? "" : ",", seg, sub, sz, is_dir ? "true" : "false");
+            if (nn < 0 || bl + nn >= (int)sizeof(body) - 2) break;
+            bl += nn; first = 0;
+        }
+    }
+    closedir(d);
+    body[bl++] = ']'; body[bl] = 0;
+    return httpd_resp_send(r, body, bl);
 }
 
 // /api/validate-script — quick syntactic pass over the DuckyScript
@@ -1073,6 +1227,10 @@ void badusb_ui_register(httpd_handle_t s) {
         // /api/toggle-led — real backend (bridges to led_set_off in main.c).
         {"/api/toggle-led",     HTTP_GET,  h_api_toggle_led,    NULL, false, false, NULL},
         {"/api/toggle-led",     HTTP_POST, h_api_toggle_led,    NULL, false, false, NULL},
+        // /api/led-mode — set color (1=GREEN, 2=KEYFLASH, 3=RED, 4=BLUE).
+        {"/api/led-mode",       HTTP_POST, h_api_led_mode,      NULL, false, false, NULL},
+        // /api/list-files — real SPIFFS enumeration for the Explorer tab.
+        {"/api/list-files",     HTTP_GET,  h_api_list_files,    NULL, false, false, NULL},
         {"/api/detect-os",      HTTP_GET,  h_api_detect_os,     NULL, false, false, NULL},
         {"/api/history",        HTTP_GET,  h_api_history,       NULL, false, false, NULL},
         {"/api/clear-history",  HTTP_POST, h_api_history,       NULL, false, false, NULL},
@@ -1126,7 +1284,8 @@ void badusb_ui_register(httpd_handle_t s) {
         "/api/save-extension", "/api/delete-extension",
         "/api/pull-extension",
         // File explorer that isn't backed by real FS ops yet
-        "/api/list-files", "/api/download", "/api/upload",
+        // (/api/list-files is REAL — registered above)
+        "/api/download", "/api/upload",
         "/api/copy-file", "/api/cut-file", "/api/paste-file",
         "/api/create-directory", "/api/check-file", "/api/file-info",
         "/api/use-file", "/api/rename",

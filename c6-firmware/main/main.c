@@ -112,8 +112,9 @@ static SemaphoreHandle_t s_ws_lock;
 static RingbufHandle_t   s_live_ring;
 
 static SemaphoreHandle_t s_log_lock;
-static bool s_recording   = true;
-static bool s_auto_dl     = false;
+// Non-static so badusb_ui.c's /api/stats can mirror the real state.
+bool s_recording   = true;
+bool s_auto_dl     = false;
 static bool s_kbd_present = false;
 static bool s_mouse_present = false;
 static bool s_pc_present   = false;   // PC (user's computer) bound the P4's HID device
@@ -127,12 +128,12 @@ uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
 // ported UI's Settings tab has its own hardware-LED toggle that we
 // need to bridge to this state.
 bool     s_led_off  = false;                // dedicated OFF switch — when true the LED is dark and the mode dropdown is disabled in the web UI
-static bool     s_held_enabled = false;            // whether HELD KEY events are shown/logged (default OFF)
-static uint8_t  s_layout   = 0;                    // keyboard layout, pushed to P4 reg 41
+bool     s_held_enabled = false;            // whether HELD KEY events are shown/logged (default OFF) — extern for /api/stats
+uint8_t  s_layout   = 0;                    // keyboard layout, pushed to P4 reg 41 — extern for /api/stats
 static volatile uint8_t s_led_disp = LED_MODE_KEYFLASH; // what's currently on reg 40
 static SemaphoreHandle_t s_led_lock;
 static volatile int  s_bootphase = 0;
-static volatile int  s_wifi_up   = -1;   // -1 pending, 1 = AP confirmed, 0 = failed
+volatile int  s_wifi_up   = -1;   // -1 pending, 1 = AP confirmed, 0 = failed  (extern for /api/stats)
 static uint32_t s_uart_bytes_total = 0;
 static uint32_t s_sdio_bytes_total = 0;
 static uint32_t s_publish_calls    = 0;   // how many times publish() was entered
@@ -254,6 +255,11 @@ static void led_user_mode(uint8_t m) {
 // Dedicated OFF switch (web /led?off= endpoint). Sets or clears the switch
 // and pushes the effective mode to the wire. Independent of s_led_mode so
 // the user can flip the LED dark and back without losing their color.
+// Trampoline for badusb_ui.c's /api/led-mode — the ported UI's LED
+// color picker calls this to change the color/pattern without also
+// clobbering the OFF switch.
+void led_user_mode_ext(uint8_t m) { led_user_mode(m); }
+
 void led_set_off(bool off) {
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
     s_led_off = off;
