@@ -35,6 +35,7 @@
 #include "c6_uart.h"
 #include "led.h"
 #include "live_type.h"
+#include "sdcard.h"
 
 // Runtime USB PHY selector — swaps FS_PHY1↔FS_PHY2 assignments.
 // After swap: OTG_FS drives GPIO24/25 (the core Type-C on this board).
@@ -445,6 +446,9 @@ void app_main(void) {
     // BadUSB "live type" watcher: polls SDIO reg 44 for bytes the C6 web
     // UI wants us to type on the target PC.
     live_type_start();
+    // Best-effort MicroSD mount on SLOT_0 (SLOT_1 is the SDIO link to C6).
+    // Non-fatal — the rest of the firmware runs fine without a card.
+    (void)sdcard_mount();
 
     // Diagnostic heartbeat: prints TinyUSB mount + HID readiness every 3 s.
     // Watch this on the USB-Serial-JTAG (core Type-C, COM34). "mounted=1" means

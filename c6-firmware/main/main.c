@@ -476,7 +476,9 @@ static void publish(const char *line) {
 }
 
 // ------------------------- HTTP handlers ------------------------------
-static esp_err_t h_root(httpd_req_t *r) {
+// Non-static so badusb_ui.c can register the pre-port keylog dashboard
+// at /klog while the ported BadUSB UI takes over /.
+esp_err_t h_root(httpd_req_t *r) {
     httpd_resp_set_type(r, "text/html; charset=utf-8");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, WEB_UI_HTML, WEB_UI_HTML_LEN);
@@ -836,7 +838,9 @@ static esp_err_t http_up(void) {
     cfg.keep_alive_count = 3;
     if (httpd_start(&s_http, &cfg) != ESP_OK) return ESP_FAIL;
     httpd_uri_t routes[] = {
-        {"/",              HTTP_GET,  h_root,       NULL, false, false, NULL},
+        // "/" now belongs to the ported BadUSB UI (registered below via
+        // badusb_ui_register). The pre-port keylog dashboard is exposed
+        // at /klog for anyone who wants the compact single-page view.
         {"/ws",            HTTP_GET,  h_ws,         NULL, true,  false, NULL},
         {"/status",        HTTP_GET,  h_status,     NULL, false, false, NULL},
         {"/log/download",  HTTP_GET,  h_download,   NULL, false, false, NULL},
@@ -853,7 +857,12 @@ static esp_err_t http_up(void) {
     };
     for (unsigned i = 0; i < sizeof(routes)/sizeof(routes[0]); i++)
         httpd_register_uri_handler(s_http, &routes[i]);
-    ESP_LOGI(TAG, "HTTP up on port 80");
+    // Overlay the ported BadUSB UI on top: "/", "/style.css", "/script.js"
+    // plus /execute + /api/* endpoints. The pre-port keylog dashboard is
+    // available at /klog for parity.
+    extern void badusb_ui_register(httpd_handle_t s);
+    badusb_ui_register(s_http);
+    ESP_LOGI(TAG, "HTTP up on port 80 (BadUSB UI + keylog @ /klog)");
     return ESP_OK;
 }
 
