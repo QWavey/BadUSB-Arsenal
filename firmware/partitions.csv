@@ -1,0 +1,16 @@
+# Custom partition table for the ESP32-P4-MINI-B N32R32 (32 MB flash).
+# Slot allocations:
+#   nvs      — 32 KB : USB identity (VID/PID/rev), LED settings, misc.
+#   phy_init —  4 KB : radio calibration blob.
+#   factory  —  2 MB : app image (bootloader ends at 0x10000 by default).
+#   msc      — 16 MB : wear-leveled FAT volume exposed as a USB Mass
+#                       Storage LUN when ATTACKMODE STORAGE is on. Big
+#                       enough for a real payload library / drop bin /
+#                       collected data. Wear-leveling burns ~4 KB per
+#                       128 KB of user data as bookkeeping — fine at
+#                       this size.
+# Name,    Type,  SubType,  Offset,  Size,  Flags
+nvs,       data,  nvs,      0x9000,  0x6000,
+phy_init,  data,  phy,      0xf000,  0x1000,
+factory,   app,   factory,  0x10000, 0x200000,
+msc,       data,  fat,      ,        0x1000000,

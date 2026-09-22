@@ -20,12 +20,28 @@ CONFIG_TINYUSB_RHPORT_FS=y
 CONFIG_TINYUSB_HID_COUNT=2
 CONFIG_TINYUSB_HID_BUFSIZE=64
 
+# BadUSB ATTACKMODE STORAGE: expose the P4's on-flash FATFS partition
+# to the PC as a USB Mass Storage device alongside the HID composite.
+# The whole thing is one TinyUSB composite (HID kbd + HID mouse + MSC)
+# so Windows binds all three drivers off the same VID/PID.
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=8192
+
 # We keep TinyUSB task at a decent priority
 CONFIG_TINYUSB_TASK_PRIORITY=5
 
 # Flash size for MINI-B (32MB). If your board is MINI-A (N16R32) that's 16MB flash — change to 16MB.
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+
+# Custom partition table (adds a 16MB MSC FAT partition — see partitions.csv).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# Wear-leveling for the MSC partition so power-loss + FAT rewrites
+# don't shred one sector after 100k cycles.
+CONFIG_WL_SECTOR_SIZE_4096=y
 
 # Bigger monitor buffer for HID logs
 CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200

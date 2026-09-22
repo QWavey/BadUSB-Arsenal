@@ -774,7 +774,9 @@ static void wifi_task(void *arg) {
     ap.ap.max_connection = AP_MAX_STA;
     ap.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    // APSTA so the STA interface is available for the WiFi scanner
+    // (esp_wifi_scan_start needs STA up — even if we never associate).
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_mode: %s", esp_err_to_name(err));
         led_fail_code(4); goto wifi_failed;

@@ -31,11 +31,15 @@
 #include "class/hid/hid_device.h"
 #include "tusb.h"
 
+#include "nvs_flash.h"
+#include "nvs.h"
+
 #include "hid_bridge.h"
 #include "c6_uart.h"
 #include "led.h"
 #include "live_type.h"
 #include "sdcard.h"
+#include "msc_storage.h"
 
 // Runtime USB PHY selector — swaps FS_PHY1↔FS_PHY2 assignments.
 // After swap: OTG_FS drives GPIO24/25 (the core Type-C on this board).
@@ -156,7 +160,10 @@ _Static_assert(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "MS OS 2.0 table size
 //   0x0202 -> composite kbd+mouse WITH per-interface report ID 1
 //   0x0203 -> composite kbd+mouse WITHOUT report IDs (current — boot subclass
 //             requires 8-byte / 3-byte reports with no prefix)
-static const tusb_desc_device_t device_desc = {
+// Mutable — VID/PID can be overridden from NVS at boot (set via
+// SDIO reg 48..51 by the C6's /api/save-usb endpoint) so the user
+// can spoof any USB identity from the web UI without reflashing.
+static tusb_desc_device_t device_desc = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
@@ -185,13 +192,21 @@ static const tusb_desc_device_t device_desc = {
     _first_itf, _itf_count, _class, _subclass, _protocol, _stridx
 
 // Total config length = config header + 2×(IAD + HID interface descriptor)
+//                     + MSC interface descriptor (bulk IN + bulk OUT)
+// TinyUSB provides TUD_MSC_DESCRIPTOR (9 iface + 2×7 endpoints = 23).
 #define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + \
                        TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
-                       TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN)
+                       TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
+                       TUD_MSC_DESC_LEN)
 
 static const uint8_t configuration_desc[] = {
-    // Configuration header: 2 interfaces, no string, total length, attributes, power
-    TUD_CONFIG_DESCRIPTOR(1, 2, 0, CFG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 100),
+    // Configuration header: 3 interfaces (kbd + mouse + MSC), no string,
+    // total length, attributes, power draw. The MSC interface stays in
+    // the descriptor at all times — msc_storage.c reports "no media"
+    // when the user has ATTACKMODE HID (STORAGE off), so Windows just
+    // shows the drive letter as empty rather than us re-enumerating on
+    // every toggle.
+    TUD_CONFIG_DESCRIPTOR(1, 3, 0, CFG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
 
     // --- Keyboard function (interface 0) ---
     // IAD: first_iface=0, count=1, class=HID(0x03), subclass=Boot(0x01), proto=Keyboard(0x01)
@@ -205,6 +220,10 @@ static const uint8_t configuration_desc[] = {
     TUD_IAD_DESCRIPTOR(1, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_MOUSE, 0),
     // HID interface descriptor — 1 ms poll (see above).
     TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_MOUSE, sizeof(hid_mouse_report_desc), 0x82, 16, 1),
+
+    // --- Mass Storage function (interface 2) ---
+    // interface, str-idx, bulk-OUT ep, bulk-IN ep, ep size.
+    TUD_MSC_DESCRIPTOR(2, 0, 0x03, 0x83, 64),
 };
 
 // TinyUSB required callbacks
@@ -387,8 +406,38 @@ static void pc_watch_task(void *arg) {
     }
 }
 
+// Load any user-persisted USB identity (VID/PID/rev) from NVS BEFORE
+// TinyUSB reads the descriptor. Writes come from the C6 web UI's
+// /api/save-usb endpoint via SDIO reg 48..52 (see live_type.c poller).
+// Legacy behaviour: if the NVS keys are absent, the compiled-in
+// defaults win.
+static void load_usb_identity(void) {
+    nvs_handle_t h;
+    if (nvs_open("usb", NVS_READONLY, &h) != ESP_OK) return;
+    uint16_t v = 0;
+    if (nvs_get_u16(h, "vid", &v) == ESP_OK && v != 0) device_desc.idVendor  = v;
+    if (nvs_get_u16(h, "pid", &v) == ESP_OK && v != 0) device_desc.idProduct = v;
+    if (nvs_get_u16(h, "rev", &v) == ESP_OK && v != 0) device_desc.bcdDevice = v;
+    nvs_close(h);
+    ESP_LOGI("usb_id", "identity: VID=%04X PID=%04X rev=%04X",
+             device_desc.idVendor, device_desc.idProduct, device_desc.bcdDevice);
+}
+
 void app_main(void) {
     ESP_LOGI(TAG, "Starting HID passthrough on ESP32-P4");
+
+    // NVS holds the persisted USB identity (VID/PID/rev) — must be
+    // available before load_usb_identity() touches it.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase(); nvs_flash_init();
+    }
+    load_usb_identity();
+
+    // Mount the MSC wear-leveled partition BEFORE tinyusb_driver_install
+    // so the tud_msc_* callbacks (linked in from msc_storage.c) have a
+    // valid handle when the host first probes the drive.
+    (void)msc_storage_init();
 
     // Status LED first so we get a green idle blink as boot progresses.
     led_init();

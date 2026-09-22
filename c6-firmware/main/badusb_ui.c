@@ -51,6 +51,10 @@ static const char *TAG = "badusb_ui";
 #define SDIO_REG_BADUSB_TYPE  44   // ASCII byte (live-type stream)
 #define SDIO_REG_BADUSB_MOD   45   // HID modifier bitmap for the next combo
 #define SDIO_REG_BADUSB_HID   46   // HID scancode for combo/named keys
+// ATTACKMODE + SIZE. Matches BADUSB_ATK_*_ADDR in firmware/main/live_type.c.
+#define SDIO_REG_ATK_ON       53   // 0 = ATTACKMODE HID; 1 = STORAGE
+#define SDIO_REG_SIZE_BASE    54   // 6 bytes LE — reported MSC capacity
+#define SDIO_REG_ATK_COMMIT   60   // write 1 to trigger snapshot
 
 // Modifier bit mask constants (match the HID boot-report modifier byte
 // on the P4 side).
@@ -577,8 +581,41 @@ static void execute_task(void *arg) {
                  !strncasecmp(line, "WINDOWS", 7) || !strncasecmp(line, "COMMAND", 7)) {
             if (run_combo_line(line)) executed++;
         }
+        // ATTACKMODE HID / STORAGE / HID STORAGE — flip the P4's MSC
+        // enable flag. STORAGE alone or "HID STORAGE" both turn MSC
+        // on; bare "HID" turns MSC off. Persisted in P4 NVS.
+        else if (!strncasecmp(line, "ATTACKMODE", 10)) {
+            const char *rest = line + 10;
+            while (*rest && isspace((unsigned char)*rest)) rest++;
+            bool want_storage = strstr(rest, "STORAGE") != NULL || strstr(rest, "storage") != NULL;
+            sdio_slave_write_reg(SDIO_REG_ATK_ON, want_storage ? 1 : 0);
+            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            executed++;
+        }
+        // SIZE_ commands (SIZE_512M, SIZE_1G, SIZE_2G, SIZE_4G, ..., SIZE_128G).
+        // Sets the FAKE capacity the MSC LUN reports. Real writes still
+        // land in the 16 MB partition — anything past that returns
+        // zeros / errors.
+        else if (!strncasecmp(line, "SIZE_", 5)) {
+            const char *nm = line + 5;
+            uint64_t bytes = 0;
+            uint64_t num = strtoull(nm, NULL, 10);
+            // Unit suffix (last char) — M/G/T/K
+            char last = 0;
+            for (const char *q = nm; *q; q++) if (isalpha((unsigned char)*q)) last = (char)toupper((unsigned char)*q);
+            switch (last) {
+                case 'K': bytes = num * 1024ULL; break;
+                case 'M': bytes = num * 1024ULL * 1024ULL; break;
+                case 'G': bytes = num * 1024ULL * 1024ULL * 1024ULL; break;
+                case 'T': bytes = num * 1024ULL * 1024ULL * 1024ULL * 1024ULL; break;
+                default:  bytes = num; break;
+            }
+            for (int i = 0; i < 6; i++) sdio_slave_write_reg(SDIO_REG_SIZE_BASE + i, (bytes >> (8 * i)) & 0xFF);
+            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            executed++;
+        }
+        // Bare named-key line: "F4", "DELETE", "UPARROW", ...
         else {
-            // Bare named-key line: "F4", "DELETE", "UPARROW", ...
             uint8_t kc = ducky_key_to_hid(line);
             if (kc && send_combo(0, kc)) executed++;
         }
@@ -837,6 +874,7 @@ static void nvs_set_bool(const char *key, uint8_t v) {
 // script.js:3815-3831 (Settings System card).
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_wifi.h"
 extern uint32_t s_sta_count;    // main.c
 extern bool     s_led_off;      // main.c (dedicated OFF switch)
 extern uint8_t  s_led_mode;     // main.c (color/pattern when not off)
@@ -1161,6 +1199,111 @@ static esp_err_t h_language(httpd_req_t *r) {
     return httpd_resp_send(r, "{\"ok\":true}", 11);
 }
 
+// /api/save-usb — persist a new USB identity (VID/PID) to the P4's
+// NVS via the SDIO reg 48..52 wire, then let the P4 reboot itself.
+// Body: {"vid":"0x303A","pid":"0x4B44"} — hex-string form matches the
+// reference JS. Returns the values that were queued; the P4 self-
+// reboots ~200 ms later so the browser may lose the connection
+// briefly. The AP stays up (we're on C6, not P4).
+static uint32_t hex_or_dec(const char *s) {
+    if (!s) return 0;
+    while (*s && isspace((unsigned char)*s)) s++;
+    return (s[0]=='0' && (s[1]=='x'||s[1]=='X')) ? strtoul(s+2, NULL, 16)
+                                                 : strtoul(s,   NULL, 0);
+}
+static esp_err_t h_api_save_usb(httpd_req_t *r) {
+    char buf[256];
+    int n = slurp_body(r, buf, sizeof(buf));
+    if (n < 0) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad body"); return ESP_OK; }
+    char vidStr[16] = { 0 }, pidStr[16] = { 0 };
+    extract_json_str(buf, "vid", vidStr, sizeof(vidStr));
+    extract_json_str(buf, "pid", pidStr, sizeof(pidStr));
+    uint32_t vid = hex_or_dec(vidStr);
+    uint32_t pid = hex_or_dec(pidStr);
+    httpd_resp_set_type(r, "application/json");
+    if (vid == 0 || vid > 0xFFFF || pid == 0 || pid > 0xFFFF) {
+        return httpd_resp_send(r, "{\"ok\":false,\"reason\":\"vid/pid missing or out of range\"}", 55);
+    }
+    // Push VID/PID into the SDIO wire, then flip the commit byte. The
+    // P4's live_type task snapshots + persists + reboots — no ack from
+    // us required. Reg 48..52 layout defined in firmware/main/live_type.c.
+    sdio_slave_write_reg(48, vid & 0xFF);
+    sdio_slave_write_reg(49, (vid >> 8) & 0xFF);
+    sdio_slave_write_reg(50, pid & 0xFF);
+    sdio_slave_write_reg(51, (pid >> 8) & 0xFF);
+    sdio_slave_write_reg(52, 1);
+    char body[128];
+    int bn = snprintf(body, sizeof(body),
+        "{\"ok\":true,\"vid\":\"0x%04X\",\"pid\":\"0x%04X\",\"note\":\"P4 will reboot to apply\"}",
+        (unsigned)vid, (unsigned)pid);
+    return httpd_resp_send(r, body, bn);
+}
+
+// /api/scan-wifi — kick off a background scan. Returns immediately;
+// results come from /api/scan-results. WiFi is APSTA mode so we can
+// scan without dropping the AP the browser is talking to us over.
+// Reference JS wants a "started" ack shape.
+static esp_err_t h_api_scan_wifi(httpd_req_t *r) {
+    wifi_scan_config_t sc = { 0 };   // active scan across all channels
+    esp_err_t err = esp_wifi_scan_start(&sc, false);
+    httpd_resp_set_type(r, "application/json");
+    if (err == ESP_ERR_WIFI_STATE) {
+        // A scan is already running — reference UI treats this as success.
+        return httpd_resp_send(r, "{\"ok\":true,\"note\":\"already scanning\"}", 37);
+    }
+    if (err != ESP_OK) {
+        char body[96];
+        int n = snprintf(body, sizeof(body), "{\"ok\":false,\"err\":\"%s\"}",
+                         esp_err_to_name(err));
+        return httpd_resp_send(r, body, n);
+    }
+    return httpd_resp_send(r, "{\"ok\":true}", 11);
+}
+
+// /api/scan-results — list the last scan. Returns JSON:
+// [{ssid, rssi, channel, auth, bssid}, ...]. If a scan hasn't
+// completed yet this returns [] and the JS retries.
+static esp_err_t h_api_scan_results(httpd_req_t *r) {
+    uint16_t n = 0;
+    esp_wifi_scan_get_ap_num(&n);
+    if (n == 0) {
+        httpd_resp_set_type(r, "application/json");
+        return httpd_resp_send(r, "[]", 2);
+    }
+    if (n > 30) n = 30;   // trim so the JSON fits in our body buffer
+    wifi_ap_record_t *aps = calloc(n, sizeof(*aps));
+    if (!aps) { httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+    uint16_t got = n;
+    esp_wifi_scan_get_ap_records(&got, aps);
+    char *body = malloc(4096);
+    if (!body) { free(aps); httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"); return ESP_OK; }
+    int bl = 0;
+    body[bl++] = '[';
+    for (uint16_t i = 0; i < got; i++) {
+        // Escape SSID (only quote + backslash are strictly needed for JSON).
+        char safe_ssid[64]; int si = 0;
+        for (int j = 0; j < 32 && aps[i].ssid[j] && si < (int)sizeof(safe_ssid) - 2; j++) {
+            unsigned char c = aps[i].ssid[j];
+            if (c == '"' || c == '\\') { safe_ssid[si++] = '\\'; safe_ssid[si++] = (char)c; }
+            else if (c >= 0x20) safe_ssid[si++] = (char)c;
+        }
+        safe_ssid[si] = 0;
+        int nn = snprintf(body + bl, 4096 - bl,
+            "%s{\"ssid\":\"%s\",\"rssi\":%d,\"channel\":%u,\"auth\":%u,"
+            "\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\"}",
+            i == 0 ? "" : ",", safe_ssid, aps[i].rssi, aps[i].primary, aps[i].authmode,
+            aps[i].bssid[0], aps[i].bssid[1], aps[i].bssid[2],
+            aps[i].bssid[3], aps[i].bssid[4], aps[i].bssid[5]);
+        if (nn < 0 || bl + nn >= 4090) break;
+        bl += nn;
+    }
+    body[bl++] = ']'; body[bl] = 0;
+    httpd_resp_set_type(r, "application/json");
+    esp_err_t rc = httpd_resp_send(r, body, bl);
+    free(body); free(aps);
+    return rc;
+}
+
 // /favicon.ico — browser autoloads this on every page. Return a 204
 // so it stops spamming the log; the tiny 16x16 default browser icon
 // is fine.
@@ -1231,6 +1374,12 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/led-mode",       HTTP_POST, h_api_led_mode,      NULL, false, false, NULL},
         // /api/list-files — real SPIFFS enumeration for the Explorer tab.
         {"/api/list-files",     HTTP_GET,  h_api_list_files,    NULL, false, false, NULL},
+        // /api/scan-wifi + /api/scan-results — real STA scan on the C6
+        // (APSTA mode; the AP stays up the whole time).
+        {"/api/scan-wifi",      HTTP_POST, h_api_scan_wifi,     NULL, false, false, NULL},
+        {"/api/scan-results",   HTTP_GET,  h_api_scan_results,  NULL, false, false, NULL},
+        // /api/save-usb — persist custom VID/PID; P4 reboots to apply.
+        {"/api/save-usb",       HTTP_POST, h_api_save_usb,      NULL, false, false, NULL},
         {"/api/detect-os",      HTTP_GET,  h_api_detect_os,     NULL, false, false, NULL},
         {"/api/history",        HTTP_GET,  h_api_history,       NULL, false, false, NULL},
         {"/api/clear-history",  HTTP_POST, h_api_history,       NULL, false, false, NULL},
@@ -1260,16 +1409,18 @@ void badusb_ui_register(httpd_handle_t s) {
     // WebServerManager.cpp` on the upstream tree). If a path here is
     // NOT in the reference, it does not belong.
     static const char *stub_paths[] = {
-        // WiFi client mode (reference has full STA support)
+        // WiFi client mode (reference has full STA support).
+        // /api/scan-wifi + /api/scan-results are REAL (registered above).
         "/api/save-wifi", "/api/saved-wifi", "/api/delete-saved-wifi",
-        "/api/scan-wifi", "/api/scan-results", "/api/join-internet",
+        "/api/join-internet",
         "/api/leave-internet", "/api/wifi-join-status", "/api/stop-wifi-join",
         "/api/wifi-secrets", "/api/stop-ap",
         // Bluetooth (reference has HID over BT)
         "/api/toggle-bluetooth", "/api/toggle-bt-discovery",
         "/api/save-bt-settings",
         // USB attack-mode toggles that need the composite refactor
-        "/api/save-usb", "/api/toggle-com", "/api/toggle-random-mac",
+        // (/api/save-usb is REAL — registered above).
+        "/api/toggle-com", "/api/toggle-random-mac",
         "/api/toggle-save-on-connect",
         // General settings knobs (persist to NVS — TODO real backends).
         // Note: /api/toggle-led is REAL (registered above with a live

@@ -20,10 +20,13 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
+#include "msc_storage.h"
 
 extern QueueHandle_t g_hid_bridge_q;   // main.c
 extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
@@ -43,6 +46,23 @@ extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
 #define BADUSB_TYPE_REG_ADDR   0xA8
 #define BADUSB_MOD_REG_ADDR    0xA9
 #define BADUSB_HID_REG_ADDR    0xAA
+// USB identity write channel (see comment block below). Reg 48..51
+// carry two 16-bit LE values (VID then PID), reg 52 is the commit
+// trigger: when the P4 sees reg 52 == 1 it snapshots reg 48..51 into
+// its NVS namespace "usb", clears reg 52, then reboots itself so the
+// new identity takes effect on the next TinyUSB enumeration.
+#define BADUSB_VID_L_REG_ADDR  0xAC   // slave scratch reg 48
+#define BADUSB_VID_H_REG_ADDR  0xAD   // slave scratch reg 49
+#define BADUSB_PID_L_REG_ADDR  0xAE   // slave scratch reg 50
+#define BADUSB_PID_H_REG_ADDR  0xAF   // slave scratch reg 51
+#define BADUSB_USB_COMMIT_ADDR 0xB0   // slave scratch reg 52
+// ATTACKMODE + SIZE — separate commit byte at reg 60 so writes to
+// individual bytes below can happen non-atomically without half-
+// applying. When reg 60 == 1 we snapshot 53..59, apply to msc_storage,
+// clear reg 60. No reboot required — MSC toggles live.
+#define BADUSB_ATK_ENABLED_ADDR 0xB1   // slave scratch reg 53 (0/1)
+#define BADUSB_SIZE_BASE_ADDR   0xB2   // slave scratch reg 54..59 (6 bytes, LE)
+#define BADUSB_ATK_COMMIT_ADDR  0xB8   // slave scratch reg 60
 
 static const char *TAG = "live_type";
 
@@ -119,6 +139,49 @@ static void live_type_task(void *arg) {
     while (1) {
         sdmmc_card_t *card = live_type_get_card();
         if (!card) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        // USB-identity commit — one-shot: when the C6 web UI posts to
+        // /api/save-usb it writes reg 48..51 with the new VID/PID and
+        // reg 52 = 1. We snapshot into our own NVS namespace "usb" and
+        // reboot ourselves so TinyUSB re-enumerates with the new IDs.
+        uint8_t commit = 0;
+        if (sdmmc_io_read_byte(card, 1, BADUSB_USB_COMMIT_ADDR, &commit) == ESP_OK && commit == 1) {
+            uint8_t vl=0, vh=0, pl=0, ph=0;
+            sdmmc_io_read_byte(card, 1, BADUSB_VID_L_REG_ADDR, &vl);
+            sdmmc_io_read_byte(card, 1, BADUSB_VID_H_REG_ADDR, &vh);
+            sdmmc_io_read_byte(card, 1, BADUSB_PID_L_REG_ADDR, &pl);
+            sdmmc_io_read_byte(card, 1, BADUSB_PID_H_REG_ADDR, &ph);
+            uint16_t vid = ((uint16_t)vh << 8) | vl;
+            uint16_t pid = ((uint16_t)ph << 8) | pl;
+            nvs_handle_t h;
+            if (vid != 0 && pid != 0 && nvs_open("usb", NVS_READWRITE, &h) == ESP_OK) {
+                nvs_set_u16(h, "vid", vid);
+                nvs_set_u16(h, "pid", pid);
+                nvs_commit(h);
+                nvs_close(h);
+                ESP_LOGI(TAG, "USB identity persisted: VID=%04X PID=%04X — rebooting", vid, pid);
+            }
+            sdmmc_io_write_byte(card, 1, BADUSB_USB_COMMIT_ADDR, 0, NULL);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
+
+        // ATTACKMODE / SIZE commit — flip STORAGE on/off and fake the
+        // reported capacity per DuckyScript SIZE_* commands. No reboot
+        // needed: msc_storage tracks these live.
+        uint8_t atk_commit = 0;
+        if (sdmmc_io_read_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, &atk_commit) == ESP_OK && atk_commit == 1) {
+            uint8_t on = 0;
+            sdmmc_io_read_byte(card, 1, BADUSB_ATK_ENABLED_ADDR, &on);
+            msc_storage_set_enabled(on != 0);
+            // 6-byte little-endian capacity (up to 256 TiB — plenty).
+            uint8_t s[6] = { 0 };
+            for (int i = 0; i < 6; i++) sdmmc_io_read_byte(card, 1, BADUSB_SIZE_BASE_ADDR + i, &s[i]);
+            uint64_t bytes = 0;
+            for (int i = 0; i < 6; i++) bytes |= ((uint64_t)s[i]) << (8 * i);
+            msc_storage_set_fake_capacity(bytes);
+            sdmmc_io_write_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, 0, NULL);
+        }
 
         // Prefer the combo path (reg 46) when set — combos are event-driven
         // (rare) and the C6 waits for the ack, so keeping their latency low
