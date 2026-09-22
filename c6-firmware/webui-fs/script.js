@@ -891,7 +891,11 @@ const VALID_KEYWORDS = new Set([
     // Raw-RGB LED ("LED 255 0 0") + fake MSC capacity (SIZE_5GB, SIZE_512MB,
     // SIZE_1TB, SIZE_4096B, …). Both are real firmware built-ins.
     'LED', 'SIZE_', 'SIZE_512MB', 'SIZE_1GB', 'SIZE_2GB', 'SIZE_4GB',
-    'SIZE_8GB', 'SIZE_16GB', 'SIZE_32GB', 'SIZE_64GB', 'SIZE_128GB', 'SIZE_256GB', 'SIZE_1TB'
+    'SIZE_8GB', 'SIZE_16GB', 'SIZE_32GB', 'SIZE_64GB', 'SIZE_128GB', 'SIZE_256GB', 'SIZE_1TB',
+    // USB composition control: DETACH pulls the device off USB entirely
+    // (== ATTACKMODE NONE); ATTACH re-exposes the storage volume
+    // (== ATTACKMODE HID STORAGE). ATTACKMODE NONE is the new blank state.
+    'DETACH', 'ATTACH', 'ATTACKMODE_NONE'
 ]);
 
 // v4.28: Hak5 built-in $_ variables. These are seeded by the firmware at
@@ -1854,6 +1858,48 @@ function saveBootScripts() {
     }).then(r => r.text()).then(msg => alert(msg));
 }
 
+// ---- USB storage (Payload Volume) attach/detach control ----------------
+// The MSC drive is a FAT volume the host PC owns while attached, so the
+// device can't safely read it at the same time (dual-mount corrupts FAT).
+// These update the banner + drive the P4's USB composition.
+let __usbMode = 0;   // 0=HID, 1=HID+STORAGE, 2=NONE
+function renderUsbState(mode) {
+    __usbMode = mode;
+    const badge = document.getElementById('usbStateBadge');
+    const msg   = document.getElementById('usbStateMsg');
+    if (!badge || !msg) return;
+    const label = mode === 1 ? 'ATTACHED to host' : (mode === 2 ? 'DETACHED (off USB)' : 'HID only (no drive)');
+    badge.textContent = label;
+    badge.style.color = mode === 1 ? 'var(--primary)' : 'var(--text-dim, #8a8a8f)';
+    if (mode === 1) {
+        msg.textContent = 'The USB drive is attached to the host PC — its files are managed by that PC and can’t be listed here while attached. Press “See storage files” to detach it and browse from the device.';
+    } else if (mode === 2) {
+        msg.textContent = 'The device is fully detached from USB (no keyboard, no drive). Press “Attach USB” to hand the drive back to the host PC.';
+    } else {
+        msg.textContent = 'HID keyboard only — no storage volume is exposed. Press “Attach USB” to expose the Payload Volume to the host PC.';
+    }
+}
+function usbAttach() {
+    fetch('/api/usb-attach', {method:'POST'}).then(r => r.json()).then(d => {
+        renderUsbState(1);
+        showToast && showToast('USB drive attached to host');
+    }).catch(() => {});
+}
+function usbDetach() {
+    fetch('/api/usb-detach', {method:'POST'}).then(r => r.json()).then(d => {
+        renderUsbState(2);
+        showToast && showToast('Device detached from USB');
+    }).catch(() => {});
+}
+function browseStorage() {
+    // Detach from the host so the FAT is free, then (once the on-device FAT
+    // listing lands) show its files. For now this detaches and refreshes.
+    fetch('/api/usb-detach', {method:'POST'}).then(r => r.json()).then(() => {
+        renderUsbState(2);
+        refreshFileBrowser();
+    }).catch(() => {});
+}
+
 function refreshFileBrowser() {
     const browser = document.getElementById('fileBrowser');
     browser.innerHTML = '<div class="file-browser-item">Loading...</div>';
@@ -2047,6 +2093,7 @@ function updateStats() {
         set('uptime', data.uptime + 's');
         set('freeMemory', Math.round(data.freeMemory / 1024) + ' KB');
         set('lastError', data.lastError || 'None');
+        if (typeof data.usbMode === 'number') renderUsbState(data.usbMode);
         // Live tab warning if HID has been disabled by ATTACKMODE
         const ls = document.getElementById('liveStatus');
         if (ls && data.attackMode && !data.attackMode.hid) {

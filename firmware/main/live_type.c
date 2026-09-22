@@ -29,9 +29,10 @@
 #include "msc_storage.h"
 
 // Defined in main.c — live USB descriptor control (no reboot).
-extern void usb_apply_storage_visibility(bool on);  // add/remove the MSC interface
-extern bool usb_storage_visible(void);              // is MSC currently attached?
-extern void usb_force_reenumerate(void);            // refresh host (re-read capacity)
+extern void usb_apply_state(int st);      // 0=HID, 1=HID+STORAGE, 2=NONE(detached)
+extern int  usb_get_state(void);
+extern bool usb_storage_visible(void);    // is MSC currently attached?
+extern void usb_force_reenumerate(void);  // refresh host (re-read capacity)
 
 extern QueueHandle_t g_hid_bridge_q;   // main.c
 extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
@@ -183,9 +184,11 @@ static void live_type_task(void *arg) {
         // tud_msc_capacity_cb and needs no reboot.
         uint8_t atk_commit = 0;
         if (sdmmc_io_read_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, &atk_commit) == ESP_OK && atk_commit == 1) {
-            uint8_t on = 0;
-            sdmmc_io_read_byte(card, 1, BADUSB_ATK_ENABLED_ADDR, &on);
-            bool want = (on != 0);
+            // USB composition mode: 0=HID, 1=HID+STORAGE, 2=NONE(detached).
+            uint8_t mode = 0;
+            sdmmc_io_read_byte(card, 1, BADUSB_ATK_ENABLED_ADDR, &mode);
+            if (mode > 2) mode = 0;
+            bool want_storage = (mode == 1);
             // 6-byte little-endian capacity (up to 256 TiB — plenty). Set the
             // fake capacity BEFORE making the volume visible so the host reads
             // the requested size on the fresh enumeration.
@@ -202,15 +205,15 @@ static void live_type_task(void *arg) {
             s_last_cap = bytes;
             s_have_cap = true;
 
-            bool was_visible = usb_storage_visible();
+            int prev_state = usb_get_state();
             msc_storage_set_fake_capacity(bytes);
-            msc_storage_set_enabled(want);
+            msc_storage_set_enabled(want_storage);
             sdmmc_io_write_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, 0, NULL);
 
-            if (want != was_visible) {
-                // Storage turned on or off → add/remove the MSC interface.
-                usb_apply_storage_visibility(want);
-            } else if (want && cap_changed) {
+            if (mode != prev_state) {
+                // Composition changed (HID / STORAGE / NONE) → apply live.
+                usb_apply_state(mode);
+            } else if (want_storage && cap_changed) {
                 // Already attached, only the size changed → detach + re-attach
                 // so Windows re-reads READ CAPACITY instead of caching the old
                 // (e.g. 16 MB) size. This is the SIZE_-after-STORAGE case.

@@ -237,38 +237,54 @@ static const uint8_t configuration_desc_hidonly[] = {
 // The live buffer esp_tinyusb keeps a pointer to. Sized for the full variant;
 // HID-only just writes fewer meaningful bytes (host honours wTotalLength).
 static uint8_t s_cfg_desc[sizeof(configuration_desc_full)];
-static bool    s_storage_visible = false;   // what s_cfg_desc currently reflects
 
-// Fill s_cfg_desc with the requested variant. Pointer/identity is stable so
-// the pointer esp_tinyusb holds stays valid across swaps.
+// USB composition state, applied live (no reboot):
+//   0 = HID only          (ATTACKMODE HID)
+//   1 = HID + Mass Storage (ATTACKMODE HID STORAGE)
+//   2 = detached           (ATTACKMODE NONE / DETACH) — device off USB
+#define USB_STATE_HID     0
+#define USB_STATE_STORAGE 1
+#define USB_STATE_NONE    2
+static int s_usb_state = USB_STATE_HID;
+
+// Fill s_cfg_desc with the requested variant. Pointer identity is stable so
+// esp_tinyusb's stored pointer stays valid across swaps.
 static void build_config_desc(bool with_msc) {
     if (with_msc) memcpy(s_cfg_desc, configuration_desc_full,    sizeof(configuration_desc_full));
     else          memcpy(s_cfg_desc, configuration_desc_hidonly, sizeof(configuration_desc_hidonly));
-    s_storage_visible = with_msc;
 }
 
-// Live toggle of the MSC volume without a chip reboot. Called from the
-// ATTACKMODE STORAGE handler (via live_type.c). Re-enumerates so the host
-// adds/removes the drive letter; the running DuckyScript keeps going.
-void usb_apply_storage_visibility(bool on) {
-    if (on == s_storage_visible) return;   // no change → nothing to do
-    ESP_LOGI(TAG, "USB storage %s — live re-enumerating (no reboot)", on ? "on" : "off");
+// Apply a USB composition state live — detach, swap the descriptor, re-attach
+// (or stay detached for NONE). No chip reboot, so a running DuckyScript keeps
+// going across the change.
+void usb_apply_state(int st) {
+    if (st < 0 || st > USB_STATE_NONE) return;
+    if (st == s_usb_state) return;
+    ESP_LOGI(TAG, "USB state %d -> %d (0=HID 1=STORAGE 2=NONE)", s_usb_state, st);
     tud_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(120));      // let the host notice the unplug
-    build_config_desc(on);
-    tud_connect();
+    vTaskDelay(pdMS_TO_TICKS(120));      // let the host see the unplug
+    if (st != USB_STATE_NONE) {
+        build_config_desc(st == USB_STATE_STORAGE);
+        tud_connect();
+    }
+    s_usb_state = st;
 }
 
-// Is the MSC volume currently exposed to the host?
-bool usb_storage_visible(void) { return s_storage_visible; }
+// Seed the state at boot from the persisted storage flag (never boots NONE).
+void usb_init_state(bool storage_on) {
+    s_usb_state = storage_on ? USB_STATE_STORAGE : USB_STATE_HID;
+    build_config_desc(storage_on);
+}
 
-// Force a re-enumeration WITHOUT changing the interface set — same
-// descriptor, but the host re-reads the device (including READ CAPACITY,
-// so a new SIZE_ takes effect). Used when the fake MSC capacity changes
-// while the volume is already attached: detach, then re-attach so Windows
-// picks up the new drive size instead of caching the old one.
+int  usb_get_state(void)      { return s_usb_state; }
+bool usb_storage_visible(void){ return s_usb_state == USB_STATE_STORAGE; }
+
+// Force a re-enumeration WITHOUT changing the interface set — same descriptor,
+// but the host re-reads the device (including READ CAPACITY, so a new SIZE_
+// takes effect). Used when the fake MSC capacity changes while the volume is
+// already attached.
 void usb_force_reenumerate(void) {
-    if (!s_storage_visible) return;      // nothing attached to refresh
+    if (s_usb_state != USB_STATE_STORAGE) return;   // nothing attached to refresh
     ESP_LOGI(TAG, "USB re-enumerate (capacity change)");
     tud_disconnect();
     vTaskDelay(pdMS_TO_TICKS(120));
@@ -533,7 +549,7 @@ void app_main(void) {
         // buffer is mutable so a later ATTACKMODE toggle can swap it live.
         .configuration_descriptor = s_cfg_desc,
     };
-    build_config_desc(msc_storage_enabled());
+    usb_init_state(msc_storage_enabled());
     ESP_LOGI(TAG, "USB descriptor: %s",
              msc_storage_enabled() ? "HID + MSC (storage on)" : "HID-only (storage off)");
     ESP_ERROR_CHECK(tinyusb_driver_install(&tcfg));

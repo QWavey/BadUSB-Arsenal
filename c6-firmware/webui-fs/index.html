@@ -146,6 +146,24 @@
                     <h3>System File Explorer</h3>
                     <button onclick="refreshFileBrowser()" style="padding: 5px 12px; font-size: 11px;">Refresh 🔄</button>
                 </div>
+
+                <!-- USB storage (Payload Volume) control. The MSC drive is a
+                     FAT volume the host PC owns while it's attached, so its
+                     files can't be listed here at the same time. Detach it to
+                     let the device read it; attach it to hand it back to the PC. -->
+                <div class="section" id="usbStoragePanel">
+                    <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                        <h4 style="margin: 0;">USB Storage (Payload Volume)</h4>
+                        <span id="usbStateBadge" style="font-family: monospace; font-size: 12px; padding: 3px 10px; border-radius: 999px; background: var(--bg-section); border: 1px solid var(--glass-border);">…</span>
+                    </div>
+                    <p id="usbStateMsg" style="margin: 0 0 12px; font-size: 13px; color: var(--text-dim, #8a8a8f);">Checking USB state…</p>
+                    <div class="flex-row" style="gap: 10px; flex-wrap: wrap;">
+                        <button id="btnBrowseStorage" onclick="browseStorage()" style="padding: 8px 14px; font-size: 13px;">📂 See storage files</button>
+                        <button id="btnAttachUsb" onclick="usbAttach()" style="padding: 8px 14px; font-size: 13px;">🔌 Attach USB</button>
+                        <button id="btnDetachUsb" onclick="usbDetach()" style="padding: 8px 14px; font-size: 13px;">⏏ Detach USB</button>
+                    </div>
+                </div>
+
                 <div class="section">
                     <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
                         <span id="currentDirDisplay" style="font-family: monospace; color: var(--primary);">/</span>

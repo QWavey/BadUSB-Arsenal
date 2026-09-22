@@ -52,7 +52,7 @@ static const char *TAG = "badusb_ui";
 #define SDIO_REG_BADUSB_MOD   45   // HID modifier bitmap for the next combo
 #define SDIO_REG_BADUSB_HID   46   // HID scancode for combo/named keys
 // ATTACKMODE + SIZE. Matches BADUSB_ATK_*_ADDR in firmware/main/live_type.c.
-#define SDIO_REG_ATK_ON       53   // 0 = ATTACKMODE HID; 1 = STORAGE
+#define SDIO_REG_ATK_ON       53   // USB mode: 0=HID, 1=HID+STORAGE, 2=NONE(detached)
 #define SDIO_REG_SIZE_BASE    54   // 6 bytes LE — reported MSC capacity
 #define SDIO_REG_ATK_COMMIT   60   // write 1 to trigger snapshot
 
@@ -117,6 +117,14 @@ uint8_t badusb_ascii_to_hid(uint8_t c, uint8_t *out_shift) {
     }
     if (out_shift) *out_shift = m.sh;
     return m.kc;
+}
+
+// Case-insensitive substring test (strcasestr isn't portable here).
+static bool ci_contains(const char *hay, const char *needle) {
+    size_t nl = strlen(needle);
+    if (!nl) return true;
+    for (; *hay; hay++) if (!strncasecmp(hay, needle, nl)) return true;
+    return false;
 }
 
 // Ducky/reference token -> HID scancode. Returns 0 if the token isn't a
@@ -624,14 +632,35 @@ static void execute_task(void *arg) {
                  !strncasecmp(line, "WINDOWS", 7) || !strncasecmp(line, "COMMAND", 7)) {
             if (run_combo_line(line)) executed++;
         }
-        // ATTACKMODE HID / STORAGE / HID STORAGE — flip the P4's MSC
-        // enable flag. STORAGE alone or "HID STORAGE" both turn MSC
-        // on; bare "HID" turns MSC off. Persisted in P4 NVS.
+        // ATTACKMODE HID / HID STORAGE / NONE — set the P4 USB composition:
+        //   ...STORAGE        -> mode 1 = HID + Mass Storage
+        //   NONE / OFF / BLANK -> mode 2 = fully detached from the host
+        //   anything else (HID) -> mode 0 = HID keyboard only, no drive
+        // The P4 applies it live (attach/detach, no reboot).
         else if (!strncasecmp(line, "ATTACKMODE", 10)) {
             const char *rest = line + 10;
             while (*rest && isspace((unsigned char)*rest)) rest++;
-            bool want_storage = strstr(rest, "STORAGE") != NULL || strstr(rest, "storage") != NULL;
-            sdio_slave_write_reg(SDIO_REG_ATK_ON, want_storage ? 1 : 0);
+            uint8_t mode;
+            if (ci_contains(rest, "STORAGE"))                        mode = 1;
+            else if (ci_contains(rest, "NONE") || ci_contains(rest, "OFF") ||
+                     ci_contains(rest, "BLANK") || *rest == 0)       mode = 2;
+            else                                                     mode = 0;   // HID
+            sdio_slave_write_reg(SDIO_REG_ATK_ON, mode);
+            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            executed++;
+        }
+        // DETACH — pull the whole device off USB (== ATTACKMODE NONE). Handy
+        // in a payload to disappear from the host, and used by the web UI's
+        // "Detach USB" button so the device can read its own storage FAT.
+        else if (!strncasecmp(line, "DETACH", 6) && (line[6] == 0 || isspace((unsigned char)line[6]))) {
+            sdio_slave_write_reg(SDIO_REG_ATK_ON, 2);
+            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            executed++;
+        }
+        // ATTACH — re-expose the mass-storage volume to the host
+        // (== ATTACKMODE HID STORAGE). Pairs with DETACH / the web buttons.
+        else if (!strncasecmp(line, "ATTACH", 6) && (line[6] == 0 || isspace((unsigned char)line[6]))) {
+            sdio_slave_write_reg(SDIO_REG_ATK_ON, 1);
             sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
             executed++;
         }
@@ -936,6 +965,11 @@ static esp_err_t h_api_default(httpd_req_t *r) {
     return httpd_resp_send(r, "{\"ok\":true,\"stub\":true}", 24);
 }
 
+// Best-effort mirror of the P4 USB composition (0=HID,1=HID+STORAGE,2=NONE),
+// set by the Explorer Attach/Detach handlers and reported in /api/stats so
+// the UI banner can say whether the storage volume is attached to the host.
+static uint8_t s_usb_mode = 0;
+
 // -------- real implementations of the trivial upstream endpoints --------
 
 #include "esp_system.h"
@@ -1067,6 +1101,8 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         // --- ATTACKMODE state (chip in the Live tab / Settings) ---
         "\"attackMode\":{\"hid\":true,\"storage\":false,"
                         "\"vid\":\"0x303A\",\"pid\":\"0x4B44\",\"sizeBytes\":0},"
+        // --- USB composition (Explorer banner): 0=HID 1=HID+STORAGE 2=NONE ---
+        "\"usbMode\":%u,"
         // --- Wi-Fi ---
         "\"wifiConnected\":false,\"staSSID\":\"\","
         "\"apActive\":%s,"
@@ -1095,6 +1131,7 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         (unsigned)sketch_used, (unsigned)sketch_total, (unsigned)sketch_pct,
         (unsigned)up_s,
         (unsigned)s_sta_count,
+        (unsigned)s_usb_mode,
         s_wifi_up == 1 ? "true" : "false",
         s_led_off ? "false" : "true", (unsigned)s_led_mode,
         s_recording ? "true" : "false",
@@ -1170,6 +1207,25 @@ static esp_err_t h_api_set_silent(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, body, n);
 }
+
+// USB composition control for the Explorer-tab buttons. Writes the same
+// P4 registers the ATTACKMODE / DETACH / ATTACH DuckyScript commands use.
+// mode: 0=HID, 1=HID+STORAGE, 2=NONE(detached). s_usb_mode (declared above)
+// mirrors the last requested mode so /api/stats can report it to the banner.
+static esp_err_t usb_set_mode_resp(httpd_req_t *r, uint8_t mode) {
+    s_usb_mode = mode;
+    sdio_slave_write_reg(SDIO_REG_ATK_ON, mode);
+    sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+    char body[64];
+    int n = snprintf(body, sizeof(body), "{\"ok\":true,\"usbMode\":%u}", mode);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+// /api/usb-attach — expose the storage volume to the host (HID + STORAGE).
+static esp_err_t h_api_usb_attach(httpd_req_t *r) { return usb_set_mode_resp(r, 1); }
+// /api/usb-detach — pull the device fully off USB (NONE) so the host lets go
+// of the storage FAT (and the device can read it for the Explorer listing).
+static esp_err_t h_api_usb_detach(httpd_req_t *r) { return usb_set_mode_resp(r, 2); }
 
 // /api/temp — chip temperature is not available on ESP32-C6 without
 // a temp_sensor init, and even then it's noisy. Return null so the UI
@@ -1684,6 +1740,11 @@ void badusb_ui_register(httpd_handle_t s) {
         // /api/set-silent — real backend (Silent Startup, persisted + pushed to P4).
         {"/api/set-silent",     HTTP_GET,  h_api_set_silent,    NULL, false, false, NULL},
         {"/api/set-silent",     HTTP_POST, h_api_set_silent,    NULL, false, false, NULL},
+        // USB composition (Explorer tab Attach/Detach buttons).
+        {"/api/usb-attach",     HTTP_POST, h_api_usb_attach,    NULL, false, false, NULL},
+        {"/api/usb-attach",     HTTP_GET,  h_api_usb_attach,    NULL, false, false, NULL},
+        {"/api/usb-detach",     HTTP_POST, h_api_usb_detach,    NULL, false, false, NULL},
+        {"/api/usb-detach",     HTTP_GET,  h_api_usb_detach,    NULL, false, false, NULL},
         // /api/list-files — real SPIFFS enumeration for the Explorer tab.
         {"/api/list-files",     HTTP_GET,  h_api_list_files,    NULL, false, false, NULL},
         // /api/upload — writes an uploaded file into /data/. Query
