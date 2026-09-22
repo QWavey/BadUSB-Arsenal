@@ -887,7 +887,11 @@ const VALID_KEYWORDS = new Set([
     'RANDOM_LETTER', 'RANDOM_LOWERCASE_LETTER', 'RANDOM_UPPERCASE_LETTER',
     'THEN', 'CONTAINS', 'IN',
     // v4.28: additional Hak5 3.0 commands used by the OS_DETECTION extension
-    'SAVE_HOST_KEYBOARD_LOCK_STATE', 'RESTORE_HOST_KEYBOARD_LOCK_STATE'
+    'SAVE_HOST_KEYBOARD_LOCK_STATE', 'RESTORE_HOST_KEYBOARD_LOCK_STATE',
+    // Raw-RGB LED ("LED 255 0 0") + fake MSC capacity (SIZE_5GB, SIZE_512MB,
+    // SIZE_1TB, SIZE_4096B, …). Both are real firmware built-ins.
+    'LED', 'SIZE_', 'SIZE_512MB', 'SIZE_1GB', 'SIZE_2GB', 'SIZE_4GB',
+    'SIZE_8GB', 'SIZE_16GB', 'SIZE_32GB', 'SIZE_64GB', 'SIZE_128GB', 'SIZE_256GB', 'SIZE_1TB'
 ]);
 
 // v4.28: Hak5 built-in $_ variables. These are seeded by the firmware at

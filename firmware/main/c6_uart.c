@@ -447,6 +447,10 @@ static void link_bringup_task(void *arg) {
 // the layout stayed at whatever the P4 read on cold boot.
 #define C6_REG_LED_MODE_ADDR   0xA4   // slave scratch reg 40 → Function 1 @ 0xA4
 #define C6_REG_LAYOUT_ADDR     0xA5   // slave scratch reg 41 → Function 1 @ 0xA5 (0=US 1=DE 2=UK)
+// Custom-RGB colour bytes, read only when the mode byte (reg 40) == 5.
+#define C6_REG_LED_R_ADDR      0xBA   // slave scratch reg 62 → R
+#define C6_REG_LED_G_ADDR      0xBB   // slave scratch reg 63 → G
+#define C6_REG_LED_B_ADDR      0xA7   // slave scratch reg 43 → B
 
 // The host side of the SDIO link died (typically because the C6 was reset or
 // its wifi crash forced a reboot — the slave re-enumerates with a fresh RCA
@@ -486,6 +490,7 @@ static void led_poll_task(void *arg) {
     // gate needed: if the user saved OFF, we honour it immediately at boot.
     uint8_t last_led = 0;
     uint8_t last_lay = 0xFF;
+    uint8_t last_r = 0, last_g = 0, last_b = 0;
     int read_fails = 0;
     TickType_t last_recover = 0;
     while (1) {
@@ -494,9 +499,23 @@ static void led_poll_task(void *arg) {
         esp_err_t err = sdmmc_io_read_byte(s_card, 1, C6_REG_LED_MODE_ADDR, &v);
         if (err == ESP_OK) {
             read_fails = 0;
-            if (v != last_led) {
-                // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE
-                led_set_mode((led_mode_t)(v > 4 ? LED_MODE_KEY_FLASH : v));
+            // C6 IDs: 0=OFF 1=GREEN 2=KEYFLASH 3=RED 4=BLUE 5=CUSTOM(RGB)
+            if (v == 5) {
+                // Custom RGB: pull the three colour bytes and re-apply whenever
+                // any of them (or the mode) changed. Only apply if ALL three
+                // reads succeed — a glitched read would otherwise default a
+                // byte to 0 and flash the LED black for a tick.
+                uint8_t r = 0, g = 0, b = 0;
+                esp_err_t e1 = sdmmc_io_read_byte(s_card, 1, C6_REG_LED_R_ADDR, &r);
+                esp_err_t e2 = sdmmc_io_read_byte(s_card, 1, C6_REG_LED_G_ADDR, &g);
+                esp_err_t e3 = sdmmc_io_read_byte(s_card, 1, C6_REG_LED_B_ADDR, &b);
+                if (e1 == ESP_OK && e2 == ESP_OK && e3 == ESP_OK &&
+                    (v != last_led || r != last_r || g != last_g || b != last_b)) {
+                    led_set_rgb(r, g, b);
+                    last_led = v; last_r = r; last_g = g; last_b = b;
+                }
+            } else if (v != last_led) {
+                led_set_mode((led_mode_t)(v > 5 ? LED_MODE_KEY_FLASH : v));
                 last_led = v;
             }
         } else if (read_fails < INT_MAX) {

@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "main.c" "web_ui.c" "badusb_ui.c"
     INCLUDE_DIRS "."
     REQUIRES esp_wifi esp_netif esp_event nvs_flash esp_http_server driver spiffs esp_timer spi_flash
+             app_update bootloader_support esp_driver_tsens
 )
 
 # Build a SPIFFS image from ../webui-fs/ and flash it into the "storage"

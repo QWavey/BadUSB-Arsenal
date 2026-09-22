@@ -28,6 +28,10 @@
 #include "nvs.h"
 #include "msc_storage.h"
 
+// Defined in main.c — swaps the USB config descriptor live (no reboot) so the
+// MSC volume appears/disappears on ATTACKMODE STORAGE toggles.
+extern void usb_apply_storage_visibility(bool on);
+
 extern QueueHandle_t g_hid_bridge_q;   // main.c
 extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
 
@@ -63,6 +67,7 @@ extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
 #define BADUSB_ATK_ENABLED_ADDR 0xB1   // slave scratch reg 53 (0/1)
 #define BADUSB_SIZE_BASE_ADDR   0xB2   // slave scratch reg 54..59 (6 bytes, LE)
 #define BADUSB_ATK_COMMIT_ADDR  0xB8   // slave scratch reg 60
+#define BADUSB_SILENT_ADDR      0xB9   // slave scratch reg 61 — Silent Startup (0/1)
 
 static const char *TAG = "live_type";
 
@@ -167,20 +172,49 @@ static void live_type_task(void *arg) {
         }
 
         // ATTACKMODE / SIZE commit — flip STORAGE on/off and fake the
-        // reported capacity per DuckyScript SIZE_* commands. No reboot
-        // needed: msc_storage tracks these live.
+        // reported capacity per DuckyScript SIZE_* commands.
+        //
+        // Whether the MSC interface EXISTS is now decided at boot from the
+        // persisted flag (HID-only vs HID+MSC descriptor in main.c). So a
+        // change to the storage-enabled state only becomes visible after a
+        // re-enumeration — reboot for it, exactly like the VID/PID path
+        // above. A capacity-only change (storage staying on) is read live by
+        // tud_msc_capacity_cb and needs no reboot.
         uint8_t atk_commit = 0;
         if (sdmmc_io_read_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, &atk_commit) == ESP_OK && atk_commit == 1) {
             uint8_t on = 0;
             sdmmc_io_read_byte(card, 1, BADUSB_ATK_ENABLED_ADDR, &on);
-            msc_storage_set_enabled(on != 0);
-            // 6-byte little-endian capacity (up to 256 TiB — plenty).
+            bool want = (on != 0);
+            // 6-byte little-endian capacity (up to 256 TiB — plenty). Set the
+            // fake capacity BEFORE making the volume visible so the host reads
+            // the requested size on the fresh enumeration.
             uint8_t s[6] = { 0 };
             for (int i = 0; i < 6; i++) sdmmc_io_read_byte(card, 1, BADUSB_SIZE_BASE_ADDR + i, &s[i]);
             uint64_t bytes = 0;
             for (int i = 0; i < 6; i++) bytes |= ((uint64_t)s[i]) << (8 * i);
             msc_storage_set_fake_capacity(bytes);
+            msc_storage_set_enabled(want);
             sdmmc_io_write_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, 0, NULL);
+            // Live re-enumerate to add/remove the drive — NO reboot, so the
+            // running DuckyScript (DELAY/GUI/… after ATTACKMODE) keeps going.
+            usb_apply_storage_visibility(want);
+        }
+
+        // Silent Startup (reg 61): the C6 pushes 0/1 here at its boot and on
+        // every change. Persist it in the P4's own NVS so led_init() can read
+        // it at the NEXT power-up and skip the boot LED self-test. No reboot —
+        // "silent STARTUP" only needs to take effect on the next boot.
+        static uint8_t s_silent_last = 0xFF;
+        uint8_t silent = 0;
+        if (sdmmc_io_read_byte(card, 1, BADUSB_SILENT_ADDR, &silent) == ESP_OK &&
+            silent != s_silent_last) {
+            s_silent_last = silent;
+            nvs_handle_t hs;
+            if (nvs_open("led", NVS_READWRITE, &hs) == ESP_OK) {
+                nvs_set_u8(hs, "silent", silent ? 1 : 0);
+                nvs_commit(hs); nvs_close(hs);
+                ESP_LOGI(TAG, "Silent Startup pref = %u (applies next boot)", silent);
+            }
         }
 
         // Prefer the combo path (reg 46) when set — combos are event-driven

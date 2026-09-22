@@ -20,10 +20,14 @@ typedef enum {
     LED_MODE_KEY_FLASH  = 2,   // green idle + red flash per key event  (default)
     LED_MODE_RED_ONLY   = 3,   // steady red
     LED_MODE_BLUE_ONLY  = 4,   // steady blue
+    LED_MODE_CUSTOM     = 5,   // arbitrary RGB set via led_set_rgb()
 } led_mode_t;
 
 void led_init(void);
 void led_set_mode(led_mode_t m);
+// Steady arbitrary colour (DuckyScript "LED r g b", LED_Y/LED_W/…). Puts the
+// driver in LED_MODE_CUSTOM and shows exactly the given 8-bit RGB triplet.
+void led_set_rgb(uint8_t r, uint8_t g, uint8_t b);
 led_mode_t led_get_mode(void);
 esp_err_t led_init_status(void);  // ESP_OK if LED driver initialized successfully
 

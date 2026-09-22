@@ -300,45 +300,56 @@
 
                     <div class="setting-group">
                         <h4 data-tour="toggles-header">Toggles</h4>
-                        <div class="flex-row" data-setting="led" style="justify-content: space-between; margin-bottom: 10px;">
+
+                        <!-- Grouped and uniformly spaced so the list reads in a
+                             sensible order: LED, then radios, then privacy /
+                             stealth, then system/connectivity. Every row uses the
+                             same flex-row + margin-bottom so nothing looks ragged. -->
+
+                        <!-- LED -->
+                        <div class="toggle-subhead">LED</div>
+                        <div class="flex-row" data-setting="led" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
                             <span>Hardware LED</span>
                             <label class="switch"><input type="checkbox" id="ledToggle" checked onchange="toggleLED()"><span class="slider"></span></label>
                         </div>
-                        <!-- v4.17: toggle whether the LED blinks fast during payload execution. -->
-                        <div class="flex-row" data-setting="led" style="justify-content: space-between; margin-bottom: 10px;">
+                        <div class="flex-row" data-setting="led" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
                             <span title="When ON, the LED fast-blinks blue while a DuckyScript payload is running. When OFF, it stays solid.">Blink LED while executing payloads</span>
                             <label class="switch"><input type="checkbox" id="blinkOnRunToggle" checked onchange="toggleBlinkOnRun()"><span class="slider"></span></label>
                         </div>
-                        <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
-                            <span>Logging</span>
-                            <label class="switch"><input type="checkbox" id="loggingToggle" onchange="toggleLogging()"><span class="slider"></span></label>
-                        </div>
-                        <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
+
+                        <!-- Radios -->
+                        <div class="toggle-subhead">Radios</div>
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
                             <span>Bluetooth</span>
                             <label class="switch"><input type="checkbox" id="btToggle" onchange="toggleBluetooth()"><span class="slider"></span></label>
                         </div>
-                        <div class="flex-row" style="justify-content: space-between; margin-bottom: 10px;">
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
                             <span>Bluetooth Discovery</span>
                             <label class="switch"><input type="checkbox" id="btDiscoveryToggle" onchange="toggleBluetoothDiscovery()"><span class="slider"></span></label>
                         </div>
-                        <div class="flex-row" data-tour="silent-row" style="justify-content: space-between; align-items: center;">
-                            <span title="Default ON. The USB PHY is dead at boot; HID attaches only when a script or Live typing needs it, then detaches.">Silent Startup (stealth HID)</span>
+
+                        <!-- Privacy / stealth -->
+                        <div class="toggle-subhead">Privacy &amp; stealth</div>
+                        <div class="flex-row" data-tour="silent-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <span title="When ON, the P4 starts up silently — no boot LED self-test or status blinks announce power-up. The HID keyboard still enumerates.">Silent Startup (stealth HID)</span>
                             <label class="switch"><input type="checkbox" id="silentToggle" onchange="toggleSilentStartup()"><span class="slider"></span></label>
                         </div>
-                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
-                            <span title="Roll a new random VID/PID at every boot (and every silent-HID re-attach that involves a reboot).">Randomize USB VID/PID</span>
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <span title="Roll a new random VID/PID at every boot so the host can't fingerprint the device by USB identity.">Randomize USB VID/PID</span>
                             <label class="switch"><input type="checkbox" id="rndUsbToggle" onchange="toggleRndUsb()"><span class="slider"></span></label>
                         </div>
-                        <!-- v4.12: MAC randomization on STA connect. Router only sees the random MAC. -->
-                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
                             <span title="When the ESP joins another WiFi network (via Internet Connection), use a fresh random MAC address instead of the factory one. Router can't track the ESP across networks by hardware address.">Randomize WiFi MAC (STA)</span>
                             <label class="switch"><input type="checkbox" id="rndMacToggle" onchange="toggleRndMac()"><span class="slider"></span></label>
                         </div>
-                        <!-- v4.5: "Allow COM connections" - enables USB CDC so PuTTY
-                             (or any COM-port terminal) can talk to the ESP over
-                             the host's COM port. HID + STORAGE are disabled while
-                             on (composite USB is CDC-only). Toggling reboots. -->
-                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-top: 10px;">
+
+                        <!-- System / connectivity -->
+                        <div class="toggle-subhead">System</div>
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <span>Logging</span>
+                            <label class="switch"><input type="checkbox" id="loggingToggle" onchange="toggleLogging()"><span class="slider"></span></label>
+                        </div>
+                        <div class="flex-row" style="justify-content: space-between; align-items: center; margin-bottom: 10px;">
                             <span title="Presents the ESP as a USB CDC serial device. Connect with PuTTY: Connection type = Serial, Serial line = the new COM port that appears in Device Manager, Speed = 115200. HID (keyboard) and STORAGE are DISABLED while this is on - reboot to re-enable them.">Allow COM connections</span>
                             <label class="switch"><input type="checkbox" id="comToggle" onchange="toggleCom()"><span class="slider"></span></label>
                         </div>
@@ -778,20 +789,32 @@
         // stays in sync.
         window.addEventListener('load', () => {
             const toggle = document.getElementById('ledToggle');
-            const row = toggle ? toggle.closest('.setting-row, .row, div') : null;
-            if (!row) return;
+            // Attach the picker AFTER the Hardware LED row inside the
+            // same setting-group. Old code did `row.appendChild(wrap)`
+            // which stuffed the button strip INTO the flex-row that
+            // uses `justify-content: space-between`, so the color
+            // buttons ended up overlapping the switch and label — the
+            // "Hardware LED" caption bled into the Color: row on the
+            // Settings tab. Sibling insert = clean row below.
+            const row = toggle ? toggle.closest('.flex-row, .setting-row, .row') : null;
+            const group = row ? row.parentElement : null;
+            if (!row || !group) return;
             if (document.getElementById('ledColorPicker')) return;
             const wrap = document.createElement('div');
             wrap.id = 'ledColorPicker';
-            wrap.style.cssText = 'display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; align-items:center;';
+            wrap.style.cssText =
+                'display:flex; gap:8px; margin-top:10px; margin-bottom:10px; ' +
+                'flex-wrap:wrap; align-items:center; padding: 8px 0; ' +
+                'border-top: 1px solid rgba(255,255,255,0.06);';
             wrap.innerHTML =
-                '<span style="color:var(--text-muted);font-size:13px">Color:</span>' +
+                '<span style="color:var(--text-muted);font-size:13px;flex:0 0 auto">Color:</span>' +
                 '<button class="control-btn" data-m="1" style="background:#4CAF50;color:#000">Green</button>' +
                 '<button class="control-btn" data-m="3" style="background:#f44336;color:#fff">Red</button>' +
                 '<button class="control-btn" data-m="4" style="background:#2196F3;color:#fff">Blue</button>' +
                 '<button class="control-btn" data-m="2">Key-flash</button>' +
-                '<span id="ledModeLabel" style="color:var(--text-muted);font-size:13px;margin-left:8px">mode: —</span>';
-            row.appendChild(wrap);
+                '<span id="ledModeLabel" style="color:var(--text-muted);font-size:13px;margin-left:8px;flex:1 1 auto;text-align:right">mode: —</span>';
+            // Sibling insert (not append into the flex-row).
+            row.parentNode.insertBefore(wrap, row.nextSibling);
             wrap.querySelectorAll('button[data-m]').forEach(b => {
                 b.addEventListener('click', () => {
                     fetch('/api/led-mode?m=' + b.dataset.m, {method:'POST'})

@@ -284,10 +284,53 @@ static const char *mime_for(const char *path) {
 // Stream a file from /spiffs into the response in 1 KB chunks. If the
 // file doesn't exist we return a 404 body the browser can display,
 // rather than the terse esp_http_server default.
+//
+// Special case: if the whole SPIFFS partition is empty (a partial or failed
+// storage.bin flash then got reformatted to blank by
+// format_if_mount_failed), every asset would 404 with a terse message the
+// user can't act on. Serve a self-contained HTML explanation instead — a
+// user reading THIS on 192.168.4.1 knows immediately that they need to
+// reflash the C6.
+extern volatile bool s_storage_empty;
+
 static esp_err_t serve_spiffs(httpd_req_t *r, const char *spiffs_path) {
     FILE *f = fopen(spiffs_path, "rb");
     if (!f) {
         ESP_LOGW(TAG, "serve_spiffs 404: %s", spiffs_path);
+        if (s_storage_empty) {
+            httpd_resp_set_status(r, "503 Service Unavailable");
+            httpd_resp_set_type(r, "text/html; charset=utf-8");
+            static const char body[] =
+              "<!doctype html><meta charset=utf-8>"
+              "<title>Storage partition empty</title>"
+              "<style>html,body{margin:0;background:#0f0f0f;color:#f5f5f7;"
+              "font:15px/1.5 -apple-system,Segoe UI,sans-serif;padding:32px;}"
+              "h1{color:#ff453a;margin:0 0 12px}code{background:#111;"
+              "border:1px solid #333;border-radius:4px;padding:2px 6px;}"
+              "a{color:#8ecaff}</style>"
+              "<h1>SPIFFS partition is empty.</h1>"
+              "<p>The C6 booted, but its storage partition has no assets. The "
+              "usual cause is a <b>storage.bin flash that was interrupted</b> "
+              "(the WebFlasher log will have ended with something like "
+              "<i>unknown system error</i> during the storage step, or the "
+              "flasher was closed before it finished).</p>"
+              "<p>On mount failure the C6 automatically reformatted the "
+              "partition to a blank SPIFFS so log persistence keeps working "
+              "&mdash; but that means every UI asset is gone.</p>"
+              "<p><b>Fix:</b> reopen the unified WebFlasher at "
+              "<a href=\"https://qwavey.github.io/flashers/esp32-p4-hub-keylogger/\">"
+              "qwavey.github.io/flashers/esp32-p4-hub-keylogger/</a>, flip U4 "
+              "back to <code>1</code>, hold <code>C6_BOOT</code>, and rerun "
+              "the <b>Flash C6</b> step. Watch the log &mdash; you want to see "
+              "<code>Wrote 2097152 bytes ... at 0x200000</code> followed by "
+              "<code>Leaving...</code>. If either is missing, retry once "
+              "more; sometimes the CH334 hub glitches the final ACK on the "
+              "first attempt.</p>"
+              "<p style=\"color:#8a8a8f;font-family:ui-monospace,monospace;font-size:12px\">"
+              "diagnostic: index.html is missing at /data/index.html; "
+              "esp_spiffs_info reports the storage partition mounted empty.</p>";
+            return httpd_resp_send(r, body, HTTPD_RESP_USE_STRLEN);
+        }
         httpd_resp_set_status(r, "404 Not Found");
         httpd_resp_set_type(r, "text/plain");
         return httpd_resp_send(r, "not on flash storage", -1);
@@ -592,25 +635,80 @@ static void execute_task(void *arg) {
             sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
             executed++;
         }
-        // SIZE_ commands (SIZE_512M, SIZE_1G, SIZE_2G, SIZE_4G, ..., SIZE_128G).
-        // Sets the FAKE capacity the MSC LUN reports. Real writes still
-        // land in the 16 MB partition — anything past that returns
-        // zeros / errors.
+        // "LED r g b" — steady arbitrary RGB (each 0..255), e.g. "LED 255 0 0".
+        // Checked before the LED_ branch; the 4th char is a space, not '_'.
+        else if (!strncasecmp(line, "LED", 3) && (line[3]==' ' || line[3]=='\t')) {
+            extern void led_user_rgb(uint8_t r, uint8_t g, uint8_t b);
+            int r = 0, g = 0, b = 0;
+            if (sscanf(line + 3, "%d %d %d", &r, &g, &b) == 3) {
+                r = r < 0 ? 0 : (r > 255 ? 255 : r);
+                g = g < 0 ? 0 : (g > 255 ? 255 : g);
+                b = b < 0 ? 0 : (b > 255 ? 255 : b);
+                led_user_rgb((uint8_t)r, (uint8_t)g, (uint8_t)b);
+                executed++;
+            }
+        }
+        // LED_<name> — named colours + modes. R/G/B/RED/GREEN/BLUE and
+        // KEYFLASH map to the 5 built-in modes; the rest (Y/W/C/M/O/P/A/V and
+        // full names) are rendered as exact RGB via led_user_rgb. LED_OFF/ON
+        // toggle the dedicated dark switch.
+        else if (!strncasecmp(line, "LED_", 4)) {
+            const char *tag = line + 4;
+            extern void led_user_mode_ext(uint8_t m);
+            extern void led_user_rgb(uint8_t r, uint8_t g, uint8_t b);
+            extern void led_set_off(bool off);
+            // Match helper: exact tag (case-insensitive) up to end/space.
+            #define LED_TAG_IS(s) (!strncasecmp(tag, s, strlen(s)) && \
+                                   (tag[strlen(s)]==0 || isspace((unsigned char)tag[strlen(s)])))
+            if      (LED_TAG_IS("R")   || LED_TAG_IS("RED"))     { led_set_off(false); led_user_mode_ext(3); executed++; }
+            else if (LED_TAG_IS("G")   || LED_TAG_IS("GREEN"))   { led_set_off(false); led_user_mode_ext(1); executed++; }
+            else if (LED_TAG_IS("B")   || LED_TAG_IS("BLUE"))    { led_set_off(false); led_user_mode_ext(4); executed++; }
+            else if (LED_TAG_IS("KEYFLASH"))                     { led_set_off(false); led_user_mode_ext(2); executed++; }
+            else if (LED_TAG_IS("Y")   || LED_TAG_IS("YELLOW"))  { led_user_rgb(255, 255, 0);   executed++; }
+            else if (LED_TAG_IS("W")   || LED_TAG_IS("WHITE"))   { led_user_rgb(255, 255, 255); executed++; }
+            else if (LED_TAG_IS("C")   || LED_TAG_IS("CYAN"))    { led_user_rgb(0,   255, 255); executed++; }
+            else if (LED_TAG_IS("M")   || LED_TAG_IS("MAGENTA")) { led_user_rgb(255, 0,   255); executed++; }
+            else if (LED_TAG_IS("O")   || LED_TAG_IS("ORANGE"))  { led_user_rgb(255, 90,  0);   executed++; }
+            else if (LED_TAG_IS("P")   || LED_TAG_IS("PURPLE"))  { led_user_rgb(140, 0,   255); executed++; }
+            else if (LED_TAG_IS("A")   || LED_TAG_IS("AMBER"))   { led_user_rgb(255, 120, 0);   executed++; }
+            else if (LED_TAG_IS("V")   || LED_TAG_IS("VIOLET"))  { led_user_rgb(160, 0,   255); executed++; }
+            else if (LED_TAG_IS("OFF"))                          { led_set_off(true);  executed++; }
+            else if (LED_TAG_IS("ON"))                           { led_set_off(false); executed++; }
+            #undef LED_TAG_IS
+        }
+        // SIZE_ commands — set the FAKE capacity the MSC LUN reports to the
+        // host, so Windows shows e.g. a 5 GB drive even though only 16 MB of
+        // real flash backs it (writes past the real end return zeros/errors).
+        // Accepts a number then an optional unit, with or without a space and
+        // with either the short (K/M/G/T) or long (KB/MB/GB/TB/B) form:
+        //   SIZE_5GB  SIZE_5G  SIZE_512MB  "SIZE_2 GB"  SIZE_1TB  SIZE_4096B
+        // The unit is read from the FIRST letter after the number — the old
+        // code keyed off the LAST letter, so "5GB" matched 'B' and set 5
+        // BYTES instead of 5 gigabytes.
         else if (!strncasecmp(line, "SIZE_", 5)) {
             const char *nm = line + 5;
-            uint64_t bytes = 0;
-            uint64_t num = strtoull(nm, NULL, 10);
-            // Unit suffix (last char) — M/G/T/K
-            char last = 0;
-            for (const char *q = nm; *q; q++) if (isalpha((unsigned char)*q)) last = (char)toupper((unsigned char)*q);
-            switch (last) {
-                case 'K': bytes = num * 1024ULL; break;
-                case 'M': bytes = num * 1024ULL * 1024ULL; break;
-                case 'G': bytes = num * 1024ULL * 1024ULL * 1024ULL; break;
-                case 'T': bytes = num * 1024ULL * 1024ULL * 1024ULL * 1024ULL; break;
-                default:  bytes = num; break;
+            char *endp = NULL;
+            uint64_t num = strtoull(nm, &endp, 10);
+            while (endp && (*endp == ' ' || *endp == '\t')) endp++;   // allow "SIZE_2 GB"
+            char unit = (endp && isalpha((unsigned char)*endp)) ? (char)toupper((unsigned char)*endp) : 'B';
+            uint64_t mult;
+            switch (unit) {
+                case 'K': mult = 1024ULL; break;
+                case 'M': mult = 1024ULL * 1024ULL; break;
+                case 'G': mult = 1024ULL * 1024ULL * 1024ULL; break;
+                case 'T': mult = 1024ULL * 1024ULL * 1024ULL * 1024ULL; break;
+                case 'B':
+                default:  mult = 1ULL; break;   // bare number or explicit "B" = bytes
             }
+            // Clamp to the 48 bits the 6-byte capacity register carries (~256 TB)
+            // so an absurd value can't overflow the multiply and wrap to a tiny
+            // size. The MSC capacity callback clamps the block count again.
+            const uint64_t MAX_BYTES = 0xFFFFFFFFFFFFULL;
+            uint64_t bytes = (num > MAX_BYTES / mult) ? MAX_BYTES : num * mult;
             for (int i = 0; i < 6; i++) sdio_slave_write_reg(SDIO_REG_SIZE_BASE + i, (bytes >> (8 * i)) & 0xFF);
+            // SIZE_ implies STORAGE on — make the volume visible so the host
+            // actually reads the faked capacity.
+            sdio_slave_write_reg(SDIO_REG_ATK_ON, 1);
             sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
             executed++;
         }
@@ -875,6 +973,26 @@ static void nvs_set_bool(const char *key, uint8_t v) {
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_wifi.h"
+#include "esp_heap_caps.h"
+#include "esp_ota_ops.h"
+#include "esp_image_format.h"
+#include "driver/temperature_sensor.h"
+
+// Lazily-installed on-chip temperature sensor. The old /api/stats hardcoded
+// cpuTempC:null so the UI showed "- - unread"; now we report the real die
+// temperature (°C) of the C6.
+static temperature_sensor_handle_t s_tsens = NULL;
+static float read_cpu_temp_c(void) {
+    if (!s_tsens) {
+        temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 100);
+        if (temperature_sensor_install(&cfg, &s_tsens) != ESP_OK) { s_tsens = NULL; return -1000.0f; }
+        temperature_sensor_enable(s_tsens);
+    }
+    float c = -1000.0f;
+    if (temperature_sensor_get_celsius(s_tsens, &c) != ESP_OK) return -1000.0f;
+    return c;
+}
+
 extern uint32_t s_sta_count;    // main.c
 extern bool     s_led_off;      // main.c (dedicated OFF switch)
 extern uint8_t  s_led_mode;     // main.c (color/pattern when not off)
@@ -883,6 +1001,8 @@ extern bool     s_auto_dl;      // main.c
 extern bool     s_held_enabled; // main.c
 extern uint8_t  s_layout;       // main.c
 extern volatile int s_wifi_up;  // main.c
+extern void     badusb_set_silent(bool on);  // main.c — Silent Startup setter
+extern bool     badusb_get_silent(void);     // main.c — Silent Startup getter
 static esp_err_t h_api_stats(httpd_req_t *r) {
     // SPIFFS
     size_t sp_total = 0, sp_used = 0;
@@ -894,20 +1014,49 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
     esp_chip_info_t ci = { 0 };
     esp_chip_info(&ci);
     uint32_t up_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-    uint32_t free_heap = esp_get_free_heap_size();
-    uint32_t min_free  = esp_get_minimum_free_heap_size();
-    // Total heap is free + a rough estimate of what's allocated. IDF
-    // doesn't expose "total heap" cheaply so we report free_heap +
-    // min_free as an approximation (better than "NaN KB").
-    uint32_t total_heap = free_heap + (free_heap - min_free);
+    uint32_t free_heap  = esp_get_free_heap_size();
+    // True total internal heap (accurate RAM readout, not the old free+delta
+    // guess that could read absurd values).
+    uint32_t total_heap = (uint32_t)heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    if (total_heap == 0) total_heap = free_heap;
 
-    char body[1024];
+    // App ("sketch") usage: real image length vs the app partition size, so
+    // the Settings "Flash used" tile shows a value instead of "-". The image
+    // size never changes at runtime, so compute it once and cache — /api/stats
+    // is polled every 5 s and esp_image_get_metadata does a flash read.
+    static uint32_t sketch_used = 0, sketch_total = 0, sketch_pct = 0;
+    static bool sketch_done = false;
+    if (!sketch_done) {
+        const esp_partition_t *run = esp_ota_get_running_partition();
+        if (run) {
+            sketch_total = run->size;
+            esp_partition_pos_t pos = { .offset = run->address, .size = run->size };
+            esp_image_metadata_t meta = { 0 };
+            if (esp_image_get_metadata(&pos, &meta) == ESP_OK && meta.image_len) {
+                sketch_used = meta.image_len;
+                sketch_pct  = sketch_total ? (uint32_t)((uint64_t)sketch_used * 100 / sketch_total) : 0;
+            }
+            sketch_done = true;   // partition found → cache even if metadata read failed
+        }
+    }
+
+    // On-chip die temperature (°C). NaN sentinel (-1000) → report null.
+    float temp_c = read_cpu_temp_c();
+    char tempbuf[16];
+    if (temp_c > -900.0f) snprintf(tempbuf, sizeof(tempbuf), "%.1f", temp_c);
+    else                  { tempbuf[0] = 'n'; tempbuf[1] = 'u'; tempbuf[2] = 'l'; tempbuf[3] = 'l'; tempbuf[4] = 0; }
+
+    // Roomy buffer: the JSON runs ~600 chars, but new fields were added and a
+    // truncated body is invalid JSON that breaks EVERY tile at once — cheap to
+    // over-provision. snprintf still bounds the write.
+    char body[1280];
     int n = snprintf(body, sizeof(body),
         "{"
         // --- CPU / RAM / flash / uptime (Settings System card) ---
-        "\"cpuMhz\":%u,\"cpuCores\":%u,\"cpuBusyPct\":0,\"cpuTempC\":null,"
+        "\"cpuMhz\":%u,\"cpuCores\":%u,\"cpuBusyPct\":0,\"cpuTempC\":%s,"
         "\"freeMemory\":%u,\"totalMemory\":%u,"
         "\"flashSize\":%u,\"sdUsed\":%u,\"sdTotal\":%u,"
+        "\"sketchSize\":%u,\"sketchTotal\":%u,\"sketchUsedPct\":%u,"
         "\"uptime\":%u,"
         // --- Stats tab tiles ---
         "\"errorCount\":0,\"totalScripts\":0,\"totalCommands\":0,"
@@ -928,6 +1077,7 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         // --- Recording / live / layout / held ---
         "\"recording\":%s,\"autoDownload\":%s,"
         "\"layout\":%u,\"heldEnabled\":%s,"
+        "\"silentStartup\":%s,"
         // --- Language + UI hide-list. We keep BT / MSC / attack-mode
         //     rows visible so the color picker etc. render; add "com"
         //     because we don't emulate a serial port. ---
@@ -936,9 +1086,11 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         "}",
         (unsigned)(ci.revision == 0 ? 160 : 160),
         (unsigned)ci.cores,
+        tempbuf,
         (unsigned)free_heap, (unsigned)total_heap,
         (unsigned)fl_bytes,
         (unsigned)sp_used, (unsigned)sp_total,
+        (unsigned)sketch_used, (unsigned)sketch_total, (unsigned)sketch_pct,
         (unsigned)up_s,
         (unsigned)s_sta_count,
         s_wifi_up == 1 ? "true" : "false",
@@ -947,7 +1099,8 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         s_recording ? "true" : "false",
         s_auto_dl ? "true" : "false",
         (unsigned)s_layout,
-        s_held_enabled ? "true" : "false");
+        s_held_enabled ? "true" : "false",
+        badusb_get_silent() ? "true" : "false");
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, body, n);
 }
@@ -987,6 +1140,31 @@ static esp_err_t h_api_toggle_led(httpd_req_t *r) {
     char body[48];
     int n = snprintf(body, sizeof(body),
         "{\"ledEnabled\":%s}", s_led_off ? "false" : "true");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+
+// Silent Startup (stealth). Persisted on the C6 and pushed to the P4 (reg
+// 61); the P4 stores it in its own NVS and skips the boot LED self-test on
+// the next power-up. body = {"enabled":true|false}. Returns the new state.
+static esp_err_t h_api_set_silent(httpd_req_t *r) {
+    if (r->method == HTTP_POST) {
+        char buf[64] = { 0 };
+        int cl = r->content_len < (int)sizeof(buf) - 1 ? r->content_len : (int)sizeof(buf) - 1;
+        int got = 0;
+        while (got < cl) {
+            int n = httpd_req_recv(r, buf + got, cl - got);
+            if (n <= 0) break;
+            got += n;
+        }
+        buf[got] = 0;
+        // Tiny JSON: look for "enabled":true/false (also accept "silent").
+        bool on = (strstr(buf, "true") != NULL);
+        badusb_set_silent(on);
+    }
+    char body[48];
+    int n = snprintf(body, sizeof(body),
+        "{\"ok\":true,\"silentStartup\":%s}", badusb_get_silent() ? "true" : "false");
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, body, n);
 }
@@ -1101,9 +1279,16 @@ static esp_err_t h_api_list_files(httpd_req_t *r) {
                 char probe[80];
                 int pn = snprintf(probe, sizeof(probe), "\"name\":\"%.*s\"", seg, name);
                 if (memmem(body, bl, probe, pn) != NULL) continue;
+                // The reference JS reads .name / .path / .isDirectory (see
+                // script.js refreshFileBrowser). We used to emit .isDir and
+                // no .path — the Explorer tab then rendered "undefined"
+                // handlers and every navigation broke. Emit BOTH the
+                // reference field names AND the shorter legacy ones so
+                // older JS keeps working too.
                 int nn = snprintf(body + bl, sizeof(body) - bl,
-                    "%s{\"name\":\"%.*s\",\"size\":0,\"isDir\":true}",
-                    first ? "" : ",", seg, name);
+                    "%s{\"name\":\"%.*s\",\"path\":\"%.*s\",\"size\":0,"
+                    "\"isDirectory\":true,\"isDir\":true}",
+                    first ? "" : ",", seg, name, seg, name);
                 if (nn < 0 || bl + nn >= (int)sizeof(body) - 2) break;
                 bl += nn; first = 0;
             } else {
@@ -1111,8 +1296,9 @@ static esp_err_t h_api_list_files(httpd_req_t *r) {
                 struct stat st;
                 long sz = (stat(full, &st) == 0) ? (long)st.st_size : 0;
                 int nn = snprintf(body + bl, sizeof(body) - bl,
-                    "%s{\"name\":\"%s\",\"size\":%ld,\"isDir\":false}",
-                    first ? "" : ",", name, sz);
+                    "%s{\"name\":\"%s\",\"path\":\"%s\",\"size\":%ld,"
+                    "\"isDirectory\":false,\"isDir\":false}",
+                    first ? "" : ",", name, name, sz);
                 if (nn < 0 || bl + nn >= (int)sizeof(body) - 2) break;
                 bl += nn; first = 0;
             }
@@ -1128,9 +1314,14 @@ static esp_err_t h_api_list_files(httpd_req_t *r) {
             char full[320]; snprintf(full, sizeof(full), "/data/%s", name);
             struct stat st;
             long sz = (!is_dir && stat(full, &st) == 0) ? (long)st.st_size : 0;
+            // Build the full path this entry represents (parent/name).
+            char childpath[128];
+            snprintf(childpath, sizeof(childpath), "%s/%.*s", p, seg, sub);
             int nn = snprintf(body + bl, sizeof(body) - bl,
-                "%s{\"name\":\"%.*s\",\"size\":%ld,\"isDir\":%s}",
-                first ? "" : ",", seg, sub, sz, is_dir ? "true" : "false");
+                "%s{\"name\":\"%.*s\",\"path\":\"%s\",\"size\":%ld,"
+                "\"isDirectory\":%s,\"isDir\":%s}",
+                first ? "" : ",", seg, sub, childpath, sz,
+                is_dir ? "true" : "false", is_dir ? "true" : "false");
             if (nn < 0 || bl + nn >= (int)sizeof(body) - 2) break;
             bl += nn; first = 0;
         }
@@ -1138,6 +1329,122 @@ static esp_err_t h_api_list_files(httpd_req_t *r) {
     closedir(d);
     body[bl++] = ']'; body[bl] = 0;
     return httpd_resp_send(r, body, bl);
+}
+
+// -------- /api/upload -------------------------------------------------
+// Accepts raw file bytes with the target filename in ?name=<x> (or the
+// content-disposition header). Writes to /data/<safe(name)>. Overwrites
+// silently — the Explorer tab prompts before calling this. The reference
+// UI POSTs via XMLHttpRequest with FormData; we skip multipart parsing
+// and honour the query name only, which is what the current script.js
+// uploadFile() sends anyway (see xhr.open('POST','/api/upload') then
+// xhr.send(formData) — the file body ends up as the whole request body
+// with our simple raw-passthrough here, filename read from ?name=).
+static esp_err_t h_api_upload(httpd_req_t *r) {
+    char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+    char nameraw[80] = { 0 };
+    httpd_query_key_value(q, "name", nameraw, sizeof(nameraw));
+    if (!nameraw[0]) {
+        // FormData wraps files in multipart/form-data — parse the first
+        // filename= tag out of the initial boundary block. Best-effort;
+        // if we can't find it we fall back to "upload.bin".
+        char preview[512]; int n = httpd_req_recv(r, preview, sizeof(preview) - 1);
+        if (n > 0) {
+            preview[n] = 0;
+            const char *fn = strstr(preview, "filename=\"");
+            if (fn) {
+                fn += 10;
+                int i = 0;
+                while (*fn && *fn != '"' && i < (int)sizeof(nameraw) - 1) nameraw[i++] = *fn++;
+                nameraw[i] = 0;
+            }
+        }
+    }
+    if (!nameraw[0]) strncpy(nameraw, "upload.bin", sizeof(nameraw));
+    char name[80]; safe_name(nameraw, name, sizeof(name));
+
+    char full[128]; snprintf(full, sizeof(full), "/data/%s", name);
+    FILE *f = fopen(full, "wb");
+    if (!f) { httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "open failed"); return ESP_OK; }
+    char buf[1024]; int total = 0;
+    while (1) {
+        int n = httpd_req_recv(r, buf, sizeof(buf));
+        if (n <= 0) break;
+        fwrite(buf, 1, n, f);
+        total += n;
+        if (total > 1024 * 1024) break;   // 1 MiB cap — SPIFFS is small
+    }
+    fclose(f);
+    httpd_resp_set_type(r, "application/json");
+    char resp[160];
+    int rn = snprintf(resp, sizeof(resp),
+        "{\"success\":true,\"name\":\"%s\",\"path\":\"%s\",\"bytes\":%d}",
+        name, name, total);
+    return httpd_resp_send(r, resp, rn);
+}
+
+// -------- /api/download ------------------------------------------------
+// GET ?path=<relative>. Streams /data/<path> back with a reasonable mime
+// type. Reuses serve_spiffs.
+static esp_err_t h_api_download(httpd_req_t *r) {
+    char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+    char pathq[128] = { 0 };
+    httpd_query_key_value(q, "path", pathq, sizeof(pathq));
+    if (!pathq[0]) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "missing path"); return ESP_OK; }
+    // Prevent traversal — reject any '..' segment or leading '/'.
+    if (strstr(pathq, "..") != NULL) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK; }
+    char *sp = pathq; while (*sp == '/') sp++;
+    char full[160]; snprintf(full, sizeof(full), "/data/%s", sp);
+    httpd_resp_set_hdr(r, "Content-Disposition", "attachment");
+    return serve_spiffs(r, full);
+}
+
+// -------- /api/rename --------------------------------------------------
+// POST body = {"from":"a","to":"b"} (or from=&to= query). SPIFFS's rename
+// is a copy + delete under the hood; we use libc rename() which works
+// on esp-idf's SPIFFS wrapper.
+static esp_err_t h_api_rename(httpd_req_t *r) {
+    char buf[512]; int n = 0;
+    if (r->content_len > 0 && r->content_len < (int)sizeof(buf)) {
+        n = httpd_req_recv(r, buf, r->content_len);
+    }
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    char fromq[128] = { 0 }, toq[128] = { 0 };
+    // Prefer JSON body {"from":"...","to":"..."}. Fallback to query.
+    const char *pf = strstr(buf, "\"from\"");
+    const char *pt = strstr(buf, "\"to\"");
+    if (pf && pt) {
+        pf = strchr(pf, ':'); if (pf) { pf++; while (*pf && isspace((unsigned char)*pf)) pf++; }
+        pt = strchr(pt, ':'); if (pt) { pt++; while (*pt && isspace((unsigned char)*pt)) pt++; }
+        if (pf && *pf == '"' && pt && *pt == '"') {
+            pf++; pt++;
+            int i = 0;
+            while (*pf && *pf != '"' && i < (int)sizeof(fromq) - 1) fromq[i++] = *pf++;
+            fromq[i] = 0;
+            i = 0;
+            while (*pt && *pt != '"' && i < (int)sizeof(toq) - 1) toq[i++] = *pt++;
+            toq[i] = 0;
+        }
+    }
+    if (!fromq[0] || !toq[0]) {
+        char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+        httpd_query_key_value(q, "from", fromq, sizeof(fromq));
+        httpd_query_key_value(q, "to",   toq,   sizeof(toq));
+    }
+    if (!fromq[0] || !toq[0]) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "need from + to"); return ESP_OK; }
+    if (strstr(fromq, "..") || strstr(toq, "..")) { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad path"); return ESP_OK; }
+    char *sf = fromq; while (*sf == '/') sf++;
+    char *st = toq;   while (*st == '/') st++;
+    char fromfull[160], tofull[160];
+    snprintf(fromfull, sizeof(fromfull), "/data/%s", sf);
+    snprintf(tofull,   sizeof(tofull),   "/data/%s", st);
+    int rc = rename(fromfull, tofull);
+    httpd_resp_set_type(r, "application/json");
+    if (rc == 0) return httpd_resp_send(r, "{\"success\":true}", 16);
+    char msg[128];
+    int mn = snprintf(msg, sizeof(msg), "{\"success\":false,\"error\":\"rename failed (%d)\"}", rc);
+    return httpd_resp_send(r, msg, mn);
 }
 
 // /api/validate-script — quick syntactic pass over the DuckyScript
@@ -1372,8 +1679,20 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/toggle-led",     HTTP_POST, h_api_toggle_led,    NULL, false, false, NULL},
         // /api/led-mode — set color (1=GREEN, 2=KEYFLASH, 3=RED, 4=BLUE).
         {"/api/led-mode",       HTTP_POST, h_api_led_mode,      NULL, false, false, NULL},
+        // /api/set-silent — real backend (Silent Startup, persisted + pushed to P4).
+        {"/api/set-silent",     HTTP_GET,  h_api_set_silent,    NULL, false, false, NULL},
+        {"/api/set-silent",     HTTP_POST, h_api_set_silent,    NULL, false, false, NULL},
         // /api/list-files — real SPIFFS enumeration for the Explorer tab.
         {"/api/list-files",     HTTP_GET,  h_api_list_files,    NULL, false, false, NULL},
+        // /api/upload — writes an uploaded file into /data/. Query
+        // ?name=X sets the target basename (or the first filename= in
+        // a multipart preamble). See h_api_upload above.
+        {"/api/upload",         HTTP_POST, h_api_upload,        NULL, false, false, NULL},
+        // /api/download — streams /data/<path?path=> back with an
+        // attachment content-disposition. Path-traversal guarded.
+        {"/api/download",       HTTP_GET,  h_api_download,      NULL, false, false, NULL},
+        // /api/rename — rename a file inside /data/ (JSON body or query).
+        {"/api/rename",         HTTP_POST, h_api_rename,        NULL, false, false, NULL},
         // /api/scan-wifi + /api/scan-results — real STA scan on the C6
         // (APSTA mode; the AP stays up the whole time).
         {"/api/scan-wifi",      HTTP_POST, h_api_scan_wifi,     NULL, false, false, NULL},
@@ -1427,7 +1746,7 @@ void badusb_ui_register(httpd_handle_t s) {
         // backend that flips led_set_off).
         "/api/save-settings", "/api/toggle-autoconnect",
         "/api/toggle-blink-on-run",
-        "/api/toggle-logging", "/api/toggle-wifi", "/api/set-silent",
+        "/api/toggle-logging", "/api/toggle-wifi",
         // Boot-script slot
         "/api/set-boot-script", "/api/test-boot-script",
         // Extensions store (Hak5's remote payload feed)
@@ -1435,11 +1754,11 @@ void badusb_ui_register(httpd_handle_t s) {
         "/api/save-extension", "/api/delete-extension",
         "/api/pull-extension",
         // File explorer that isn't backed by real FS ops yet
-        // (/api/list-files is REAL — registered above)
-        "/api/download", "/api/upload",
+        // (/api/list-files, /api/upload, /api/download, /api/rename are
+        // REAL — registered above).
         "/api/copy-file", "/api/cut-file", "/api/paste-file",
         "/api/create-directory", "/api/check-file", "/api/file-info",
-        "/api/use-file", "/api/rename",
+        "/api/use-file",
         // Alias for the older `/api/self-destruct` path some JS still
         // uses (parallel to the canonical `/selfdestruct`).
         "/api/self-destruct",

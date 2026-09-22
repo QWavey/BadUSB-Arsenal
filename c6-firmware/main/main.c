@@ -78,6 +78,7 @@ static const char *TAG = "c6ui";
 #define NVS_K_HELD       "heldon"    // whether HELD KEY events are surfaced
 #define NVS_K_BOOTTR     "boottr"
 #define NVS_K_LAYOUT     "layout"
+#define NVS_K_SILENT     "silent"    // Silent Startup (stealth) — suppress P4 boot LED self-test
 
 // LED modes must match firmware/main/led.h
 #define LED_MODE_OFF       0
@@ -90,6 +91,11 @@ static const char *TAG = "c6ui";
 // (28..31 are the interrupt registers).
 #define SDIO_REG_LED_MODE  40
 #define SDIO_REG_LAYOUT    41   // 0=US 1=DE 2=UK (matches P4 kb_layout_t)
+#define SDIO_REG_SILENT    61   // Silent Startup: 1 = P4 skips boot LED self-test (persisted P4-side)
+// Custom-RGB colour bytes, read by the P4 only when reg 40 (mode) == 5.
+#define SDIO_REG_LED_R     62
+#define SDIO_REG_LED_G     63
+#define SDIO_REG_LED_B     43
 // BadUSB live-type transport: C6 writes an ASCII byte (1..127) that the
 // P4 side (live_type.c) reads via SDIO Function 1, then clears back to 0
 // once it has enqueued the corresponding HID keydown/keyup pair.
@@ -123,6 +129,11 @@ static bool s_warned_pending_dl = false;
 uint32_t s_sta_count = 0;
 // Non-static so badusb_ui.c's /api/stats can read the current mode.
 uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
+// Custom-RGB state: when s_led_custom is set, the effective LED mode is 5 and
+// the P4 renders exactly (s_cr,s_cg,s_cb). Set by DuckyScript "LED r g b" /
+// LED_Y / LED_W etc. Not persisted — a colour picked live isn't a saved mode.
+static bool    s_led_custom = false;
+static uint8_t s_cr = 0, s_cg = 0, s_cb = 0;
 // Exposed non-static so badusb_ui.c's /api/toggle-led + /api/stats can
 // read (and, via led_set_off below, flip) the LED-off switch — the
 // ported UI's Settings tab has its own hardware-LED toggle that we
@@ -130,6 +141,11 @@ uint8_t  s_led_mode = LED_MODE_KEYFLASH;   // saved USER color/pattern (1..4)
 bool     s_led_off  = false;                // dedicated OFF switch — when true the LED is dark and the mode dropdown is disabled in the web UI
 bool     s_held_enabled = false;            // whether HELD KEY events are shown/logged (default OFF) — extern for /api/stats
 uint8_t  s_layout   = 0;                    // keyboard layout, pushed to P4 reg 41 — extern for /api/stats
+// Silent Startup (stealth): when true, the P4 skips its boot LED self-test
+// (the 3 green blinks) on the NEXT power-up so the device doesn't visibly
+// announce itself. Pushed to P4 reg 61; the P4 persists it in its own NVS
+// and reads it at led_init(). extern for badusb_ui.c's /api/set-silent.
+bool     s_silent   = false;
 static volatile uint8_t s_led_disp = LED_MODE_KEYFLASH; // what's currently on reg 40
 static SemaphoreHandle_t s_led_lock;
 static volatile int  s_bootphase = 0;
@@ -165,6 +181,7 @@ static void nvs_load_settings(void) {
     if (nvs_get_u8(h, NVS_K_LEDOFF,  &v) == ESP_OK) s_led_off       = v ? true : false;
     if (nvs_get_u8(h, NVS_K_HELD,    &v) == ESP_OK) s_held_enabled  = v ? true : false;
     if (nvs_get_u8(h, NVS_K_LAYOUT,  &v) == ESP_OK) s_layout        = v > 2 ? 0 : v;
+    if (nvs_get_u8(h, NVS_K_SILENT,  &v) == ESP_OK) s_silent        = v ? true : false;
     nvs_close(h);
 }
 static void nvs_save_settings(void) {
@@ -176,6 +193,7 @@ static void nvs_save_settings(void) {
     nvs_set_u8(h, NVS_K_LEDOFF,  s_led_off       ? 1 : 0);
     nvs_set_u8(h, NVS_K_HELD,    s_held_enabled  ? 1 : 0);
     nvs_set_u8(h, NVS_K_LAYOUT,  s_layout);
+    nvs_set_u8(h, NVS_K_SILENT,  s_silent        ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -223,16 +241,35 @@ static void led_fail_code(uint8_t code) {
     sdio_slave_write_reg(42, code);
     ESP_LOGE(TAG, "locked failure code %u", (unsigned)code);
 }
+// Push the three custom-RGB colour bytes to the P4 (regs 62/63/43). The P4
+// only reads them when the mode byte is 5, so this is harmless otherwise.
+static void push_rgb(void) {
+    sdio_slave_write_reg(SDIO_REG_LED_R, s_cr);
+    sdio_slave_write_reg(SDIO_REG_LED_G, s_cg);
+    sdio_slave_write_reg(SDIO_REG_LED_B, s_cb);
+}
+
 // Compute what SHOULD be on reg 40 right now: OFF if the user's dedicated
-// switch is on, otherwise the user's chosen color/pattern mode. Updates
-// s_led_disp under the lock and writes reg 40 immediately.
+// switch is on, 5 (custom) if a raw RGB colour is active, otherwise the
+// user's chosen color/pattern mode. Updates s_led_disp and writes reg 40.
 static void led_apply_effective(void) {
     uint8_t effective;
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
-    effective = s_led_off ? LED_MODE_OFF : s_led_mode;
+    effective = s_led_off ? LED_MODE_OFF : (s_led_custom ? 5 : s_led_mode);
     s_led_disp = effective;
     xSemaphoreGive(s_led_lock);
+    if (effective == 5) push_rgb();      // colour bytes before the mode flip
     led_write_reg(effective);
+}
+
+// DuckyScript "LED r g b" / LED_Y / LED_W etc. — steady arbitrary colour.
+void led_user_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    xSemaphoreTake(s_led_lock, portMAX_DELAY);
+    s_cr = r; s_cg = g; s_cb = b;
+    s_led_custom = true;
+    s_led_off    = false;
+    xSemaphoreGive(s_led_lock);
+    led_apply_effective();
 }
 
 // Adopt the user's saved color/pattern mode (web /led?m= endpoint or post-
@@ -245,8 +282,9 @@ static void led_apply_effective(void) {
 static void led_user_mode(uint8_t m) {
     if (m < LED_MODE_GREEN || m > LED_MODE_BLUE) return;   // reject OFF and out-of-range
     xSemaphoreTake(s_led_lock, portMAX_DELAY);
-    s_led_mode = m;
-    s_led_off  = false;
+    s_led_mode   = m;
+    s_led_custom = false;    // picking a named mode leaves custom-RGB
+    s_led_off    = false;
     xSemaphoreGive(s_led_lock);
     led_apply_effective();
     nvs_save_settings();
@@ -293,6 +331,10 @@ static void led_task(void *arg) {
         xSemaphoreTake(s_led_lock, portMAX_DELAY);
         m = s_led_disp;
         xSemaphoreGive(s_led_lock);
+        // For custom RGB, keep the colour bytes fresh every tick so a P4-side
+        // link recovery (which zeroes the slave scratch) can't drop us to
+        // black — the P4 re-reads them whenever the mode byte is 5.
+        if (m == 5) push_rgb();
         if (m != last) { led_write_reg(m); last = m; }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -303,6 +345,23 @@ static void push_layout(void) {
     esp_err_t err = sdio_slave_write_reg(SDIO_REG_LAYOUT, s_layout);
     if (err != ESP_OK) ESP_LOGW(TAG, "layout reg write: %s", esp_err_to_name(err));
 }
+
+// Silent Startup -> reg 61. The P4 persists this in its own NVS and reads it
+// at led_init() on the NEXT boot to decide whether to run the LED self-test.
+// Pushed once at boot (so the P4's copy tracks ours) and again on every change.
+static void push_silent(void) {
+    esp_err_t err = sdio_slave_write_reg(SDIO_REG_SILENT, s_silent ? 1 : 0);
+    if (err != ESP_OK) ESP_LOGW(TAG, "silent reg write: %s", esp_err_to_name(err));
+}
+
+// Called by badusb_ui.c's /api/set-silent handler to change the setting.
+void badusb_set_silent(bool on) {
+    s_silent = on;
+    nvs_save_settings();
+    push_silent();
+    ESP_LOGI(TAG, "Silent Startup %s", on ? "on" : "off");
+}
+bool badusb_get_silent(void) { return s_silent; }
 
 static size_t file_size(const char *path) {
     struct stat st;
@@ -891,11 +950,20 @@ static esp_err_t http_up(void) {
 }
 
 // ------------------------- storage ------------------------------------
+// True when SPIFFS came up empty at boot (partial/failed storage.bin flash
+// → mount checksum fails → format_if_mount_failed reformats to empty). The
+// UI serve path checks this so users see "reflash storage.bin", not
+// "not on flash storage" 404s.
+volatile bool s_storage_empty = false;
+
 static esp_err_t storage_up(void) {
     esp_vfs_spiffs_conf_t cfg = {
         .base_path = LOG_MOUNT,
         .partition_label = "storage",
         .max_files = 4,
+        // Keep format-on-failure so the log-persistence path (log.txt,
+        // ducky/, etc.) always has a writable filesystem. But note it below
+        // and expose it — a reformatted partition is silent otherwise.
         .format_if_mount_failed = true,
     };
     esp_err_t err = esp_vfs_spiffs_register(&cfg);
@@ -903,6 +971,18 @@ static esp_err_t storage_up(void) {
     size_t total = 0, used = 0;
     esp_spiffs_info("storage", &total, &used);
     ESP_LOGI(TAG, "SPIFFS %u/%u bytes used", (unsigned)used, (unsigned)total);
+
+    // A freshly-formatted SPIFFS reports a few hundred bytes of internal
+    // bookkeeping used but has NO app-shipped assets. Signal this so the
+    // UI serves an explanatory page instead of blank 404s.
+    struct stat st;
+    if (stat(LOG_MOUNT "/index.html", &st) != 0) {
+        s_storage_empty = true;
+        ESP_LOGE(TAG, "SPIFFS is empty (no index.html at %s). Storage.bin was "
+                      "never flashed, or the last flash was interrupted "
+                      "(format_if_mount_failed then wiped it). Reflash the C6.",
+                      LOG_MOUNT);
+    }
     return ESP_OK;
 }
 
@@ -1051,6 +1131,7 @@ void app_main(void) {
         boot_trace(BOOT_PHASE_SDIO_UP);
         led_phase(LED_MODE_GREEN);        // alive + SDIO enumerated
         push_layout();                    // runtime layout reaches the P4 at boot
+        push_silent();                    // sync the P4's Silent-Startup copy
     }
 
     // LED wire owner first so boot telemetry is on reg 40 before the wifi

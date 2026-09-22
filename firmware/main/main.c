@@ -191,40 +191,73 @@ static tusb_desc_device_t device_desc = {
     TUD_IAD_DESC_LEN, TUSB_DESC_INTERFACE_ASSOCIATION,                               \
     _first_itf, _itf_count, _class, _subclass, _protocol, _stridx
 
-// Total config length = config header + 2×(IAD + HID interface descriptor)
-//                     + MSC interface descriptor (bulk IN + bulk OUT)
-// TinyUSB provides TUD_MSC_DESCRIPTOR (9 iface + 2×7 endpoints = 23).
-#define CFG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + \
-                       TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
-                       TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
-                       TUD_MSC_DESC_LEN)
+// Two configuration variants, swapped LIVE (no reboot):
+//
+//   HID-only : 2 interfaces (kbd + mouse). NO MSC interface, so the host
+//              never creates a drive letter. Default (ATTACKMODE HID).
+//   Full     : 3 interfaces (kbd + mouse + MSC). ATTACKMODE HID STORAGE.
+//
+// esp_tinyusb stores ONE descriptor pointer at install time and hands it
+// back from tud_descriptor_configuration_cb. We give it a single mutable
+// buffer (s_cfg_desc) sized for the FULL variant and rewrite its bytes when
+// storage is toggled: the host reads only wTotalLength bytes, so writing the
+// HID-only header (2 interfaces, shorter length) hides MSC even though the
+// buffer is physically longer. Toggling then does tud_disconnect() → rewrite
+// → tud_connect(), so the host re-enumerates with the new interface set
+// WITHOUT a chip reboot — a reboot mid-payload would drop the SDIO link and
+// kill the running DuckyScript (that was the ATTACKMODE-toggle crash).
+#define CFG_TOTAL_LEN_FULL (TUD_CONFIG_DESC_LEN + \
+                            TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
+                            TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
+                            TUD_MSC_DESC_LEN)
+#define CFG_TOTAL_LEN_HID  (TUD_CONFIG_DESC_LEN + \
+                            TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN + \
+                            TUD_IAD_DESC_LEN + TUD_HID_DESC_LEN)
 
-static const uint8_t configuration_desc[] = {
-    // Configuration header: 3 interfaces (kbd + mouse + MSC), no string,
-    // total length, attributes, power draw. The MSC interface stays in
-    // the descriptor at all times — msc_storage.c reports "no media"
-    // when the user has ATTACKMODE HID (STORAGE off), so Windows just
-    // shows the drive letter as empty rather than us re-enumerating on
-    // every toggle.
-    TUD_CONFIG_DESCRIPTOR(1, 3, 0, CFG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
+// Shared HID block (keyboard iface 0 + mouse iface 1). Same bytes in both
+// variants — only the config header's interface count/length and the
+// trailing MSC interface differ.
+#define HID_IFACE_BLOCK \
+    TUD_IAD_DESCRIPTOR(0, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_KEYBOARD, 0), \
+    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof(hid_keyboard_report_desc), 0x81, 16, 1), \
+    TUD_IAD_DESCRIPTOR(1, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_MOUSE, 0), \
+    TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_MOUSE, sizeof(hid_mouse_report_desc), 0x82, 16, 1)
 
-    // --- Keyboard function (interface 0) ---
-    // IAD: first_iface=0, count=1, class=HID(0x03), subclass=Boot(0x01), proto=Keyboard(0x01)
-    TUD_IAD_DESCRIPTOR(0, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_KEYBOARD, 0),
-    // HID interface descriptor — bInterval = 1 ms (fastest legal FS poll,
-    // matches the pre-composite baseline for minimum keystroke latency).
-    TUD_HID_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof(hid_keyboard_report_desc), 0x81, 16, 1),
-
-    // --- Mouse function (interface 1) ---
-    // IAD: first_iface=1, count=1, class=HID(0x03), subclass=Boot(0x01), proto=Mouse(0x02)
-    TUD_IAD_DESCRIPTOR(1, 1, TUSB_CLASS_HID, HID_SUBCLASS_BOOT, HID_ITF_PROTOCOL_MOUSE, 0),
-    // HID interface descriptor — 1 ms poll (see above).
-    TUD_HID_DESCRIPTOR(1, 0, HID_ITF_PROTOCOL_MOUSE, sizeof(hid_mouse_report_desc), 0x82, 16, 1),
-
-    // --- Mass Storage function (interface 2) ---
-    // interface, str-idx, bulk-OUT ep, bulk-IN ep, ep size.
+// Const templates memcpy'd into the mutable active buffer.
+static const uint8_t configuration_desc_full[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 3, 0, CFG_TOTAL_LEN_FULL, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
+    HID_IFACE_BLOCK,
     TUD_MSC_DESCRIPTOR(2, 0, 0x03, 0x83, 64),
 };
+static const uint8_t configuration_desc_hidonly[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 2, 0, CFG_TOTAL_LEN_HID, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
+    HID_IFACE_BLOCK,
+};
+
+// The live buffer esp_tinyusb keeps a pointer to. Sized for the full variant;
+// HID-only just writes fewer meaningful bytes (host honours wTotalLength).
+static uint8_t s_cfg_desc[sizeof(configuration_desc_full)];
+static bool    s_storage_visible = false;   // what s_cfg_desc currently reflects
+
+// Fill s_cfg_desc with the requested variant. Pointer/identity is stable so
+// the pointer esp_tinyusb holds stays valid across swaps.
+static void build_config_desc(bool with_msc) {
+    if (with_msc) memcpy(s_cfg_desc, configuration_desc_full,    sizeof(configuration_desc_full));
+    else          memcpy(s_cfg_desc, configuration_desc_hidonly, sizeof(configuration_desc_hidonly));
+    s_storage_visible = with_msc;
+}
+
+// Live toggle of the MSC volume without a chip reboot. Called from the
+// ATTACKMODE STORAGE handler (via live_type.c). Re-enumerates so the host
+// adds/removes the drive letter; the running DuckyScript keeps going.
+void usb_apply_storage_visibility(bool on) {
+    if (on == s_storage_visible) return;   // no change → nothing to do
+    ESP_LOGI(TAG, "USB storage %s — live re-enumerating (no reboot)", on ? "on" : "off");
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(120));      // let the host notice the unplug
+    build_config_desc(on);
+    tud_connect();
+}
 
 // TinyUSB required callbacks
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
@@ -479,8 +512,14 @@ void app_main(void) {
         .string_descriptor = string_desc,
         .string_descriptor_count = sizeof(string_desc) / sizeof(string_desc[0]),
         .external_phy = false,
-        .configuration_descriptor = configuration_desc,
+        // Expose the MSC volume ONLY when ATTACKMODE STORAGE is persisted on;
+        // otherwise enumerate HID-only so no drive letter ever appears. The
+        // buffer is mutable so a later ATTACKMODE toggle can swap it live.
+        .configuration_descriptor = s_cfg_desc,
     };
+    build_config_desc(msc_storage_enabled());
+    ESP_LOGI(TAG, "USB descriptor: %s",
+             msc_storage_enabled() ? "HID + MSC (storage on)" : "HID-only (storage off)");
     ESP_ERROR_CHECK(tinyusb_driver_install(&tcfg));
     ESP_LOGI(TAG, "TinyUSB HID device up (FS port -> PC)");
     c6_uart_send_evt("USB_UP");

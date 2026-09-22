@@ -24,6 +24,7 @@
 
 #include "tinyusb.h"
 #include "class/msc/msc.h"
+#include "class/msc/msc_device.h"  // tud_msc_set_sense (missing from msc.h)
 
 static const char *TAG = "msc";
 
@@ -31,7 +32,12 @@ static const char *TAG = "msc";
 static wl_handle_t s_wl = WL_INVALID_HANDLE;
 static uint32_t    s_sector_size = 4096;
 static uint32_t    s_sector_count = 0;   // real geometry
-static bool        s_enabled = true;     // ATTACKMODE STORAGE default
+// ATTACKMODE STORAGE default: OFF. Hak5 semantics — a bare ATTACKMODE HID
+// means keyboard + mouse ONLY, with no exposed volume; only ATTACKMODE HID
+// STORAGE (or SIZE_* which implies STORAGE) makes the 16 MB payload volume
+// visible to the host. Historically this defaulted to on and the drive
+// popped up on first plug even when no ducky script had run — a data leak.
+static bool        s_enabled = false;
 static uint64_t    s_fake_capacity = 0;  // 0 = report real geometry
 
 // -------- boot init: mount the wear-leveled partition ------------------
@@ -55,10 +61,11 @@ esp_err_t msc_storage_init(void) {
     s_sector_size  = wl_sector_size(s_wl);
     s_sector_count = wl_size(s_wl) / s_sector_size;
 
-    // Restore user preferences.
+    // Restore user preferences. Default = OFF when no NVS entry exists
+    // (see the "ATTACKMODE STORAGE default: OFF" note at s_enabled).
     nvs_handle_t h;
     if (nvs_open("msc", NVS_READONLY, &h) == ESP_OK) {
-        uint8_t on = 1;
+        uint8_t on = 0;
         nvs_get_u8(h, "on", &on);
         s_enabled = on != 0;
         uint64_t cap = 0;
