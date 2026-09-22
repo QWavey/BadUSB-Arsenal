@@ -28,9 +28,10 @@
 #include "nvs.h"
 #include "msc_storage.h"
 
-// Defined in main.c — swaps the USB config descriptor live (no reboot) so the
-// MSC volume appears/disappears on ATTACKMODE STORAGE toggles.
-extern void usb_apply_storage_visibility(bool on);
+// Defined in main.c — live USB descriptor control (no reboot).
+extern void usb_apply_storage_visibility(bool on);  // add/remove the MSC interface
+extern bool usb_storage_visible(void);              // is MSC currently attached?
+extern void usb_force_reenumerate(void);            // refresh host (re-read capacity)
 
 extern QueueHandle_t g_hid_bridge_q;   // main.c
 extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
@@ -192,12 +193,29 @@ static void live_type_task(void *arg) {
             for (int i = 0; i < 6; i++) sdmmc_io_read_byte(card, 1, BADUSB_SIZE_BASE_ADDR + i, &s[i]);
             uint64_t bytes = 0;
             for (int i = 0; i < 6; i++) bytes |= ((uint64_t)s[i]) << (8 * i);
+
+            // Detect a capacity change so a SIZE_ issued while the drive is
+            // already attached re-attaches at the new size.
+            static uint64_t s_last_cap = 0;
+            static bool     s_have_cap = false;
+            bool cap_changed = (!s_have_cap || bytes != s_last_cap);
+            s_last_cap = bytes;
+            s_have_cap = true;
+
+            bool was_visible = usb_storage_visible();
             msc_storage_set_fake_capacity(bytes);
             msc_storage_set_enabled(want);
             sdmmc_io_write_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, 0, NULL);
-            // Live re-enumerate to add/remove the drive — NO reboot, so the
-            // running DuckyScript (DELAY/GUI/… after ATTACKMODE) keeps going.
-            usb_apply_storage_visibility(want);
+
+            if (want != was_visible) {
+                // Storage turned on or off → add/remove the MSC interface.
+                usb_apply_storage_visibility(want);
+            } else if (want && cap_changed) {
+                // Already attached, only the size changed → detach + re-attach
+                // so Windows re-reads READ CAPACITY instead of caching the old
+                // (e.g. 16 MB) size. This is the SIZE_-after-STORAGE case.
+                usb_force_reenumerate();
+            }
         }
 
         // Silent Startup (reg 61): the C6 pushes 0/1 here at its boot and on

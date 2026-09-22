@@ -259,6 +259,22 @@ void usb_apply_storage_visibility(bool on) {
     tud_connect();
 }
 
+// Is the MSC volume currently exposed to the host?
+bool usb_storage_visible(void) { return s_storage_visible; }
+
+// Force a re-enumeration WITHOUT changing the interface set — same
+// descriptor, but the host re-reads the device (including READ CAPACITY,
+// so a new SIZE_ takes effect). Used when the fake MSC capacity changes
+// while the volume is already attached: detach, then re-attach so Windows
+// picks up the new drive size instead of caching the old one.
+void usb_force_reenumerate(void) {
+    if (!s_storage_visible) return;      // nothing attached to refresh
+    ESP_LOGI(TAG, "USB re-enumerate (capacity change)");
+    tud_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(120));
+    tud_connect();
+}
+
 // TinyUSB required callbacks
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
     // instance 0 = keyboard interface, instance 1 = mouse interface

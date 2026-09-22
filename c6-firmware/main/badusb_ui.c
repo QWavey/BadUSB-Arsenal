@@ -706,9 +706,11 @@ static void execute_task(void *arg) {
             const uint64_t MAX_BYTES = 0xFFFFFFFFFFFFULL;
             uint64_t bytes = (num > MAX_BYTES / mult) ? MAX_BYTES : num * mult;
             for (int i = 0; i < 6; i++) sdio_slave_write_reg(SDIO_REG_SIZE_BASE + i, (bytes >> (8 * i)) & 0xFF);
-            // SIZE_ implies STORAGE on — make the volume visible so the host
-            // actually reads the faked capacity.
-            sdio_slave_write_reg(SDIO_REG_ATK_ON, 1);
+            // SIZE_ sets the reported capacity WITHOUT changing the storage
+            // on/off state — it leaves ATK_ON alone. The commit tells the P4
+            // to re-read the size: if the volume is currently attached it
+            // detaches and re-attaches at the new size; if it's off, the size
+            // is just remembered for the next ATTACKMODE ... STORAGE.
             sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
             executed++;
         }
