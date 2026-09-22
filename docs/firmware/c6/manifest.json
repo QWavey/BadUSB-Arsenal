@@ -1,0 +1,16 @@
+{
+  "name": "ESP32-P4 BadUSB — C6 firmware",
+  "version": "badusb-port",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-C6",
+      "parts": [
+        { "path": "bootloader.bin",       "offset":       0 },
+        { "path": "partition-table.bin",  "offset":  32768 },
+        { "path": "app.bin",              "offset":  65536 },
+        { "path": "storage.bin",          "offset": 2097152 }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-P4 BadUSB — Web Flasher</title>
+<!-- ESP Web Tools handles the WebSerial + esptool.js bundle in one component;
+     works in any Chromium-based browser (Chrome, Edge, Opera, Brave, Arc, ...). -->
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+    :root{
+        color-scheme:dark;
+        --bg:#0f0f0f; --fg:#fff; --muted:#b0b0b0;
+        --primary:#4CAF50; --danger:#f44336; --accent:#2196F3;
+        --card:rgba(45,45,45,.7); --bd:rgba(255,255,255,.1);
+        --code:#0b0e13;
+    }
+    html,body{background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,Segoe UI,sans-serif;margin:0}
+    .wrap{max-width:820px;margin:0 auto;padding:24px}
+    h1{margin:0 0 4px;font-size:26px}
+    h2{margin:28px 0 10px;font-size:18px;color:var(--primary);letter-spacing:.4px;text-transform:uppercase}
+    .sub{color:var(--muted);font-size:14px;margin-bottom:24px}
+    .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:20px;margin-bottom:16px}
+    .step{display:flex;gap:14px;align-items:flex-start;margin:12px 0}
+    .num{flex:0 0 34px;height:34px;border-radius:50%;background:var(--primary);color:#000;font-weight:700;
+         display:flex;align-items:center;justify-content:center;font-size:15px}
+    .note{background:rgba(244,67,54,.14);border:1px solid rgba(244,67,54,.4);border-radius:8px;
+          padding:10px 14px;color:#ffb7b0;font-size:14px;margin:14px 0}
+    .info{background:rgba(33,150,243,.14);border:1px solid rgba(33,150,243,.4);border-radius:8px;
+          padding:10px 14px;color:#bbdefb;font-size:14px;margin:14px 0}
+    kbd{background:var(--code);border:1px solid var(--bd);border-radius:4px;padding:2px 6px;font-family:ui-monospace,Menlo,monospace;font-size:13px}
+    esp-web-install-button{display:inline-block;--esp-tools-button-color:var(--fg);
+                           --esp-tools-button-text-color:#000;--esp-tools-button-border-color:var(--primary)}
+    esp-web-install-button::part(button){
+        background:var(--primary);color:#000;padding:10px 22px;border-radius:8px;font-weight:600;
+        border:1px solid var(--primary);cursor:pointer;font:inherit}
+    esp-web-install-button::part(button):hover{background:#66bb6a;border-color:#66bb6a}
+    .badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;letter-spacing:.4px;text-transform:uppercase;background:rgba(255,255,255,.08);color:var(--muted)}
+    a{color:var(--accent)}
+    ol.pins{margin:8px 0 0;padding-left:20px}
+    ol.pins li{margin:4px 0}
+    hr{border:0;border-top:1px solid var(--bd);margin:22px 0}
+    .flash-row{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:8px 0 4px}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <h1>ESP32-P4 BadUSB — Web Flasher</h1>
+    <div class="sub">Ports of QWavey's <a href="https://github.com/QWavey/esp32-p4-hub-keylogger">esp32-p4-hub-keylogger</a> for the Spotpear ESP32-P4-MINI-B-M-EXT (P4 N32R32 + on-board C6). Flash both chips right from your browser — no esptool, no IDF.</div>
+
+    <div class="note">
+        <b>Order matters.</b> Flash the <b>P4 first</b>, then the <b>C6</b>. Don't skip the switch position or the boot-hold — the CH334 hub on the board multiplexes the USB port and the wrong combo will silently fail.
+    </div>
+
+    <div class="card">
+        <h2>Step 1 &nbsp;—&nbsp; Flash the P4</h2>
+        <div class="step">
+            <div class="num">1</div>
+            <div>
+                <b>Set the U4 switch to <span class="badge">FLASH / 0</span></b> (the position that routes the core Type-C to the P4's USB-Serial-JTAG). This is the P4 flashing position.
+            </div>
+        </div>
+        <div class="step">
+            <div class="num">2</div>
+            <div>
+                <b>Hold <kbd>BOOT</kbd> on the P4</b>, tap <kbd>RESET</kbd> (or plug the cable in while holding BOOT), then release <kbd>BOOT</kbd>. The P4 is now in the ROM boot loader — Windows / macOS enumerates it as a serial device (COMxx / /dev/tty.usbmodem*).
+            </div>
+        </div>
+        <div class="step">
+            <div class="num">3</div>
+            <div>
+                Click the button, pick the port that just appeared, and let it write. About 15 seconds.
+                <div class="flash-row" style="margin-top:12px">
+                    <esp-web-install-button manifest="firmware/p4/manifest.json"></esp-web-install-button>
+                    <span class="badge">chip family: ESP32-P4</span>
+                </div>
+            </div>
+        </div>
+        <div class="step">
+            <div class="num">4</div>
+            <div>
+                When it says "Installation complete", tap <kbd>RESET</kbd> on the P4 (no BOOT this time). The status LED does 3 green blinks then dim green — that's the P4 online.
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Step 2 &nbsp;—&nbsp; Flash the C6</h2>
+        <div class="step">
+            <div class="num">1</div>
+            <div>
+                <b>Move the U4 switch to <span class="badge">position 1</span></b> — this routes the Type-C to the on-board ESP32-C6-MINI-1 for programming. The C6 is now the device your PC sees on the port.
+            </div>
+        </div>
+        <div class="step">
+            <div class="num">2</div>
+            <div>
+                <b>Hold <kbd>C6_BOOT</kbd></b> on the M-EXT board, tap <kbd>C6_RESET</kbd>, release <kbd>C6_BOOT</kbd>. Another serial device shows up.
+            </div>
+        </div>
+        <div class="step">
+            <div class="num">3</div>
+            <div>
+                Flash. About 30 seconds (the C6 image is bigger — includes the 2 MB SPIFFS UI bundle with the full Hak5 language pack set).
+                <div class="flash-row" style="margin-top:12px">
+                    <esp-web-install-button manifest="firmware/c6/manifest.json"></esp-web-install-button>
+                    <span class="badge">chip family: ESP32-C6</span>
+                </div>
+            </div>
+        </div>
+        <div class="step">
+            <div class="num">4</div>
+            <div>
+                <b>Flip the U4 switch back to <span class="badge">FLASH / 0</span> (P4 position)</b> and reset. The P4 is what the target PC will see over USB (HID + MSC composite). The C6 sits on-board and serves the Wi-Fi AP.
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>Step 3 &nbsp;—&nbsp; Connect</h2>
+        <ol class="pins">
+            <li>Look for the Wi-Fi network <b>P4-KeyLogger</b> — password <b>changeme123</b>.</li>
+            <li>Open <a href="http://192.168.4.1">http://192.168.4.1</a>. That's the ported BadUSB UI.</li>
+            <li>The old keylog dashboard is still around at <a href="http://192.168.4.1/klog">http://192.168.4.1/klog</a>, and the Keylog tab in the UI reads from the same live channel.</li>
+        </ol>
+    </div>
+
+    <div class="info">
+        <b>Requirements:</b> Chromium browser (Chrome, Edge, Opera, Brave, Arc), a USB-C data cable, and a Spotpear ESP32-P4-MINI-B-M-EXT (N32R32 variant recommended so the 16 MB MSC partition fits). Web-flashing needs the tab to be served over HTTPS — GitHub Pages does that automatically.
+    </div>
+
+    <hr>
+    <p style="text-align:center;color:var(--muted);font-size:13px">
+        Source: <a href="https://github.com/QWavey/esp32-p4-hub-keylogger/tree/badusb-port">esp32-p4-hub-keylogger @ badusb-port</a>
+    </p>
+</div>
+</body>
+</html>

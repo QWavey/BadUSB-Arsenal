@@ -1,0 +1,15 @@
+{
+  "name": "ESP32-P4 BadUSB — P4 firmware",
+  "version": "badusb-port",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-P4",
+      "parts": [
+        { "path": "bootloader.bin",       "offset":  8192  },
+        { "path": "partition-table.bin",  "offset": 32768  },
+        { "path": "app.bin",              "offset": 65536  }
+      ]
+    }
+  ]
+}
