@@ -70,6 +70,7 @@ extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
 #define BADUSB_SIZE_BASE_ADDR   0xB2   // slave scratch reg 54..59 (6 bytes, LE)
 #define BADUSB_ATK_COMMIT_ADDR  0xB8   // slave scratch reg 60
 #define BADUSB_SILENT_ADDR      0xB9   // slave scratch reg 61 — Silent Startup (0/1)
+#define BADUSB_FSCH_ADDR        0xAB   // slave scratch reg 47 — file-listing channel
 
 static const char *TAG = "live_type";
 
@@ -139,6 +140,38 @@ static void inject_hid(uint8_t kc, uint8_t mod) {
     xQueueSend(g_hid_bridge_q, &up,   pdMS_TO_TICKS(50));
 }
 static void inject_char(uint8_t kc, bool shift) { inject_hid(kc, shift ? 0x02 : 0x00); }
+
+// Stream the payload-volume file listing to the C6 over reg 47 using a
+// single-register turn-taking protocol:
+//   reg==0     -> P4's turn: it writes the next data byte (never 0/>=0xF0)
+//   reg!=0     -> C6's turn: it reads the byte and writes reg=0 to consume
+//   reg==0xF2  -> end of listing
+// Data is printable ASCII + \t + \n (all < 0xF0). Bounded spins so a stalled
+// or vanished C6 can't wedge the P4. Only runs while detached (msc_storage_list
+// refuses when the volume is exposed to the host).
+static void fs_stream_listing(sdmmc_card_t *card) {
+    static char buf[1536];
+    int n = 0;
+    esp_err_t err = msc_storage_list(buf, sizeof(buf), &n);
+    char errbuf[48];
+    const char *p; size_t len;
+    if (err == ESP_OK)                        { p = buf; len = strlen(buf); }
+    else if (err == ESP_ERR_NOT_FOUND)        { snprintf(errbuf, sizeof(errbuf), "!EMPTY\t0\t0\n");    p = errbuf; len = strlen(errbuf); }
+    else if (err == ESP_ERR_INVALID_STATE)    { snprintf(errbuf, sizeof(errbuf), "!ATTACHED\t0\t0\n"); p = errbuf; len = strlen(errbuf); }
+    else                                      { snprintf(errbuf, sizeof(errbuf), "!ERR\t%d\t0\n", (int)err); p = errbuf; len = strlen(errbuf); }
+
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = (uint8_t)p[i];
+        if (b == 0 || b >= 0xF0) b = ' ';   // never send a control value as data
+        if (sdmmc_io_write_byte(card, 1, BADUSB_FSCH_ADDR, b, NULL) != ESP_OK) return;
+        uint8_t v = b; int spins = 0;
+        while (spins++ < 20000) {           // ~bounded wait for C6 to consume
+            if (sdmmc_io_read_byte(card, 1, BADUSB_FSCH_ADDR, &v) == ESP_OK && v == 0) break;
+        }
+        if (v != 0) return;                 // C6 gave up — abort cleanly
+    }
+    sdmmc_io_write_byte(card, 1, BADUSB_FSCH_ADDR, 0xF2, NULL);   // end-of-listing
+}
 
 static void live_type_task(void *arg) {
     (void)arg;
@@ -236,6 +269,14 @@ static void live_type_task(void *arg) {
                 nvs_commit(hs); nvs_close(hs);
                 ESP_LOGI(TAG, "Silent Startup pref = %u (applies next boot)", silent);
             }
+        }
+
+        // File-listing request from the C6 Explorer tab: reg 47 == 0xF1 means
+        // "send me the payload-volume file list". Stream it (blocking, but the
+        // device is detached during a browse so HID typing isn't happening).
+        uint8_t fsch = 0;
+        if (sdmmc_io_read_byte(card, 1, BADUSB_FSCH_ADDR, &fsch) == ESP_OK && fsch == 0xF1) {
+            fs_stream_listing(card);
         }
 
         // Prefer the combo path (reg 46) when set — combos are event-driven

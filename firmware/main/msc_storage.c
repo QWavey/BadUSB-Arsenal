@@ -26,6 +26,12 @@
 #include "class/msc/msc.h"
 #include "class/msc/msc_device.h"  // tud_msc_set_sense (missing from msc.h)
 
+#include <stdio.h>
+#include <stdlib.h>
+#include "ff.h"
+#include "diskio_impl.h"   // ff_diskio_get_drive / ff_diskio_unregister
+#include "diskio_wl.h"     // ff_diskio_register_wl_partition
+
 static const char *TAG = "msc";
 
 // Wear-leveled partition handle. Lives for the duration of the app.
@@ -106,6 +112,53 @@ void msc_storage_set_fake_capacity(uint64_t bytes) {
 uint64_t msc_storage_capacity_bytes(void) {
     if (s_fake_capacity) return s_fake_capacity;
     return (uint64_t)s_sector_count * s_sector_size;
+}
+
+// Read-only listing of the payload-volume FAT root, mounted on the EXISTING
+// wear-leveling handle so we don't wl_mount twice. Only safe while the volume
+// is detached from the host (otherwise Windows owns the FAT).
+esp_err_t msc_storage_list(char *out, size_t out_sz, int *nfiles) {
+    if (nfiles) *nfiles = 0;
+    if (out && out_sz) out[0] = 0;
+    if (!out || out_sz < 2)          return ESP_ERR_INVALID_ARG;
+    if (s_wl == WL_INVALID_HANDLE)   return ESP_ERR_INVALID_STATE;
+    if (s_enabled)                   return ESP_ERR_INVALID_STATE;  // attached to host
+
+    BYTE pdrv = 0xFF;
+    if (ff_diskio_get_drive(&pdrv) != ESP_OK || pdrv == 0xFF) return ESP_FAIL;
+    esp_err_t err = ff_diskio_register_wl_partition(pdrv, s_wl);
+    if (err != ESP_OK) return err;
+
+    char drv[3] = { (char)('0' + pdrv), ':', 0 };
+    FATFS *fs = calloc(1, sizeof(FATFS));
+    if (!fs) { ff_diskio_unregister(pdrv); return ESP_ERR_NO_MEM; }
+
+    esp_err_t ret = ESP_OK;
+    FRESULT fr = f_mount(fs, drv, 1);   // 1 = mount immediately
+    if (fr != FR_OK) {
+        ret = ESP_ERR_NOT_FOUND;        // unformatted / no FAT yet
+    } else {
+        size_t w = 0; int n = 0;
+        FF_DIR dir; FILINFO fno;
+        if (f_opendir(&dir, drv) == FR_OK) {
+            while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0]) {
+                if (fno.fname[0] == '.') continue;         // '.'/'..'
+                if (fno.fattrib & AM_HID) continue;        // hidden/system
+                int wrote = snprintf(out + w, out_sz - w, "%s\t%lu\t%d\n",
+                                     fno.fname, (unsigned long)fno.fsize,
+                                     (fno.fattrib & AM_DIR) ? 1 : 0);
+                if (wrote < 0 || (size_t)wrote >= out_sz - w) break;  // buffer full
+                w += wrote; n++;
+            }
+            f_closedir(&dir);
+        }
+        out[w] = 0;
+        if (nfiles) *nfiles = n;
+        f_mount(NULL, drv, 0);          // unmount
+    }
+    ff_diskio_unregister(pdrv);
+    free(fs);
+    return ret;
 }
 
 // -------- TinyUSB MSC callbacks ---------------------------------------

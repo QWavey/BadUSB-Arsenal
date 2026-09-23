@@ -27,3 +27,11 @@ void      msc_storage_set_enabled(bool on);
 bool      msc_storage_enabled(void);
 void      msc_storage_set_fake_capacity(uint64_t bytes);
 uint64_t  msc_storage_capacity_bytes(void);
+
+// Mount the payload-volume FAT read-only ON THE EXISTING wear-leveling handle
+// (no second wl_mount), enumerate the root directory into `out` as one line
+// per entry ("name\tsize\tisdir\n"), unmount, and return. REFUSES when the
+// volume is currently exposed to the host (msc_storage_enabled()) so the
+// device never dual-mounts the FAT that Windows owns. `out` is always NUL-
+// terminated; *nfiles (optional) gets the entry count.
+esp_err_t msc_storage_list(char *out, size_t out_sz, int *nfiles);

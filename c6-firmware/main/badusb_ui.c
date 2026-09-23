@@ -55,6 +55,7 @@ static const char *TAG = "badusb_ui";
 #define SDIO_REG_ATK_ON       53   // USB mode: 0=HID, 1=HID+STORAGE, 2=NONE(detached)
 #define SDIO_REG_SIZE_BASE    54   // 6 bytes LE — reported MSC capacity
 #define SDIO_REG_ATK_COMMIT   60   // write 1 to trigger snapshot
+#define SDIO_REG_FSCH         47   // file-listing channel (turn-taking byte stream)
 
 // Modifier bit mask constants (match the HID boot-report modifier byte
 // on the P4 side).
@@ -1227,6 +1228,89 @@ static esp_err_t h_api_usb_attach(httpd_req_t *r) { return usb_set_mode_resp(r, 
 // of the storage FAT (and the device can read it for the Explorer listing).
 static esp_err_t h_api_usb_detach(httpd_req_t *r) { return usb_set_mode_resp(r, 2); }
 
+// /api/storage-list — fetch the payload-volume (MSC FAT) file list from the
+// P4 over the reg-47 turn-taking channel and return it as JSON. Only works
+// while the drive is detached from the host (the P4 refuses to dual-mount).
+#include "esp_rom_sys.h"   // esp_rom_delay_us
+static volatile bool s_fs_busy = false;   // serialize storage-list requests
+static esp_err_t h_api_storage_list(httpd_req_t *r) {
+    if (s_fs_busy) {   // another browse is mid-transfer; the shared channel is busy
+        httpd_resp_set_type(r, "application/json");
+        return httpd_resp_send(r, "{\"status\":\"busy\",\"files\":[]}", 28);
+    }
+    s_fs_busy = true;
+    static char raw[1600];
+    size_t w = 0;
+    sdio_slave_write_reg(SDIO_REG_FSCH, 0xF1);          // request a listing
+    int64_t start = esp_timer_get_time();
+    int idle = 0;
+    while ((esp_timer_get_time() - start) < 5000000) {  // 5 s cap
+        uint8_t b = sdio_slave_read_reg(SDIO_REG_FSCH);
+        if (b == 0 || b == 0xF1) {                       // P4's turn / not started
+            esp_rom_delay_us(50);
+            if (++idle % 400 == 0) vTaskDelay(1);        // yield to Wi-Fi
+            continue;
+        }
+        if (b == 0xF2) { sdio_slave_write_reg(SDIO_REG_FSCH, 0); break; }  // END
+        if (w < sizeof(raw) - 1) raw[w++] = (char)b;
+        sdio_slave_write_reg(SDIO_REG_FSCH, 0);          // consume
+        idle = 0;
+    }
+    raw[w] = 0;
+    sdio_slave_write_reg(SDIO_REG_FSCH, 0);              // leave the channel free
+
+    const char *status = "ok";
+    if (w == 0)                              status = "timeout";
+    else if (!strncmp(raw, "!EMPTY", 6))     status = "empty";
+    else if (!strncmp(raw, "!ATTACHED", 9))  status = "attached";
+    else if (!strncmp(raw, "!ERR", 4))       status = "error";
+
+    httpd_resp_set_type(r, "application/json");
+    const size_t CAP = 4096;
+    char *body = malloc(CAP);
+    if (!body) { s_fs_busy = false; return httpd_resp_send(r, "{\"status\":\"oom\",\"files\":[]}", 27); }
+    // Append helper that NEVER lets bl run past CAP. snprintf returns the
+    // INTENDED length (can exceed the buffer), so adding it blindly would
+    // overflow bl and make (CAP - bl) underflow on the next call — a heap
+    // overflow. Cap on truncation instead.
+    size_t bl = 0;
+    #define APPEND(...) do { \
+        if (bl < CAP) { \
+            int _rc = snprintf(body + bl, CAP - bl, __VA_ARGS__); \
+            if (_rc < 0) { body[bl] = 0; } \
+            else if ((size_t)_rc >= CAP - bl) { bl = CAP - 1; } \
+            else { bl += (size_t)_rc; } \
+        } \
+    } while (0)
+    APPEND("{\"status\":\"%s\",\"files\":[", status);
+    if (!strcmp(status, "ok")) {
+        char *save = NULL;
+        bool first = true;
+        for (char *line = strtok_r(raw, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+            char *t1 = strchr(line, '\t'); if (!t1) continue; *t1 = 0;
+            char *t2 = strchr(t1 + 1, '\t');
+            long size = atol(t1 + 1);
+            int  isdir = t2 ? atoi(t2 + 1) : 0;
+            char esc[130]; size_t e = 0;
+            for (char *c = line; *c && e < sizeof(esc) - 2; c++) {
+                if (*c == '"' || *c == '\\') esc[e++] = '\\';
+                esc[e++] = *c;
+            }
+            esc[e] = 0;
+            if (bl > CAP - 200) break;   // leave room for this item + closer
+            APPEND("%s{\"name\":\"%s\",\"size\":%ld,\"isDirectory\":%s}",
+                   first ? "" : ",", esc, size, isdir ? "true" : "false");
+            first = false;
+        }
+    }
+    APPEND("]}");
+    #undef APPEND
+    esp_err_t rc = httpd_resp_send(r, body, bl);
+    free(body);
+    s_fs_busy = false;
+    return rc;
+}
+
 // /api/temp — chip temperature is not available on ESP32-C6 without
 // a temp_sensor init, and even then it's noisy. Return null so the UI
 // renders "n/a" instead of a bogus number.
@@ -1745,6 +1829,7 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/usb-attach",     HTTP_GET,  h_api_usb_attach,    NULL, false, false, NULL},
         {"/api/usb-detach",     HTTP_POST, h_api_usb_detach,    NULL, false, false, NULL},
         {"/api/usb-detach",     HTTP_GET,  h_api_usb_detach,    NULL, false, false, NULL},
+        {"/api/storage-list",   HTTP_GET,  h_api_storage_list,  NULL, false, false, NULL},
         // /api/list-files — real SPIFFS enumeration for the Explorer tab.
         {"/api/list-files",     HTTP_GET,  h_api_list_files,    NULL, false, false, NULL},
         // /api/upload — writes an uploaded file into /data/. Query

@@ -1892,12 +1892,52 @@ function usbDetach() {
     }).catch(() => {});
 }
 function browseStorage() {
-    // Detach from the host so the FAT is free, then (once the on-device FAT
-    // listing lands) show its files. For now this detaches and refreshes.
+    // Detach from the host so the device owns the FAT, then pull the listing
+    // from the P4 (which mounts the FAT read-only) and render it.
+    const browser = document.getElementById('fileBrowser');
+    if (browser) browser.innerHTML = '<div class="file-browser-item">Detaching USB & reading storage…</div>';
     fetch('/api/usb-detach', {method:'POST'}).then(r => r.json()).then(() => {
         renderUsbState(2);
-        refreshFileBrowser();
-    }).catch(() => {});
+        // Give the P4 a moment to see the detach before it mounts the FAT.
+        setTimeout(loadStorageFiles, 400);
+    }).catch(() => {
+        if (browser) browser.innerHTML = '<div class="file-browser-item">Failed to detach USB.</div>';
+    });
+}
+function loadStorageFiles() {
+    const browser = document.getElementById('fileBrowser');
+    if (browser) browser.innerHTML = '<div class="file-browser-item">Reading storage…</div>';
+    const dd = document.getElementById('currentDirDisplay');
+    if (dd) dd.textContent = 'storage:/';
+    fetch('/api/storage-list').then(r => r.json()).then(data => {
+        if (!browser) return;
+        if (data.status === 'attached') {
+            browser.innerHTML = '<div class="file-browser-item">Still attached to the host — press “Detach USB” first.</div>';
+            return;
+        }
+        if (data.status === 'empty') {
+            browser.innerHTML = '<div class="file-browser-item">The storage volume is empty or not formatted yet. Attach it to a PC and copy files (or format it) first.</div>';
+            return;
+        }
+        if (data.status !== 'ok') {
+            browser.innerHTML = '<div class="file-browser-item">Could not read storage (' + (data.status || 'error') + ').</div>';
+            return;
+        }
+        if (!data.files || !data.files.length) {
+            browser.innerHTML = '<div class="file-browser-item">No files on the Payload Volume.</div>';
+            return;
+        }
+        browser.innerHTML = '';
+        data.files.forEach(f => {
+            const row = document.createElement('div');
+            row.className = 'file-browser-item';
+            const kb = f.size >= 1024 ? (f.size/1024).toFixed(1)+' KB' : f.size+' B';
+            row.textContent = (f.isDirectory ? '📁 ' : '📄 ') + f.name + (f.isDirectory ? '' : '   ' + kb);
+            browser.appendChild(row);
+        });
+    }).catch(() => {
+        if (browser) browser.innerHTML = '<div class="file-browser-item">Failed to read storage listing.</div>';
+    });
 }
 
 function refreshFileBrowser() {
