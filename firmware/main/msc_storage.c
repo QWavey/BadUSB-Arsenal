@@ -45,6 +45,12 @@ static uint32_t    s_sector_count = 0;   // real geometry
 // popped up on first plug even when no ducky script had run — a data leak.
 static bool        s_enabled = false;
 static uint64_t    s_fake_capacity = 0;  // 0 = report real geometry
+// When the reported capacity changes while the volume is already attached, the
+// host won't re-read geometry on its own. Setting this makes the next TEST
+// UNIT READY return a UNIT ATTENTION ("medium may have changed", ASC 0x28),
+// which is the standard signal that forces the host to re-read READ CAPACITY —
+// so SIZE_ takes effect without a full re-enumeration.
+static volatile bool s_media_changed = false;
 
 // -------- boot init: mount the wear-leveled partition ------------------
 // We do NOT mount FAT here — the host is going to own the filesystem
@@ -108,6 +114,9 @@ void msc_storage_set_fake_capacity(uint64_t bytes) {
     save_prefs();
     ESP_LOGI(TAG, "fake capacity = %llu bytes", (unsigned long long)bytes);
 }
+
+// Tell the host the medium changed so it re-reads capacity (see s_media_changed).
+void msc_storage_signal_media_change(void) { s_media_changed = true; }
 
 uint64_t msc_storage_capacity_bytes(void) {
     if (s_fake_capacity) return s_fake_capacity;
@@ -178,7 +187,14 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     (void)lun;
     if (!s_enabled) {
-        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);   // medium not present
+        return false;
+    }
+    if (s_media_changed) {
+        // Report the medium changed ONCE so the host re-reads READ CAPACITY
+        // (this is how a new SIZE_ takes effect on an already-attached volume).
+        s_media_changed = false;
+        tud_msc_set_sense(lun, SCSI_SENSE_UNIT_ATTENTION, 0x28, 0x00);
         return false;
     }
     return true;

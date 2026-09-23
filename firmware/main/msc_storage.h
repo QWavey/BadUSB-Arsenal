@@ -27,6 +27,8 @@ void      msc_storage_set_enabled(bool on);
 bool      msc_storage_enabled(void);
 void      msc_storage_set_fake_capacity(uint64_t bytes);
 uint64_t  msc_storage_capacity_bytes(void);
+// Signal the host that the medium changed so it re-reads capacity (SIZE_).
+void      msc_storage_signal_media_change(void);
 
 // Mount the payload-volume FAT read-only ON THE EXISTING wear-leveling handle
 // (no second wl_mount), enumerate the root directory into `out` as one line

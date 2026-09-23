@@ -128,6 +128,23 @@ static bool ci_contains(const char *hay, const char *needle) {
     return false;
 }
 
+// Trigger an ATTACKMODE/SIZE commit and WAIT for the P4 to process it (it
+// clears the commit register back to 0). Without this, back-to-back
+// DuckyScript lines (ATTACKMODE STORAGE / HID / STORAGE, or SIZE_ then
+// ATTACKMODE) overwrite the commit register before the P4 has read it, so
+// every command but the last is silently dropped. commit_val: 1=mode change
+// (ATTACKMODE/DETACH/ATTACH), 2=SIZE-only.
+static void atk_commit_wait(uint8_t commit_val) {
+    sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, commit_val);
+    for (int i = 0; i < 300; i++) {                    // up to ~1.5 s
+        if (sdio_slave_read_reg(SDIO_REG_ATK_COMMIT) == 0) break;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    // The P4 does a live re-enumeration after a mode/size change; give the
+    // host a beat to finish enumerating before the next command fires.
+    vTaskDelay(pdMS_TO_TICKS(60));
+}
+
 // Ducky/reference token -> HID scancode. Returns 0 if the token isn't a
 // known named key. Case-insensitive.
 static uint8_t ducky_key_to_hid(const char *tok) {
@@ -647,7 +664,7 @@ static void execute_task(void *arg) {
                      ci_contains(rest, "BLANK") || *rest == 0)       mode = 2;
             else                                                     mode = 0;   // HID
             sdio_slave_write_reg(SDIO_REG_ATK_ON, mode);
-            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            atk_commit_wait(1);
             executed++;
         }
         // DETACH — pull the whole device off USB (== ATTACKMODE NONE). Handy
@@ -655,14 +672,14 @@ static void execute_task(void *arg) {
         // "Detach USB" button so the device can read its own storage FAT.
         else if (!strncasecmp(line, "DETACH", 6) && (line[6] == 0 || isspace((unsigned char)line[6]))) {
             sdio_slave_write_reg(SDIO_REG_ATK_ON, 2);
-            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            atk_commit_wait(1);
             executed++;
         }
         // ATTACH — re-expose the mass-storage volume to the host
         // (== ATTACKMODE HID STORAGE). Pairs with DETACH / the web buttons.
         else if (!strncasecmp(line, "ATTACH", 6) && (line[6] == 0 || isspace((unsigned char)line[6]))) {
             sdio_slave_write_reg(SDIO_REG_ATK_ON, 1);
-            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            atk_commit_wait(1);
             executed++;
         }
         // "LED r g b" — steady arbitrary RGB (each 0..255), e.g. "LED 255 0 0".
@@ -740,8 +757,8 @@ static void execute_task(void *arg) {
             // just applies the new capacity (re-attaching if the volume is
             // live). This must NOT re-read ATK_ON as the mode — after a C6
             // reboot ATK_ON is a stale 0, which would wrongly detach storage.
-            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 2);
             ESP_LOGI(TAG, "SIZE_ -> %llu bytes (unit %c)", (unsigned long long)bytes, unit);
+            atk_commit_wait(2);
             executed++;
         }
         // Bare named-key line: "F4", "DELETE", "UPARROW", ...
@@ -1229,7 +1246,7 @@ static esp_err_t h_api_set_silent(httpd_req_t *r) {
 static esp_err_t usb_set_mode_resp(httpd_req_t *r, uint8_t mode) {
     s_usb_mode = mode;
     sdio_slave_write_reg(SDIO_REG_ATK_ON, mode);
-    sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+    atk_commit_wait(1);
     char body[64];
     int n = snprintf(body, sizeof(body), "{\"ok\":true,\"usbMode\":%u}", mode);
     httpd_resp_set_type(r, "application/json");

@@ -254,7 +254,11 @@ static void live_type_task(void *arg) {
             if (mode != prev_state) {
                 usb_apply_state(mode);              // HID / STORAGE / NONE change
             } else if (want_storage && cap_changed) {
-                usb_force_reenumerate();            // same mode, new size → re-read
+                // Same mode, new size → tell the host the medium changed so it
+                // re-reads READ CAPACITY, AND re-enumerate as a fallback for
+                // hosts that ignore the UNIT ATTENTION.
+                msc_storage_signal_media_change();
+                usb_force_reenumerate();
             }
         }
 
