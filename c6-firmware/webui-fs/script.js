@@ -523,13 +523,22 @@ function pollSystemStatus() {
     if (statusController) statusController.abort();
     statusController = new AbortController();
 
-    fetch('/status', { signal: statusController.signal }).then(r => r.text()).then(data => {
+    // /status returns device TELEMETRY JSON ({"chip":"esp32c6","ssid":...}),
+    // not a script-status string. It must never be dumped verbatim into the
+    // script-status pill (that showed a raw JSON blob on the coding tab).
+    // Just confirm the device is reachable and keep the pill at "Idle" when
+    // no script is running; execution states are set by executeScript().
+    fetch('/status', { signal: statusController.signal }).then(r => r.json()).then(() => {
         const statusEl = document.getElementById('scriptStatus');
-        if (statusEl && !statusEl.classList.contains('status-error')) {
-            statusEl.textContent = data.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|\u200D|\uFE0F/g, '');
-        }
+        if (!statusEl || statusEl.classList.contains('status-error')) return;
+        const t = statusEl.textContent.trim();
+        // Clear a previously-leaked blob, and don't clobber a live run status.
+        if (t.startsWith('{') || t === '' || t === 'Offline') statusEl.textContent = 'Idle';
     }).catch(err => {
-        if (err.name !== 'AbortError') console.error("Status Poll Error:", err);
+        if (err.name !== 'AbortError') {
+            const statusEl = document.getElementById('scriptStatus');
+            if (statusEl && statusEl.textContent.trim().startsWith('{')) statusEl.textContent = 'Idle';
+        }
     });
 }
 

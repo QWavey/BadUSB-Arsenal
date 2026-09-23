@@ -736,12 +736,12 @@ static void execute_task(void *arg) {
             const uint64_t MAX_BYTES = 0xFFFFFFFFFFFFULL;
             uint64_t bytes = (num > MAX_BYTES / mult) ? MAX_BYTES : num * mult;
             for (int i = 0; i < 6; i++) sdio_slave_write_reg(SDIO_REG_SIZE_BASE + i, (bytes >> (8 * i)) & 0xFF);
-            // SIZE_ sets the reported capacity WITHOUT changing the storage
-            // on/off state — it leaves ATK_ON alone. The commit tells the P4
-            // to re-read the size: if the volume is currently attached it
-            // detaches and re-attaches at the new size; if it's off, the size
-            // is just remembered for the next ATTACKMODE ... STORAGE.
-            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 1);
+            // Commit type 2 = SIZE-only: the P4 keeps its current USB mode and
+            // just applies the new capacity (re-attaching if the volume is
+            // live). This must NOT re-read ATK_ON as the mode — after a C6
+            // reboot ATK_ON is a stale 0, which would wrongly detach storage.
+            sdio_slave_write_reg(SDIO_REG_ATK_COMMIT, 2);
+            ESP_LOGI(TAG, "SIZE_ -> %llu bytes (unit %c)", (unsigned long long)bytes, unit);
             executed++;
         }
         // Bare named-key line: "F4", "DELETE", "UPARROW", ...
@@ -1019,16 +1019,29 @@ static void nvs_set_bool(const char *key, uint8_t v) {
 // cpuTempC:null so the UI showed "- - unread"; now we report the real die
 // temperature (°C) of the C6.
 static temperature_sensor_handle_t s_tsens = NULL;
+static bool s_tsens_ready = false;
 static float read_cpu_temp_c(void) {
-    if (!s_tsens) {
-        temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 100);
-        if (temperature_sensor_install(&cfg, &s_tsens) != ESP_OK) { s_tsens = NULL; return -1000.0f; }
-        temperature_sensor_enable(s_tsens);
+    if (!s_tsens_ready) {
+        // The C6 sensor has fixed measurement bands; the range must fit inside
+        // ONE of them (e.g. -10..80, 20..100). (-10,110) spanned two bands and
+        // the driver rejected it ("Cannot select the correct range"). (20,100)
+        // is the warm-operating band and covers the chip's normal temperatures.
+        temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(20, 100);
+        esp_err_t e = temperature_sensor_install(&cfg, &s_tsens);
+        if (e != ESP_OK) { ESP_LOGE(TAG, "tsens install: %s", esp_err_to_name(e)); s_tsens = NULL; return -1000.0f; }
+        e = temperature_sensor_enable(s_tsens);
+        if (e != ESP_OK) { ESP_LOGE(TAG, "tsens enable: %s", esp_err_to_name(e)); return -1000.0f; }
+        s_tsens_ready = true;
+        ESP_LOGI(TAG, "tsens installed + enabled");
     }
     float c = -1000.0f;
-    if (temperature_sensor_get_celsius(s_tsens, &c) != ESP_OK) return -1000.0f;
+    esp_err_t e = temperature_sensor_get_celsius(s_tsens, &c);
+    if (e != ESP_OK) { ESP_LOGW(TAG, "tsens read: %s", esp_err_to_name(e)); return -1000.0f; }
     return c;
 }
+// Force the sensor to install + take a first reading at boot, so any failure
+// shows in the console immediately and the first /api/stats already has a value.
+void badusb_temp_init(void) { float t = read_cpu_temp_c(); ESP_LOGI(TAG, "boot CPU temp = %.1f C", t); }
 
 extern uint32_t s_sta_count;    // main.c
 extern bool     s_led_off;      // main.c (dedicated OFF switch)
@@ -1781,6 +1794,10 @@ void badusb_ui_register(httpd_handle_t s) {
     // "storage" — passing NULL always returned false, so the marker
     // file was never created and script listings were empty.
     if (esp_spiffs_mounted("storage")) ensure_script_dir();
+
+    // Install the die-temperature sensor at boot so /api/stats reports a real
+    // value from the first poll (and any failure is logged on the console).
+    badusb_temp_init();
 
     // REAL handlers — these have a working backend behind them today.
     httpd_uri_t real[] = {

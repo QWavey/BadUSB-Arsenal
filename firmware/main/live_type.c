@@ -215,42 +215,46 @@ static void live_type_task(void *arg) {
         // re-enumeration — reboot for it, exactly like the VID/PID path
         // above. A capacity-only change (storage staying on) is read live by
         // tud_msc_capacity_cb and needs no reboot.
+        // Commit type: 1 = ATTACKMODE/DETACH/ATTACH (mode + capacity),
+        //              2 = SIZE_ only (capacity, keep current mode).
         uint8_t atk_commit = 0;
-        if (sdmmc_io_read_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, &atk_commit) == ESP_OK && atk_commit == 1) {
-            // USB composition mode: 0=HID, 1=HID+STORAGE, 2=NONE(detached).
-            uint8_t mode = 0;
-            sdmmc_io_read_byte(card, 1, BADUSB_ATK_ENABLED_ADDR, &mode);
-            if (mode > 2) mode = 0;
+        if (sdmmc_io_read_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, &atk_commit) == ESP_OK &&
+            (atk_commit == 1 || atk_commit == 2)) {
+            int prev_state = usb_get_state();
+            // Desired USB mode. For a SIZE-only commit (type 2) KEEP the
+            // current state — do NOT read ATK_ON, which is a stale 0 after a
+            // C6 reboot and would wrongly detach the storage volume.
+            int mode = prev_state;
+            if (atk_commit == 1) {
+                uint8_t m = 0;
+                sdmmc_io_read_byte(card, 1, BADUSB_ATK_ENABLED_ADDR, &m);
+                mode = (m > 2) ? 0 : m;   // 0=HID, 1=HID+STORAGE, 2=NONE
+            }
             bool want_storage = (mode == 1);
-            // 6-byte little-endian capacity (up to 256 TiB — plenty). Set the
-            // fake capacity BEFORE making the volume visible so the host reads
-            // the requested size on the fresh enumeration.
+
+            // 6-byte little-endian fake capacity. Set BEFORE (re)attaching so
+            // the host reads the requested size on the fresh enumeration.
             uint8_t s[6] = { 0 };
             for (int i = 0; i < 6; i++) sdmmc_io_read_byte(card, 1, BADUSB_SIZE_BASE_ADDR + i, &s[i]);
             uint64_t bytes = 0;
             for (int i = 0; i < 6; i++) bytes |= ((uint64_t)s[i]) << (8 * i);
 
-            // Detect a capacity change so a SIZE_ issued while the drive is
-            // already attached re-attaches at the new size.
             static uint64_t s_last_cap = 0;
             static bool     s_have_cap = false;
             bool cap_changed = (!s_have_cap || bytes != s_last_cap);
             s_last_cap = bytes;
             s_have_cap = true;
 
-            int prev_state = usb_get_state();
             msc_storage_set_fake_capacity(bytes);
             msc_storage_set_enabled(want_storage);
             sdmmc_io_write_byte(card, 1, BADUSB_ATK_COMMIT_ADDR, 0, NULL);
+            ESP_LOGI(TAG, "ATK commit=%u mode=%d(prev %d) cap=%llu changed=%d",
+                     atk_commit, mode, prev_state, (unsigned long long)bytes, cap_changed);
 
             if (mode != prev_state) {
-                // Composition changed (HID / STORAGE / NONE) → apply live.
-                usb_apply_state(mode);
+                usb_apply_state(mode);              // HID / STORAGE / NONE change
             } else if (want_storage && cap_changed) {
-                // Already attached, only the size changed → detach + re-attach
-                // so Windows re-reads READ CAPACITY instead of caching the old
-                // (e.g. 16 MB) size. This is the SIZE_-after-STORAGE case.
-                usb_force_reenumerate();
+                usb_force_reenumerate();            // same mode, new size → re-read
             }
         }
 
