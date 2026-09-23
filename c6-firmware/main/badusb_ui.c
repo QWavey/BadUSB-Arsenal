@@ -1113,6 +1113,12 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
     if (temp_c > -900.0f) snprintf(tempbuf, sizeof(tempbuf), "%.1f", temp_c);
     else                  { tempbuf[0] = 'n'; tempbuf[1] = 'u'; tempbuf[2] = 'l'; tempbuf[3] = 'l'; tempbuf[4] = 0; }
 
+    // Applied MSC capacity read back from the P4 (it writes regs 54..59 with
+    // the size the host actually sees after each ATTACKMODE/SIZE_ commit).
+    uint64_t applied_size = 0;
+    for (int i = 0; i < 6; i++)
+        applied_size |= ((uint64_t)sdio_slave_read_reg(SDIO_REG_SIZE_BASE + i)) << (8 * i);
+
     // Roomy buffer: the JSON runs ~600 chars, but new fields were added and a
     // truncated body is invalid JSON that breaks EVERY tile at once — cheap to
     // over-provision. snprintf still bounds the write.
@@ -1131,7 +1137,7 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         "\"lastError\":\"\","
         // --- ATTACKMODE state (chip in the Live tab / Settings) ---
         "\"attackMode\":{\"hid\":true,\"storage\":false,"
-                        "\"vid\":\"0x303A\",\"pid\":\"0x4B44\",\"sizeBytes\":0},"
+                        "\"vid\":\"0x303A\",\"pid\":\"0x4B44\",\"sizeBytes\":%llu},"
         // --- USB composition (Explorer banner): 0=HID 1=HID+STORAGE 2=NONE ---
         "\"usbMode\":%u,"
         // --- Wi-Fi ---
@@ -1162,6 +1168,7 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         (unsigned)sketch_used, (unsigned)sketch_total, (unsigned)sketch_pct,
         (unsigned)up_s,
         (unsigned)s_sta_count,
+        (unsigned long long)applied_size,
         (unsigned)s_usb_mode,
         s_wifi_up == 1 ? "true" : "false",
         s_led_off ? "false" : "true", (unsigned)s_led_mode,

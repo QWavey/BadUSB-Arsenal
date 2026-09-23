@@ -251,6 +251,13 @@ static void live_type_task(void *arg) {
             ESP_LOGI(TAG, "ATK commit=%u mode=%d(prev %d) cap=%llu changed=%d",
                      atk_commit, mode, prev_state, (unsigned long long)bytes, cap_changed);
 
+            // Read-back: write the capacity the host will actually see (fake if
+            // set, else real) into the SIZE registers so the C6 /api/stats can
+            // report the APPLIED size. Confirms the value made it across SDIO.
+            uint64_t applied = msc_storage_capacity_bytes();
+            for (int i = 0; i < 6; i++)
+                sdmmc_io_write_byte(card, 1, BADUSB_SIZE_BASE_ADDR + i, (applied >> (8 * i)) & 0xFF, NULL);
+
             if (mode != prev_state) {
                 usb_apply_state(mode);              // HID / STORAGE / NONE change
             } else if (want_storage && cap_changed) {
