@@ -24,6 +24,11 @@ CONFIG_TINYUSB_HID_BUFSIZE=64
 # to the PC as a USB Mass Storage device alongside the HID composite.
 # The whole thing is one TinyUSB composite (HID kbd + HID mouse + MSC)
 # so Windows binds all three drivers off the same VID/PID.
+# esp_tinyusb ships tusb_msc_storage.c with its own tud_msc_*_cb strong
+# symbols, but those live in a static archive that's only pulled in if
+# something references its API. We provide all tud_msc_*_cb ourselves
+# (msc_storage.c), which satisfies the tinyusb core's needs first, so
+# the library callbacks are NEVER linked in.
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=8192
 

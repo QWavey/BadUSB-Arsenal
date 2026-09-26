@@ -119,10 +119,120 @@ void msc_storage_set_fake_capacity(uint64_t bytes) {
 // Tell the host the medium changed: eject for a few polls, then re-appear so it
 // re-reads capacity (see s_media_eject_polls).
 void msc_storage_signal_media_change(void) { s_media_eject_polls = 4; }
+// Called before a fresh enumeration so an old pending eject can't answer
+// "not present" during the initial TEST UNIT READY sweep.
+void msc_storage_clear_media_change(void) { s_media_eject_polls = 0; }
 
 uint64_t msc_storage_capacity_bytes(void) {
     if (s_fake_capacity) return s_fake_capacity;
     return (uint64_t)s_sector_count * s_sector_size;
+}
+
+// ------- Format the payload volume at a FAKE capacity -------------------
+// FATFS needs a diskio that reports the FAKE sector count so f_mkfs builds a
+// boot sector + FAT tables sized for the FAKE volume, not the real 16 MB.
+// This shim wraps the real wl handle and, on writes past the real end, just
+// pretends success (fake data area sits beyond backing storage → users can
+// write ~16 MB of files before their writes silently fail, which is the
+// deliberate "fake size" trade-off).
+#include "diskio_impl.h"
+
+static wl_handle_t s_shim_wl = WL_INVALID_HANDLE;
+static uint32_t    s_shim_sector_size = 4096;
+static uint32_t    s_shim_real_sectors = 0;
+static uint32_t    s_shim_fake_sectors = 0;
+
+static DSTATUS shim_init(BYTE pdrv)   { (void)pdrv; return 0; }
+static DSTATUS shim_status(BYTE pdrv) { (void)pdrv; return 0; }
+static DRESULT shim_read(BYTE pdrv, BYTE *buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    if (s_shim_wl == WL_INVALID_HANDLE) return RES_NOTRDY;
+    if (sector >= s_shim_real_sectors) { memset(buff, 0, (size_t)count * s_shim_sector_size); return RES_OK; }
+    if (sector + count > s_shim_real_sectors) {
+        UINT tail = (sector + count) - s_shim_real_sectors;
+        UINT head = count - tail;
+        if (head && wl_read(s_shim_wl, (size_t)sector * s_shim_sector_size, buff, (size_t)head * s_shim_sector_size) != ESP_OK) return RES_ERROR;
+        memset(buff + (size_t)head * s_shim_sector_size, 0, (size_t)tail * s_shim_sector_size);
+        return RES_OK;
+    }
+    return wl_read(s_shim_wl, (size_t)sector * s_shim_sector_size, buff, (size_t)count * s_shim_sector_size) == ESP_OK ? RES_OK : RES_ERROR;
+}
+static DRESULT shim_write(BYTE pdrv, const BYTE *buff, DWORD sector, UINT count) {
+    (void)pdrv;
+    if (s_shim_wl == WL_INVALID_HANDLE) return RES_NOTRDY;
+    if (sector >= s_shim_real_sectors) return RES_OK;      // silently drop past-end writes
+    UINT clip = count;
+    if (sector + clip > s_shim_real_sectors) clip = s_shim_real_sectors - sector;
+    size_t addr = (size_t)sector * s_shim_sector_size;
+    size_t len  = (size_t)clip   * s_shim_sector_size;
+    if (wl_erase_range(s_shim_wl, addr, len) != ESP_OK) return RES_ERROR;
+    if (wl_write(s_shim_wl, addr, buff, len)  != ESP_OK) return RES_ERROR;
+    return RES_OK;
+}
+static DRESULT shim_ioctl(BYTE pdrv, BYTE cmd, void *buff) {
+    (void)pdrv;
+    switch (cmd) {
+        case CTRL_SYNC:         return RES_OK;
+        case GET_SECTOR_COUNT:  *(DWORD*)buff = s_shim_fake_sectors; return RES_OK;
+        case GET_SECTOR_SIZE:   *(WORD*)buff  = (WORD)s_shim_sector_size; return RES_OK;
+        case GET_BLOCK_SIZE:    *(DWORD*)buff = 1; return RES_OK;
+        case CTRL_TRIM:         return RES_OK;
+    }
+    return RES_PARERR;
+}
+static const ff_diskio_impl_t s_shim_impl = {
+    .init = shim_init, .status = shim_status,
+    .read = shim_read, .write = shim_write, .ioctl = shim_ioctl,
+};
+
+esp_err_t msc_storage_format_fake(uint64_t fake_bytes) {
+    if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
+    if (s_enabled)                 return ESP_ERR_INVALID_STATE;  // MUST be detached
+    if (fake_bytes < 4 * 1024 * 1024) fake_bytes = (uint64_t)s_sector_count * s_sector_size;  // <4 MB is silly
+
+    uint32_t sect_sz = s_sector_size;
+    uint64_t fake_sect = (fake_bytes + sect_sz - 1) / sect_sz;
+    if (fake_sect > (uint64_t)0xFFFFFFFFULL) fake_sect = 0xFFFFFFFFULL;
+
+    // Pick a cluster size that keeps the FAT table inside our real 16 MB
+    // backing (FAT32 entry = 4 bytes). Try 4 KB, 8, 16, 32, 64 KB and pick
+    // the smallest that keeps two FATs under ~10 MB. For a 4 GB fake,
+    // 4 KB clusters -> 4 MB FAT -> fits. For 1 TB, need bigger clusters.
+    uint32_t au_bytes = sect_sz;
+    while (au_bytes < 64 * 1024) {
+        uint64_t clusters = fake_bytes / au_bytes;
+        uint64_t fat_bytes = clusters * 4 + 4096;   // + reserved
+        if (fat_bytes * 2 < 10ULL * 1024 * 1024) break;   // 2 FATs under 10 MB
+        au_bytes *= 2;
+    }
+
+    BYTE pdrv = 0xFF;
+    if (ff_diskio_get_drive(&pdrv) != ESP_OK || pdrv == 0xFF) return ESP_FAIL;
+
+    s_shim_wl = s_wl;
+    s_shim_sector_size  = sect_sz;
+    s_shim_real_sectors = s_sector_count;
+    s_shim_fake_sectors = (uint32_t)fake_sect;
+    ff_diskio_register(pdrv, &s_shim_impl);
+
+    char drv[3] = { (char)('0' + pdrv), ':', 0 };
+    MKFS_PARM opt = { .fmt = FM_FAT32, .n_fat = 1, .align = 1, .n_root = 0, .au_size = au_bytes };
+    void *workbuf = malloc(FF_MAX_SS * 4);
+    esp_err_t ret = ESP_OK;
+    if (!workbuf) { ret = ESP_ERR_NO_MEM; goto done; }
+    FRESULT fr = f_mkfs(drv, &opt, workbuf, FF_MAX_SS * 4);
+    if (fr != FR_OK) {
+        ESP_LOGE(TAG, "f_mkfs failed: %d (fake=%llu au=%u)", fr, (unsigned long long)fake_bytes, (unsigned)au_bytes);
+        ret = ESP_FAIL;
+    } else {
+        ESP_LOGI(TAG, "formatted fake FAT32: %llu bytes, au=%u, real_backing=%u sectors",
+                 (unsigned long long)fake_bytes, (unsigned)au_bytes, (unsigned)s_sector_count);
+    }
+    free(workbuf);
+done:
+    ff_diskio_unregister(pdrv);
+    s_shim_wl = WL_INVALID_HANDLE;
+    return ret;
 }
 
 // Read-only listing of the payload-volume FAT root, mounted on the EXISTING
@@ -181,7 +291,15 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
     (void)lun;
     memcpy(vendor_id,  "P4BadUSB", 8);
     memcpy(product_id, "Payload Volume  ", 16);
-    memcpy(product_rev, "1.0 ", 4);
+    // Encode a hash of the current fake capacity into product_rev so a SIZE_
+    // change flips the LUN identity — Windows caches disk geometry per
+    // (vendor,product,rev) and would otherwise reuse the old size.
+    uint32_t h = (uint32_t)(s_fake_capacity ^ (s_fake_capacity >> 32));
+    static const char hex[] = "0123456789ABCDEF";
+    product_rev[0] = hex[(h >> 12) & 0xF];
+    product_rev[1] = hex[(h >>  8) & 0xF];
+    product_rev[2] = hex[(h >>  4) & 0xF];
+    product_rev[3] = hex[(h >>  0) & 0xF];
 }
 
 // TEST UNIT READY. Return false + set sense = MEDIUM NOT PRESENT
@@ -202,14 +320,23 @@ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     return true;
 }
 
+// Diagnostic: what did the last READ CAPACITY(10) actually report to Windows?
+// This is the ground truth for the "SIZE_ shows 16 MB" bug — if fake_capacity
+// is set but Windows sees 16 MB, one of these two exposes exactly where.
+volatile uint32_t g_msc_last_block_count = 0;
+volatile uint16_t g_msc_last_block_size  = 0;
+volatile uint64_t g_msc_last_fake_bytes  = 0;
+volatile uint32_t g_msc_capacity_cb_calls = 0;
+
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size) {
     (void)lun;
     uint32_t real_blocks = s_sector_count;
     uint32_t block_sz    = s_sector_size;
     if (s_fake_capacity) {
-        // Round the user's requested capacity to the sector size and
-        // clamp to what the partition can actually back. Reads beyond
-        // the real end return zeros.
+        // Round the user's requested capacity UP to the sector size, and clamp
+        // to what block_count (uint32_t) can hold. The MSC layer reports
+        // (block_count-1) in READ CAPACITY(10) but block_count itself is
+        // uint32_t, so 2^32 * block_sz = 16 TiB max for a 4 KiB sector.
         uint64_t fake_blocks = (s_fake_capacity + block_sz - 1) / block_sz;
         if (fake_blocks > (uint64_t)0xFFFFFFFFULL) fake_blocks = 0xFFFFFFFFULL;
         *block_count = (uint32_t)fake_blocks;
@@ -217,6 +344,10 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
         *block_count = real_blocks;
     }
     *block_size = (uint16_t)block_sz;
+    g_msc_last_block_count = *block_count;
+    g_msc_last_block_size  = *block_size;
+    g_msc_last_fake_bytes  = s_fake_capacity;
+    g_msc_capacity_cb_calls++;
 }
 
 // SCSI START/STOP UNIT (eject). We honour eject as "flip the enable

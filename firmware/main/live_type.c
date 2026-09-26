@@ -71,6 +71,11 @@ extern sdmmc_card_t *live_type_get_card(void);  // resolved via c6_uart
 #define BADUSB_ATK_COMMIT_ADDR  0xB8   // slave scratch reg 60
 #define BADUSB_SILENT_ADDR      0xB9   // slave scratch reg 61 — Silent Startup (0/1)
 #define BADUSB_FSCH_ADDR        0xAB   // slave scratch reg 47 — file-listing channel
+// MSC diagnostics: what tud_msc_capacity_cb ACTUALLY returned to the host.
+// Regs 32..38, Function-1 addresses = reg + 0x7C so 32→0x9C, 38→0xA2.
+#define BADUSB_MSC_BLKCNT_ADDR  0x9C   // reg 32..35 (4 bytes LE, last block_count)
+#define BADUSB_MSC_BLKSZ_ADDR   0xA0   // reg 36..37 (2 bytes LE, last block_size)
+#define BADUSB_MSC_CALLS_ADDR   0xA2   // reg 38     (1 byte, capacity_cb call count mod 256)
 
 static const char *TAG = "live_type";
 
@@ -176,9 +181,33 @@ static void fs_stream_listing(sdmmc_card_t *card) {
 static void live_type_task(void *arg) {
     (void)arg;
     ESP_LOGI(TAG, "live-type task up (reg 44/46 poller)");
+    // MSC capacity-callback observability (see g_msc_last_*).
+    extern volatile uint32_t g_msc_last_block_count;
+    extern volatile uint16_t g_msc_last_block_size;
+    extern volatile uint32_t g_msc_capacity_cb_calls;
+    static uint32_t s_last_pushed_blkcnt = 0xFFFFFFFF;
+    static int s_diag_tick = 0;
+
     while (1) {
         sdmmc_card_t *card = live_type_get_card();
         if (!card) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+
+        // Push MSC diagnostics every ~500 ms so the C6 /api/stats can show
+        // what Windows actually asked for (or 0 if it never asked).
+        if (++s_diag_tick >= 25) {   // 25 * 20 ms = 500 ms
+            s_diag_tick = 0;
+            uint32_t bc = g_msc_last_block_count;
+            uint16_t bs = g_msc_last_block_size;
+            uint8_t  cn = (uint8_t)(g_msc_capacity_cb_calls & 0xFF);
+            if (bc != s_last_pushed_blkcnt) {
+                s_last_pushed_blkcnt = bc;
+                for (int i = 0; i < 4; i++)
+                    sdmmc_io_write_byte(card, 1, BADUSB_MSC_BLKCNT_ADDR + i, (bc >> (8*i)) & 0xFF, NULL);
+                sdmmc_io_write_byte(card, 1, BADUSB_MSC_BLKSZ_ADDR + 0, bs & 0xFF, NULL);
+                sdmmc_io_write_byte(card, 1, BADUSB_MSC_BLKSZ_ADDR + 1, (bs >> 8) & 0xFF, NULL);
+                sdmmc_io_write_byte(card, 1, BADUSB_MSC_CALLS_ADDR, cn, NULL);
+            }
+        }
 
         // USB-identity commit — one-shot: when the C6 web UI posts to
         // /api/save-usb it writes reg 48..51 with the new VID/PID and
@@ -258,13 +287,32 @@ static void live_type_task(void *arg) {
             for (int i = 0; i < 6; i++)
                 sdmmc_io_write_byte(card, 1, BADUSB_SIZE_BASE_ADDR + i, (applied >> (8 * i)) & 0xFF, NULL);
 
+            // When storage is being attached (or reattached with a new size),
+            // (re)format the FAT with the fake capacity so Windows sees a
+            // fresh N-GB filesystem, not the old 16 MB boot sector. Formatting
+            // MUST happen while the volume is detached from the host (no dual
+            // mount). Temporarily flip s_enabled off so msc_storage_format_fake
+            // accepts the request; usb_apply_state / usb_force_reenumerate does
+            // the actual USB disconnect.
+            bool need_format = want_storage && cap_changed && bytes > 0;
+            if (need_format) {
+                // Detach USB first (host lets go of the FAT), then format,
+                // then let usb_apply_state re-attach with the fresh FAT.
+                extern void tud_disconnect(void);
+                extern void tud_connect(void);
+                tud_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(600));
+                bool was_enabled = msc_storage_enabled();
+                msc_storage_set_enabled(false);
+                esp_err_t ferr = msc_storage_format_fake(bytes);
+                msc_storage_set_enabled(was_enabled);
+                if (ferr != ESP_OK) ESP_LOGE(TAG, "format_fake err=%d", ferr);
+            }
             if (mode != prev_state) {
                 usb_apply_state(mode);              // HID / STORAGE / NONE change
             } else if (want_storage && cap_changed) {
-                // Same mode, new size → tell the host the medium changed so it
-                // re-reads READ CAPACITY, AND re-enumerate as a fallback for
-                // hosts that ignore the UNIT ATTENTION.
-                msc_storage_signal_media_change();
+                // Same mode, new size → do a full USB re-enumeration so Windows
+                // re-reads READ CAPACITY at the new geometry.
                 usb_force_reenumerate();
             }
         }

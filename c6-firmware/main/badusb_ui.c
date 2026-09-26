@@ -1118,6 +1118,14 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
     uint64_t applied_size = 0;
     for (int i = 0; i < 6; i++)
         applied_size |= ((uint64_t)sdio_slave_read_reg(SDIO_REG_SIZE_BASE + i)) << (8 * i);
+    // MSC observability: what the P4 ACTUALLY returned from tud_msc_capacity_cb.
+    // If Windows sees 16 MB but SIZE_ set 1 GB, this tells us whether the
+    // callback wasn't fired, fired with wrong fake, or fired with our value.
+    uint32_t msc_blkcnt = 0;
+    for (int i = 0; i < 4; i++) msc_blkcnt |= ((uint32_t)sdio_slave_read_reg(32 + i)) << (8 * i);
+    uint16_t msc_blksz = (uint16_t)(sdio_slave_read_reg(36) | (sdio_slave_read_reg(37) << 8));
+    uint8_t  msc_calls = sdio_slave_read_reg(38);
+    uint64_t msc_reported_bytes = (uint64_t)msc_blkcnt * (uint64_t)msc_blksz;
 
     // Roomy buffer: the JSON runs ~600 chars, but new fields were added and a
     // truncated body is invalid JSON that breaks EVERY tile at once — cheap to
@@ -1137,7 +1145,8 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         "\"lastError\":\"\","
         // --- ATTACKMODE state (chip in the Live tab / Settings) ---
         "\"attackMode\":{\"hid\":true,\"storage\":false,"
-                        "\"vid\":\"0x303A\",\"pid\":\"0x4B44\",\"sizeBytes\":%llu},"
+                        "\"vid\":\"0x303A\",\"pid\":\"0x4B44\",\"sizeBytes\":%llu,"
+                        "\"mscBlkCnt\":%u,\"mscBlkSz\":%u,\"mscCbCalls\":%u,\"mscReportedBytes\":%llu},"
         // --- USB composition (Explorer banner): 0=HID 1=HID+STORAGE 2=NONE ---
         "\"usbMode\":%u,"
         // --- Wi-Fi ---
@@ -1169,6 +1178,8 @@ static esp_err_t h_api_stats(httpd_req_t *r) {
         (unsigned)up_s,
         (unsigned)s_sta_count,
         (unsigned long long)applied_size,
+        (unsigned)msc_blkcnt, (unsigned)msc_blksz, (unsigned)msc_calls,
+        (unsigned long long)msc_reported_bytes,
         (unsigned)s_usb_mode,
         s_wifi_up == 1 ? "true" : "false",
         s_led_off ? "false" : "true", (unsigned)s_led_mode,

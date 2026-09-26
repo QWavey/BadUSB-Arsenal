@@ -29,6 +29,16 @@ void      msc_storage_set_fake_capacity(uint64_t bytes);
 uint64_t  msc_storage_capacity_bytes(void);
 // Signal the host that the medium changed so it re-reads capacity (SIZE_).
 void      msc_storage_signal_media_change(void);
+// Reset the pending media-change eject before a fresh USB enumeration
+// (called by main.c's usb_apply_state to prevent leaked state).
+void      msc_storage_clear_media_change(void);
+// Format the payload volume as a FRESH FATFS advertising `fake_bytes` of
+// total capacity. Uses a shim diskio that reports the fake sector count so
+// f_mkfs builds boot sector + FAT tables for the fake size; writes past the
+// real 16 MB end are silently accepted (they just don't persist), so file
+// storage still tops out at the real backing size. MUST be called while
+// USB is detached (no dual-mount). Returns ESP_OK on success.
+esp_err_t msc_storage_format_fake(uint64_t fake_bytes);
 
 // Mount the payload-volume FAT read-only ON THE EXISTING wear-leveling handle
 // (no second wl_mount), enumerate the root directory into `out` as one line

@@ -262,9 +262,18 @@ void usb_apply_state(int st) {
     if (st == s_usb_state) return;
     ESP_LOGI(TAG, "USB state %d -> %d (0=HID 1=STORAGE 2=NONE)", s_usb_state, st);
     tud_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(120));      // let the host see the unplug
+    // 120 ms was too short: Windows debounces unplugs and often didn't notice,
+    // so the new descriptor (with MSC + fake capacity) was never re-read and
+    // it kept showing the old geometry. 600 ms comfortably clears the debounce
+    // window and forces a real re-enumeration.
+    vTaskDelay(pdMS_TO_TICKS(600));
     if (st != USB_STATE_NONE) {
         build_config_desc(st == USB_STATE_STORAGE);
+        // A pending eject/insert (from a same-mode SIZE_) would leak into this
+        // fresh enumeration and answer "medium not present" for the first few
+        // TEST UNIT READY polls → Windows bails and never reads capacity.
+        extern void msc_storage_clear_media_change(void);
+        msc_storage_clear_media_change();
         tud_connect();
     }
     s_usb_state = st;
@@ -287,7 +296,8 @@ void usb_force_reenumerate(void) {
     if (s_usb_state != USB_STATE_STORAGE) return;   // nothing attached to refresh
     ESP_LOGI(TAG, "USB re-enumerate (capacity change)");
     tud_disconnect();
-    vTaskDelay(pdMS_TO_TICKS(120));
+    // 600 ms — see usb_apply_state for why: Windows debounces unplugs.
+    vTaskDelay(pdMS_TO_TICKS(600));
     tud_connect();
 }
 
