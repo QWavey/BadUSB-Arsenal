@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include <sys/types.h>
 #include <unistd.h>        // unlink()
 #include <ctype.h>
@@ -1637,6 +1638,51 @@ static esp_err_t h_api_rename(httpd_req_t *r) {
     return httpd_resp_send(r, msg, mn);
 }
 
+// /api/create-directory — mkdir on the on-device SPIFFS at /data/<path>.
+// Body: {"path":"foo/bar"} OR ?path=foo/bar. Rejects traversal (..),
+// strips leading slashes, and tolerates "already exists" as success so
+// the client can safely retry.
+static esp_err_t h_api_create_directory(httpd_req_t *r) {
+    char buf[512] = { 0 };
+    if (r->content_len > 0 && r->content_len < (int)sizeof(buf)) {
+        int got = 0;
+        while (got < (int)r->content_len) {
+            int w = (int)sizeof(buf) - 1 - got; if (w > (int)r->content_len - got) w = (int)r->content_len - got;
+            int n = httpd_req_recv(r, buf + got, w);
+            if (n <= 0) break;
+            got += n;
+        }
+        buf[got] = 0;
+    }
+    char path[128] = { 0 };
+    const char *pp = strstr(buf, "\"path\"");
+    if (pp) {
+        pp = strchr(pp, ':'); if (pp) pp++;
+        while (pp && *pp && isspace((unsigned char)*pp)) pp++;
+        if (pp && *pp == '"') {
+            pp++;
+            int i = 0;
+            while (*pp && *pp != '"' && i < (int)sizeof(path) - 1) path[i++] = *pp++;
+            path[i] = 0;
+        }
+    }
+    if (!path[0]) {
+        char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+        httpd_query_key_value(q, "path", path, sizeof(path));
+    }
+    if (!path[0])             { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "need path"); return ESP_OK; }
+    if (strstr(path, ".."))   { httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "bad path");  return ESP_OK; }
+    char *sp = path; while (*sp == '/') sp++;
+    char full[160];
+    snprintf(full, sizeof(full), "/data/%s", sp);
+    int rc = mkdir(full, 0777);
+    httpd_resp_set_type(r, "application/json");
+    if (rc == 0 || errno == EEXIST) return httpd_resp_send(r, "{\"success\":true}", 16);
+    char msg[128];
+    int mn = snprintf(msg, sizeof(msg), "{\"success\":false,\"error\":\"mkdir failed errno=%d\"}", errno);
+    return httpd_resp_send(r, msg, mn);
+}
+
 // /api/validate-script — quick syntactic pass over the DuckyScript
 // body. For now we accept any non-empty payload as "valid" (the real
 // parser lives in /execute); the UI just wants a green-check indicator.
@@ -1893,6 +1939,7 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/download",       HTTP_GET,  h_api_download,      NULL, false, false, NULL},
         // /api/rename — rename a file inside /data/ (JSON body or query).
         {"/api/rename",         HTTP_POST, h_api_rename,        NULL, false, false, NULL},
+        {"/api/create-directory", HTTP_POST, h_api_create_directory, NULL, false, false, NULL},
         // /api/scan-wifi + /api/scan-results — real STA scan on the C6
         // (APSTA mode; the AP stays up the whole time).
         {"/api/scan-wifi",      HTTP_POST, h_api_scan_wifi,     NULL, false, false, NULL},
@@ -1957,7 +2004,7 @@ void badusb_ui_register(httpd_handle_t s) {
         // (/api/list-files, /api/upload, /api/download, /api/rename are
         // REAL — registered above).
         "/api/copy-file", "/api/cut-file", "/api/paste-file",
-        "/api/create-directory", "/api/check-file", "/api/file-info",
+        "/api/check-file", "/api/file-info",
         "/api/use-file",
         // Alias for the older `/api/self-destruct` path some JS still
         // uses (parallel to the canonical `/selfdestruct`).
