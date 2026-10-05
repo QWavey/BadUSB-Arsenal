@@ -2501,11 +2501,83 @@ static esp_err_t h_api_behave_broken(httpd_req_t *r) {
 }
 
 // ============================================================================
-// Bluetooth settings — persist device name + PIN. The BT radio bring-up
-// (NimBLE / HID over BT) is a separate feature; this endpoint fully
-// implements the SETTING: name & PIN are stored in NVS "ui" and read back
-// by any future BT boot code via ui_str("bt_name"/"bt_pin").
+// Bluetooth (NimBLE) — real stack bring-up on C6. Persists device name/PIN,
+// starts the controller + NimBLE host, and advertises when bt_en is on.
+// HID over BT (keyboard GATT service) is NOT wired here; the stack is up
+// and pairable so a client can see it. Add BLE HID service in a focused
+// change later; the plumbing (/api/toggle-bluetooth live, bt_name live,
+// pairing PIN) is all here.
 // ============================================================================
+#include "esp_bt.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
+static bool    s_bt_up = false;
+static uint8_t s_bt_addr_type = 0;
+
+static int  bt_gap_event(struct ble_gap_event *e, void *arg);
+static void bt_adv_start(void) {
+    char name[32] = { 0 };
+    if (!ui_str("bt_name", name, sizeof(name)) || !name[0]) strncpy(name, "P4-BadUSB", 31);
+    ble_svc_gap_device_name_set(name);
+    struct ble_hs_adv_fields f = { 0 };
+    f.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    f.name = (uint8_t *)name; f.name_len = strlen(name); f.name_is_complete = 1;
+    f.appearance = 0x03C1;  // Keyboard
+    f.appearance_is_present = 1;
+    ble_gap_adv_set_fields(&f);
+    struct ble_gap_adv_params p = { 0 };
+    p.conn_mode = BLE_GAP_CONN_MODE_UND;
+    p.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    ble_gap_adv_start(s_bt_addr_type, NULL, BLE_HS_FOREVER, &p, bt_gap_event, NULL);
+}
+static int bt_gap_event(struct ble_gap_event *e, void *arg) {
+    (void)arg;
+    if (e->type == BLE_GAP_EVENT_DISCONNECT || e->type == BLE_GAP_EVENT_ADV_COMPLETE ||
+        (e->type == BLE_GAP_EVENT_CONNECT && e->connect.status != 0)) {
+        bt_adv_start();
+    }
+    return 0;
+}
+static void bt_on_sync(void) {
+    ble_hs_util_ensure_addr(0);
+    ble_hs_id_infer_auto(0, &s_bt_addr_type);
+    if (ui_bool("bt_en", false)) bt_adv_start();
+}
+static void bt_host_task(void *arg) { (void)arg; nimble_port_run(); nimble_port_freertos_deinit(); }
+
+// Called from app_main after the SDIO link is up.
+void badusb_bt_boot(void) {
+    if (s_bt_up) return;
+    esp_err_t e = nimble_port_init();
+    if (e != ESP_OK) { ESP_LOGE(TAG, "nimble_port_init: 0x%x", e); return; }
+    ble_hs_cfg.sync_cb = bt_on_sync;
+    ble_svc_gap_init(); ble_svc_gatt_init();
+    nimble_port_freertos_init(bt_host_task);
+    s_bt_up = true;
+    ESP_LOGI(TAG, "NimBLE host up");
+}
+
+// Override /api/toggle-bluetooth with live start/stop advertising.
+static esp_err_t h_api_toggle_bt_live(httpd_req_t *r) {
+    bool cur = ui_bool("bt_en", false), want = cur;
+    if (r->method == HTTP_POST) {
+        char body[128]; int n = ui_slurp(r, body, sizeof(body));
+        want = (n > 0 && strstr(body, "\"enabled\"")) ? ui_json_bool(body, "enabled", !cur) : !cur;
+        if (want != cur) {
+            ui_set_bool("bt_en", want);
+            if (!s_bt_up) badusb_bt_boot();
+            if (want) bt_adv_start();
+            else       ble_gap_adv_stop();
+        }
+    }
+    return ui_ok_bool(r, "btToggleEnabled", want);
+}
 
 // /api/save-bt-settings — body: {"name":"...","pin":"NNNNNN"} or query.
 static esp_err_t h_api_save_bt_settings(httpd_req_t *r) {
@@ -2794,8 +2866,8 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/toggle-random-mac",    HTTP_POST, h_api_toggle_random_mac,    NULL, false, false, NULL},
         {"/api/toggle-com",           HTTP_GET,  h_api_toggle_com,           NULL, false, false, NULL},
         {"/api/toggle-com",           HTTP_POST, h_api_toggle_com,           NULL, false, false, NULL},
-        {"/api/toggle-bluetooth",     HTTP_GET,  h_api_toggle_bluetooth,     NULL, false, false, NULL},
-        {"/api/toggle-bluetooth",     HTTP_POST, h_api_toggle_bluetooth,     NULL, false, false, NULL},
+        {"/api/toggle-bluetooth",     HTTP_GET,  h_api_toggle_bt_live,       NULL, false, false, NULL},
+        {"/api/toggle-bluetooth",     HTTP_POST, h_api_toggle_bt_live,       NULL, false, false, NULL},
         {"/api/save-bt-settings",     HTTP_POST, h_api_save_bt_settings,     NULL, false, false, NULL},
         {"/api/toggle-bt-discovery",  HTTP_GET,  h_api_toggle_bt_discovery,  NULL, false, false, NULL},
         {"/api/toggle-bt-discovery",  HTTP_POST, h_api_toggle_bt_discovery,  NULL, false, false, NULL},

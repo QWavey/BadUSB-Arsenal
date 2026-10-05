@@ -3,11 +3,13 @@ CONFIG_IDF_TARGET="esp32c6"
 # Wi-Fi enabled; run on C6's own radio (no coprocessor)
 CONFIG_ESP_WIFI_ENABLED=y
 
-# NOTE: Bluetooth stack bring-up (NimBLE/Bluedroid) requires several
-# interdependent menuconfig settings; it's a sizeable feature that will
-# land in its own change. The web UI toggles (/api/toggle-bluetooth,
-# /api/save-bt-settings) are fully wired to NVS so settings persist, and
-# will apply automatically once the BT backend is added.
+# Bluetooth (BLE via NimBLE host). On the C6 the controller is built-in.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_LE_CONTROLLER_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
 
 # HTTP server + WebSocket
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

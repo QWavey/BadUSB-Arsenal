@@ -1150,7 +1150,9 @@ void app_main(void) {
     // Delayed briefly so the C6 ↔ P4 SDIO link is up before DuckyScript HID
     // commands start firing.
     vTaskDelay(pdMS_TO_TICKS(2000));
+    extern void badusb_bt_boot(void);
     extern void badusb_run_boot_script(void);
+    badusb_bt_boot();
     badusb_run_boot_script();
     while (1) vTaskDelay(pdMS_TO_TICKS(5000));
 }
