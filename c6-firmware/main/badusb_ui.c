@@ -2500,6 +2500,49 @@ static esp_err_t h_api_behave_broken(httpd_req_t *r) {
     return ui_ok_bool(r, "behaveBroken", v);
 }
 
+// ============================================================================
+// Bluetooth settings — persist device name + PIN. The BT radio bring-up
+// (NimBLE / HID over BT) is a separate feature; this endpoint fully
+// implements the SETTING: name & PIN are stored in NVS "ui" and read back
+// by any future BT boot code via ui_str("bt_name"/"bt_pin").
+// ============================================================================
+
+// /api/save-bt-settings — body: {"name":"...","pin":"NNNNNN"} or query.
+static esp_err_t h_api_save_bt_settings(httpd_req_t *r) {
+    char body[256]; int n = ui_slurp(r, body, sizeof(body));
+    char name[32] = { 0 }, pin[8] = { 0 };
+    if (n > 0) {
+        ui_json_str(body, "name", name, sizeof(name));
+        ui_json_str(body, "pin",  pin,  sizeof(pin));
+        if (!name[0]) ui_json_str(body, "deviceName", name, sizeof(name));
+    }
+    if (!name[0] || !pin[0]) {
+        char q[192] = { 0 };
+        httpd_req_get_url_query_str(r, q, sizeof(q));
+        if (!name[0]) httpd_query_key_value(q, "name", name, sizeof(name));
+        if (!pin[0])  httpd_query_key_value(q, "pin",  pin,  sizeof(pin));
+    }
+    if (name[0]) {
+        // Clean the device name: replace non-printables with underscores.
+        for (char *p = name; *p; p++) if (*p < 0x20 || *p > 0x7E) *p = '_';
+        ui_set_str("bt_name", name);
+    }
+    if (pin[0]) {
+        bool allnum = (strlen(pin) == 6);
+        for (char *p = pin; *p && allnum; p++) if (*p < '0' || *p > '9') allnum = false;
+        if (!allnum) return ui_err(r, "bad_pin", "PIN must be 6 digits");
+        ui_set_str("bt_pin", pin);
+    }
+    httpd_resp_set_type(r, "application/json");
+    char cur_name[32]; ui_str("bt_name", cur_name, sizeof(cur_name));
+    char resp[160];
+    int rn = snprintf(resp, sizeof(resp),
+        "{\"success\":true,\"name\":\"%s\",\"pinSet\":%s}",
+        cur_name[0] ? cur_name : "P4-BadUSB",
+        pin[0] ? "true" : "false");
+    return httpd_resp_send(r, resp, rn);
+}
+
 // Public entry: run the persisted boot script (if any) via the same executor
 // path /execute uses. Called once at the end of app_main. The script buffer
 // is malloc'd, read from /data/ducky/<name>, and transferred to the task
@@ -2753,6 +2796,7 @@ void badusb_ui_register(httpd_handle_t s) {
         {"/api/toggle-com",           HTTP_POST, h_api_toggle_com,           NULL, false, false, NULL},
         {"/api/toggle-bluetooth",     HTTP_GET,  h_api_toggle_bluetooth,     NULL, false, false, NULL},
         {"/api/toggle-bluetooth",     HTTP_POST, h_api_toggle_bluetooth,     NULL, false, false, NULL},
+        {"/api/save-bt-settings",     HTTP_POST, h_api_save_bt_settings,     NULL, false, false, NULL},
         {"/api/toggle-bt-discovery",  HTTP_GET,  h_api_toggle_bt_discovery,  NULL, false, false, NULL},
         {"/api/toggle-bt-discovery",  HTTP_POST, h_api_toggle_bt_discovery,  NULL, false, false, NULL},
         {"/api/toggle-wifi",          HTTP_GET,  h_api_toggle_wifi,          NULL, false, false, NULL},
@@ -2836,16 +2880,7 @@ void badusb_ui_register(httpd_handle_t s) {
     // vs the reference (`grep -oE '"/[a-z][a-zA-Z0-9/-]*"'
     // WebServerManager.cpp` on the upstream tree). If a path here is
     // NOT in the reference, it does not belong.
-    // Every previously-stubbed endpoint now has a REAL handler registered
-    // above. One remaining stub kept: /api/save-bt-settings has no backing
-    // BT stack in this build (BT is a compile-time opt-in).
-    static const char *stub_paths[] = {
-        "/api/save-bt-settings",
-    };
-    for (unsigned i = 0; i < sizeof(stub_paths)/sizeof(stub_paths[0]); i++)
-        reg_both(s, stub_paths[i], h_api_default);
-
-    ESP_LOGI(TAG, "BadUSB routes registered (real=%u, stub=%u)",
-             (unsigned)(sizeof(real)/sizeof(real[0])),
-             (unsigned)(sizeof(stub_paths)/sizeof(stub_paths[0])));
+    // All reference /api/* endpoints have real backends now; no stub list.
+    ESP_LOGI(TAG, "BadUSB routes registered (real=%u, stub=0)",
+             (unsigned)(sizeof(real)/sizeof(real[0])));
 }
