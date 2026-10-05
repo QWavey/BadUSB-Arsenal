@@ -289,30 +289,29 @@ static void live_type_task(void *arg) {
 
             // When storage is being attached (or reattached with a new size),
             // (re)format the FAT with the fake capacity so Windows sees a
-            // fresh N-GB filesystem, not the old 16 MB boot sector. Formatting
-            // MUST happen while the volume is detached from the host (no dual
-            // mount). Temporarily flip s_enabled off so msc_storage_format_fake
-            // accepts the request; usb_apply_state / usb_force_reenumerate does
-            // the actual USB disconnect.
+            // fresh N-GB filesystem. MUST happen while USB is detached so
+            // Windows isn't reading the FAT while we rewrite it.
+            //
+            // The disconnect/reconnect is done ONCE across the whole commit
+            // — never twice. Two dwc2 tud_disconnect() calls in a row without
+            // an intervening reset wedge the peripheral (drive vanishes and
+            // won't come back until a physical replug). So the format flow
+            // does its own disconnect and reconnect, and we short-circuit the
+            // later usb_apply_state / usb_force_reenumerate for same-mode
+            // capacity changes.
             bool need_format = want_storage && cap_changed && bytes > 0;
-            if (need_format) {
-                // Detach USB first (host lets go of the FAT), then format,
-                // then let usb_apply_state re-attach with the fresh FAT.
-                extern void tud_disconnect(void);
-                extern void tud_connect(void);
-                tud_disconnect();
-                vTaskDelay(pdMS_TO_TICKS(600));
-                bool was_enabled = msc_storage_enabled();
-                msc_storage_set_enabled(false);
-                esp_err_t ferr = msc_storage_format_fake(bytes);
-                msc_storage_set_enabled(was_enabled);
-                if (ferr != ESP_OK) ESP_LOGE(TAG, "format_fake err=%d", ferr);
-            }
-            if (mode != prev_state) {
-                usb_apply_state(mode);              // HID / STORAGE / NONE change
+            extern void usb_reconfigure(int st, bool do_format, uint64_t fake_bytes);
+            // ONE unified disconnect/reconfigure/reconnect cycle. Doing two
+            // separate cycles (one for format, one for mode change) wedges the
+            // dwc2 peripheral for anything but tiny volumes (small MB formats
+            // finish so fast the second cycle catches up; GB-sized formats
+            // don't). usb_reconfigure handles ALL of: state change, format,
+            // descriptor swap, media-change clear, serial bump, reconnect.
+            if (need_format || mode != prev_state) {
+                usb_reconfigure(mode, need_format, bytes);
             } else if (want_storage && cap_changed) {
-                // Same mode, new size → do a full USB re-enumeration so Windows
-                // re-reads READ CAPACITY at the new geometry.
+                // Same mode, capacity change, no format needed (bytes==0) —
+                // just a re-enumeration so the host re-reads READ CAPACITY.
                 usb_force_reenumerate();
             }
         }

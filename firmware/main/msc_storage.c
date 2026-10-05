@@ -187,23 +187,44 @@ static const ff_diskio_impl_t s_shim_impl = {
 
 esp_err_t msc_storage_format_fake(uint64_t fake_bytes) {
     if (s_wl == WL_INVALID_HANDLE) return ESP_ERR_INVALID_STATE;
-    if (s_enabled)                 return ESP_ERR_INVALID_STATE;  // MUST be detached
+    // Use the LIVE USB state (what the host actually sees) rather than the
+    // persisted s_enabled flag. usb_reconfigure flips the flag off before
+    // calling us, but a direct caller shouldn't be able to format while the
+    // volume is live on USB.
+    extern bool usb_storage_visible(void);
+    if (usb_storage_visible())     return ESP_ERR_INVALID_STATE;
     if (fake_bytes < 4 * 1024 * 1024) fake_bytes = (uint64_t)s_sector_count * s_sector_size;  // <4 MB is silly
 
     uint32_t sect_sz = s_sector_size;
     uint64_t fake_sect = (fake_bytes + sect_sz - 1) / sect_sz;
     if (fake_sect > (uint64_t)0xFFFFFFFFULL) fake_sect = 0xFFFFFFFFULL;
 
-    // Pick a cluster size that keeps the FAT table inside our real 16 MB
-    // backing (FAT32 entry = 4 bytes). Try 4 KB, 8, 16, 32, 64 KB and pick
-    // the smallest that keeps two FATs under ~10 MB. For a 4 GB fake,
-    // 4 KB clusters -> 4 MB FAT -> fits. For 1 TB, need bigger clusters.
+    // Pick a cluster size that keeps the FAT table inside our real backing
+    // (FAT32 entry = 4 bytes, we use n_fat=1 to halve metadata). FATFS's
+    // f_mkfs may pick a slightly bigger cluster on its own for huge volumes,
+    // but we hint the minimum here. Cap at 32 KB (FAT32 spec max).
+    // Budget for the FAT: real_backing / 4 so writing the FAT leaves room
+    // for the boot sector + a small root directory.
+    uint64_t fat_budget = ((uint64_t)s_sector_count * s_sector_size) / 4;
+    if (fat_budget < 1024 * 1024) fat_budget = 1024 * 1024;
     uint32_t au_bytes = sect_sz;
-    while (au_bytes < 64 * 1024) {
+    while (au_bytes < 32 * 1024) {
         uint64_t clusters = fake_bytes / au_bytes;
-        uint64_t fat_bytes = clusters * 4 + 4096;   // + reserved
-        if (fat_bytes * 2 < 10ULL * 1024 * 1024) break;   // 2 FATs under 10 MB
+        uint64_t fat_bytes = clusters * 4 + 4096;
+        if (fat_bytes < fat_budget) break;
         au_bytes *= 2;
+    }
+    // If even 32 KB clusters don't make the FAT fit, refuse — a corrupt
+    // partial format would present an unreadable drive.
+    {
+        uint64_t clusters = fake_bytes / au_bytes;
+        uint64_t fat_bytes = clusters * 4 + 4096;
+        if (fat_bytes >= (uint64_t)s_sector_count * s_sector_size) {
+            ESP_LOGE(TAG, "fake cap %llu too big: FAT %llu > backing %u",
+                     (unsigned long long)fake_bytes, (unsigned long long)fat_bytes,
+                     (unsigned)(s_sector_count * s_sector_size));
+            return ESP_ERR_INVALID_SIZE;
+        }
     }
 
     BYTE pdrv = 0xFF;
@@ -217,10 +238,14 @@ esp_err_t msc_storage_format_fake(uint64_t fake_bytes) {
 
     char drv[3] = { (char)('0' + pdrv), ':', 0 };
     MKFS_PARM opt = { .fmt = FM_FAT32, .n_fat = 1, .align = 1, .n_root = 0, .au_size = au_bytes };
-    void *workbuf = malloc(FF_MAX_SS * 4);
+    // f_mkfs uses workbuf to buffer FAT sectors during zero-init. Bigger =
+    // fewer per-sector calls; 32 KB is enough for volumes up to 128 GB and
+    // still fits comfortably in RAM.
+    const size_t WBUF = 32 * 1024;
+    void *workbuf = malloc(WBUF);
     esp_err_t ret = ESP_OK;
     if (!workbuf) { ret = ESP_ERR_NO_MEM; goto done; }
-    FRESULT fr = f_mkfs(drv, &opt, workbuf, FF_MAX_SS * 4);
+    FRESULT fr = f_mkfs(drv, &opt, workbuf, WBUF);
     if (fr != FR_OK) {
         ESP_LOGE(TAG, "f_mkfs failed: %d (fake=%llu au=%u)", fr, (unsigned long long)fake_bytes, (unsigned)au_bytes);
         ret = ESP_FAIL;
@@ -232,6 +257,10 @@ esp_err_t msc_storage_format_fake(uint64_t fake_bytes) {
 done:
     ff_diskio_unregister(pdrv);
     s_shim_wl = WL_INVALID_HANDLE;
+    extern volatile int32_t  g_msc_last_format_result;
+    extern volatile uint64_t g_msc_last_format_bytes;
+    g_msc_last_format_result = (int32_t)ret;
+    g_msc_last_format_bytes  = fake_bytes;
     return ret;
 }
 
@@ -243,7 +272,12 @@ esp_err_t msc_storage_list(char *out, size_t out_sz, int *nfiles) {
     if (out && out_sz) out[0] = 0;
     if (!out || out_sz < 2)          return ESP_ERR_INVALID_ARG;
     if (s_wl == WL_INVALID_HANDLE)   return ESP_ERR_INVALID_STATE;
-    if (s_enabled)                   return ESP_ERR_INVALID_STATE;  // attached to host
+    // Guard against dual-mounting the FAT: refuse while the host actually sees
+    // the volume on USB. Use the live USB state (not just the persisted
+    // s_enabled flag) so Silent-Startup — which gates the boot-time attach
+    // without touching s_enabled — doesn't block the browse unnecessarily.
+    extern bool usb_storage_visible(void);
+    if (usb_storage_visible())       return ESP_ERR_INVALID_STATE;
 
     BYTE pdrv = 0xFF;
     if (ff_diskio_get_drive(&pdrv) != ESP_OK || pdrv == 0xFF) return ESP_FAIL;
@@ -320,13 +354,18 @@ bool tud_msc_test_unit_ready_cb(uint8_t lun) {
     return true;
 }
 
-// Diagnostic: what did the last READ CAPACITY(10) actually report to Windows?
-// This is the ground truth for the "SIZE_ shows 16 MB" bug — if fake_capacity
-// is set but Windows sees 16 MB, one of these two exposes exactly where.
+// Diagnostic globals visible via /api/stats:
+//   - block_count/size: what tud_msc_capacity_cb last reported to the host
+//   - fake_bytes: value of s_fake_capacity when cb fired
+//   - capacity_cb_calls: monotonic count of READ CAPACITY(10) invocations
+//   - last_format_result: 0=none, 1=OK, negative=esp_err from last format_fake
+//   - last_format_bytes: bytes requested to last format_fake call
 volatile uint32_t g_msc_last_block_count = 0;
 volatile uint16_t g_msc_last_block_size  = 0;
 volatile uint64_t g_msc_last_fake_bytes  = 0;
 volatile uint32_t g_msc_capacity_cb_calls = 0;
+volatile int32_t  g_msc_last_format_result = 0;
+volatile uint64_t g_msc_last_format_bytes  = 0;
 
 void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size) {
     (void)lun;
@@ -368,20 +407,34 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 }
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
-    (void)lun;
+    (void)lun; (void)buffer;
     if (s_wl == WL_INVALID_HANDLE) return -1;
-    if (lba >= s_sector_count) return -1;
+    // Past-real-end write: pretend success and DROP the data. Windows sees a
+    // clean ACK and keeps using the drive up to the fake size shown in
+    // Explorer — instead of returning -1 (SCSI error) which Windows treats
+    // as a device failure and drops the whole drive off. This is the
+    // deliberate "fake size" trade-off: the first ~16 MB persist, past that
+    // the writes vanish (files past the boundary can't be read back).
+    if (lba >= s_sector_count) return (int32_t)bufsize;
+    // Would-cross-boundary write: honour up to the real end, silently drop
+    // the tail. Prevents partial data being written to the last real sector.
+    uint32_t max_sectors = s_sector_count - lba;
+    uint64_t max_bytes   = (uint64_t)max_sectors * s_sector_size - offset;
+    uint32_t clip = (bufsize > max_bytes) ? (uint32_t)max_bytes : bufsize;
     // wl_write needs an aligned sector erase first, then a write. Do
-    // it in one shot when offset==0 and bufsize is a whole sector,
+    // it in one shot when offset==0 and clip is a whole sector,
     // which is the common case for MSC 512/4096-byte block IO.
     size_t addr = (size_t)lba * s_sector_size + offset;
     esp_err_t err;
-    if (offset == 0 && bufsize == s_sector_size) {
+    if (offset == 0 && clip == s_sector_size) {
         err = wl_erase_range(s_wl, addr, s_sector_size);
         if (err != ESP_OK) return -1;
     }
-    err = wl_write(s_wl, addr, buffer, bufsize);
-    return (err == ESP_OK) ? (int32_t)bufsize : -1;
+    err = wl_write(s_wl, addr, buffer, clip);
+    if (err != ESP_OK) return -1;
+    // Report bufsize (not clip) — the whole write is "accepted" from the host's
+    // POV, even though the tail past the real end was silently dropped.
+    return (int32_t)bufsize;
 }
 
 // SCSI command not covered by the shortcuts above. TinyUSB's own

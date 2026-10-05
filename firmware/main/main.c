@@ -24,6 +24,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_mac.h"
+#include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -80,7 +81,25 @@ static const uint8_t hid_mouse_report_desc[] = {
 
 // Serial string is chip-unique (filled from eFuse MAC in app_main) so two
 // boards with the same custom PID never present the same identity to Windows.
-static char serial_str[16];
+// A per-attach counter suffix is bumped by usb_bump_serial() before every
+// live re-enumeration so Windows treats each attach as a NEW device instance —
+// otherwise Windows caches the disk's partition/FAT layout keyed by
+// (VID, PID, iSerialNumber) and reuses stale geometry across our
+// disconnect/reconnect (that's why SIZE_ / format wouldn't "take" reliably).
+static char     serial_str[24];
+static uint16_t s_serial_epoch = 0;   // bumped on every USB re-attach
+static uint32_t s_id_base = 0;        // MAC-derived base id, set in app_main
+
+// Bump the serial-number epoch so the NEXT USB enumeration presents a new
+// (VID, PID, iSerialNumber) triple → Windows creates a fresh device instance
+// with a clean cache instead of reusing stale disk/FAT metadata. Must be
+// called AFTER tud_disconnect and BEFORE tud_connect. Bcd device also bumped
+// so class-driver bindings pick up fresh state too.
+void usb_bump_serial(void) {
+    s_serial_epoch++;
+    snprintf(serial_str, sizeof(serial_str), "P4HID-%08X-%04X",
+             (unsigned int)s_id_base, s_serial_epoch);
+}
 
 static const char *string_desc[] = {
     (const char[]){0x09, 0x04},   // 0: English (US)
@@ -274,15 +293,76 @@ void usb_apply_state(int st) {
         // TEST UNIT READY polls → Windows bails and never reads capacity.
         extern void msc_storage_clear_media_change(void);
         msc_storage_clear_media_change();
+        // New iSerialNumber → Windows sees a fresh device instance and won't
+        // reuse cached partition / FAT geometry from the previous session.
+        usb_bump_serial();
+        tud_connect();
+    }
+    s_usb_state = st;
+}
+
+// Combined disconnect / reconfigure / (optional reformat) / reconnect in a
+// SINGLE cycle. Called from live_type when a commit needs BOTH a format and a
+// mode change (HID→STORAGE with SIZE_); doing two separate disconnect cycles
+// wedges dwc2 and the drive won't come back until physical replug.
+//   st           — target USB state (0=HID, 1=STORAGE, 2=NONE)
+//   do_format    — true to run msc_storage_format_fake between disconnect and reconnect
+//   fake_bytes   — size to format at (ignored if !do_format)
+void usb_reconfigure(int st, bool do_format, uint64_t fake_bytes) {
+    if (st < 0 || st > USB_STATE_NONE) return;
+    extern void msc_storage_clear_media_change(void);
+    extern void msc_storage_set_enabled(bool);
+    extern esp_err_t msc_storage_format_fake(uint64_t);
+    extern void msc_storage_set_fake_capacity(uint64_t);
+    ESP_LOGI(TAG, "USB reconfigure -> state=%d, format=%d, fake=%llu (from=%d)",
+             st, (int)do_format, (unsigned long long)fake_bytes, s_usb_state);
+    // Only disconnect if we're actually attached — calling tud_disconnect on
+    // an already-detached port wedges dwc2 and the reconnect never comes up.
+    if (s_usb_state != USB_STATE_NONE) {
+        tud_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(600));
+    }
+    // Mark the state as detached BEFORE the format call so msc_storage_*'s
+    // "is this visible to the host?" guard (usb_storage_visible) correctly
+    // sees the drive as detached. s_usb_state is restored to `st` at the end.
+    s_usb_state = USB_STATE_NONE;
+    if (do_format) {
+        msc_storage_set_enabled(false);
+        esp_err_t ferr = msc_storage_format_fake(fake_bytes);
+        if (ferr != ESP_OK) {
+            ESP_LOGE(TAG, "format_fake err=%d, falling back to real capacity", ferr);
+            msc_storage_set_fake_capacity(0);
+        }
+        msc_storage_set_enabled(st == USB_STATE_STORAGE);
+    }
+    if (st != USB_STATE_NONE) {
+        build_config_desc(st == USB_STATE_STORAGE);
+        msc_storage_clear_media_change();
+        usb_bump_serial();
         tud_connect();
     }
     s_usb_state = st;
 }
 
 // Seed the state at boot from the persisted storage flag (never boots NONE).
+// When Silent Startup is on (P4 NVS "led"/"silent" = 1), the storage volume
+// stays HIDDEN even if it was previously attached — the user must run
+// ATTACKMODE STORAGE / ATTACH to re-expose it. Prevents "the drive shows up
+// on every cable replug" behaviour reported when the persisted flag alone
+// controlled the boot state.
 void usb_init_state(bool storage_on) {
+    bool silent = false;
+    nvs_handle_t h;
+    if (nvs_open("led", NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, "silent", &v) == ESP_OK) silent = (v != 0);
+        nvs_close(h);
+    }
+    if (silent) storage_on = false;
     s_usb_state = storage_on ? USB_STATE_STORAGE : USB_STATE_HID;
     build_config_desc(storage_on);
+    ESP_LOGI(TAG, "usb_init_state: storage=%d silent=%d -> state=%d",
+             (int)storage_on, (int)silent, s_usb_state);
 }
 
 int  usb_get_state(void)      { return s_usb_state; }
@@ -298,6 +378,7 @@ void usb_force_reenumerate(void) {
     tud_disconnect();
     // 600 ms — see usb_apply_state for why: Windows debounces unplugs.
     vTaskDelay(pdMS_TO_TICKS(600));
+    usb_bump_serial();   // fresh Windows device instance → no cache reuse
     tud_connect();
 }
 
@@ -536,7 +617,12 @@ void app_main(void) {
     if (esp_efuse_mac_get_default(mac) != ESP_OK) { /* keep all-zero -> still stable */ }
     uint32_t id = ((uint32_t)mac[0] << 24) | ((uint32_t)mac[1] << 16)
                 | ((uint32_t)mac[2] << 8)  |  (uint32_t)mac[3];
-    snprintf(serial_str, sizeof(serial_str), "P4HID-%08X", (unsigned int)id);
+    s_id_base = id;
+    // Seed the epoch from esp_random() so a fresh boot never re-uses a serial
+    // Windows has cached from before — otherwise Windows would happily reload
+    // stale disk/FAT metadata after every power cycle.
+    s_serial_epoch = (uint16_t)(esp_random() & 0xFFFF);
+    snprintf(serial_str, sizeof(serial_str), "P4HID-%08X-%04X", (unsigned int)id, s_serial_epoch);
 
     // 512 slots so a brief TinyUSB stall (PC suspend / poll gap) can't overflow
     // and start dropping input reports from the physical keyboard. On the rare
