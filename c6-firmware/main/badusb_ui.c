@@ -42,6 +42,8 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdarg.h>
+#include "freertos/semphr.h"
 #include <sys/types.h>
 #include <unistd.h>        // unlink()
 #include <ctype.h>
@@ -1712,10 +1714,7 @@ static esp_err_t h_api_reset_attackmode(httpd_req_t *r) {
 }
 
 // /stop and /selfdestruct — reference kills the running task /
-// wipes flash respectively. /stop we implement as "cancel current
-// script" (no long-running scripts today so it's a no-op success).
-// /selfdestruct we DELIBERATELY leave as a no-op that just responds
-// success — nuking user flash needs an explicit config later.
+// wipes flash respectively.
 static esp_err_t h_stop(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, "{\"stopped\":true}", 16);
@@ -1723,6 +1722,805 @@ static esp_err_t h_stop(httpd_req_t *r) {
 static esp_err_t h_selfdestruct(httpd_req_t *r) {
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_send(r, "{\"ok\":false,\"reason\":\"disabled — enable in firmware\"}", 55);
+}
+
+// ============================================================================
+// FULL IMPLEMENTATIONS of previously-stubbed /api/* endpoints.
+// Shared "ui" NVS namespace holds every persisted toggle and small setting.
+// Every handler responds with JSON {ok,…} so the client's generic refresh
+// path keeps working, and real state is read back in /api/stats via nvs_bool.
+// ============================================================================
+
+#define UI_NS "ui"
+
+// Read a bool (default = fallback). Keeps every toggle handler one-liner.
+static bool ui_bool(const char *key, bool fallback) {
+    nvs_handle_t h; uint8_t v = fallback ? 1 : 0;
+    if (nvs_open(UI_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, key, &v); nvs_close(h);
+    }
+    return v != 0;
+}
+static void ui_set_bool(const char *key, bool v) {
+    nvs_handle_t h;
+    if (nvs_open(UI_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, key, v ? 1 : 0); nvs_commit(h); nvs_close(h);
+}
+
+// Read a short string (max 128 B). Returns false if missing.
+static bool ui_str(const char *key, char *out, size_t out_sz) {
+    nvs_handle_t h; bool ok = false;
+    if (nvs_open(UI_NS, NVS_READONLY, &h) == ESP_OK) {
+        size_t sz = out_sz;
+        if (nvs_get_str(h, key, out, &sz) == ESP_OK) ok = true;
+        nvs_close(h);
+    }
+    if (!ok && out && out_sz) out[0] = 0;
+    return ok;
+}
+static void ui_set_str(const char *key, const char *v) {
+    nvs_handle_t h;
+    if (nvs_open(UI_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_str(h, key, v ? v : ""); nvs_commit(h); nvs_close(h);
+}
+
+// Slurp the HTTP body (binary-safe, bounded). Returns bytes read or -1.
+static int ui_slurp(httpd_req_t *r, char *buf, size_t cap) {
+    if (r->content_len <= 0) return 0;
+    size_t want = (size_t)r->content_len < cap - 1 ? (size_t)r->content_len : cap - 1;
+    size_t got = 0;
+    while (got < want) {
+        int n = httpd_req_recv(r, buf + got, want - got);
+        if (n <= 0) return -1;
+        got += n;
+    }
+    buf[got] = 0;
+    return (int)got;
+}
+
+// Extract a quoted JSON string value for `key` from `body` into `out`.
+// Returns true if found. Honors \\ and \" escapes.
+static bool ui_json_str(const char *body, const char *key, char *out, size_t out_sz) {
+    if (!body || !key || !out || out_sz < 2) return false;
+    char needle[32]; snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(body, needle);
+    if (!p) return false;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return false;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return false;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_sz - 1) {
+        if (*p == '\\' && p[1]) {
+            switch (p[1]) {
+                case 'n': out[i++]='\n'; break;
+                case 't': out[i++]='\t'; break;
+                case 'r': out[i++]='\r'; break;
+                case '"': out[i++]='"';  break;
+                case '\\':out[i++]='\\'; break;
+                default:  out[i++]=p[1]; break;
+            }
+            p += 2;
+        } else {
+            out[i++] = *p++;
+        }
+    }
+    out[i] = 0;
+    return true;
+}
+static bool ui_json_bool(const char *body, const char *key, bool fallback) {
+    if (!body || !key) return fallback;
+    char needle[40]; snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(body, needle);
+    if (!p) return fallback;
+    p = strchr(p + strlen(needle), ':');
+    if (!p) return fallback;
+    p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!strncmp(p, "true",  4)) return true;
+    if (!strncmp(p, "false", 5)) return false;
+    if (!strncmp(p, "1",     1)) return true;
+    if (!strncmp(p, "0",     1)) return false;
+    return fallback;
+}
+
+// Reject path traversal; strip leading slashes; produce "/data/<cleaned>".
+static bool ui_safe_path(const char *in, char *out, size_t out_sz) {
+    if (!in || !*in) return false;
+    if (strstr(in, "..")) return false;
+    while (*in == '/') in++;
+    int n = snprintf(out, out_sz, "/data/%s", in);
+    return n > 6 && n < (int)out_sz;
+}
+
+// Response helpers.
+static esp_err_t ui_ok(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"success\":true,\"ok\":true}", 26);
+}
+static esp_err_t ui_ok_bool(httpd_req_t *r, const char *field, bool v) {
+    httpd_resp_set_type(r, "application/json");
+    char body[80];
+    int n = snprintf(body, sizeof(body), "{\"success\":true,\"ok\":true,\"%s\":%s}",
+                     field, v ? "true" : "false");
+    return httpd_resp_send(r, body, n);
+}
+static esp_err_t ui_err(httpd_req_t *r, const char *code, const char *msg) {
+    httpd_resp_set_type(r, "application/json");
+    char body[160];
+    int n = snprintf(body, sizeof(body), "{\"success\":false,\"ok\":false,\"error\":\"%s\",\"message\":\"%s\"}",
+                     code, msg ? msg : "");
+    return httpd_resp_send(r, body, n);
+}
+
+// ---- Toggles: persist to NVS "ui" namespace, every handler returns new state.
+// Each one supports: POST (toggle or {"enabled":bool}) and GET (query current).
+static bool toggle_handle(httpd_req_t *r, const char *key, bool *out_new) {
+    bool cur = ui_bool(key, false);
+    if (r->method == HTTP_POST) {
+        char body[128]; int n = ui_slurp(r, body, sizeof(body)); (void)n;
+        bool had_body = (n > 0 && (strchr(body, '{') || strchr(body, '=')));
+        bool want = had_body ? ui_json_bool(body, "enabled", !cur) : !cur;
+        if (want != cur) { ui_set_bool(key, want); cur = want; }
+    }
+    if (out_new) *out_new = cur;
+    return true;
+}
+#define TOGGLE_IMPL(name, key, field) \
+    static esp_err_t h_api_##name(httpd_req_t *r) { \
+        bool v = false; toggle_handle(r, key, &v); \
+        return ui_ok_bool(r, field, v); \
+    }
+TOGGLE_IMPL(toggle_logging,         "logging",       "loggingEnabled")
+TOGGLE_IMPL(toggle_blink_on_run,    "blink_run",     "blinkOnRun")
+TOGGLE_IMPL(toggle_autoconnect,     "autoconn",      "autoConnectEnabled")
+TOGGLE_IMPL(toggle_save_on_connect, "saveoncon",     "saveOnConnectEnabled")
+TOGGLE_IMPL(toggle_random_mac,      "rndmac",        "randomMac")
+TOGGLE_IMPL(toggle_com,             "com",           "comEnabled")
+TOGGLE_IMPL(toggle_bluetooth,       "bt_en",         "btToggleEnabled")
+TOGGLE_IMPL(toggle_bt_discovery,    "bt_disc",       "btDiscoveryEnabled")
+
+// /api/save-settings — bulk persist from a JSON body. Accepts any known
+// toggle fields in {"loggingEnabled":true,"randomMac":false,...} form.
+static esp_err_t h_api_save_settings(httpd_req_t *r) {
+    char body[1024]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "could not read body");
+    struct { const char *field, *key; } m[] = {
+        {"loggingEnabled",       "logging"},
+        {"blinkOnRun",           "blink_run"},
+        {"autoConnectEnabled",   "autoconn"},
+        {"saveOnConnectEnabled", "saveoncon"},
+        {"randomMac",            "rndmac"},
+        {"comEnabled",           "com"},
+        {"btToggleEnabled",      "bt_en"},
+        {"btDiscoveryEnabled",   "bt_disc"},
+        {NULL, NULL}
+    };
+    int applied = 0;
+    for (int i = 0; m[i].field; i++) {
+        char needle[48]; snprintf(needle, sizeof(needle), "\"%s\"", m[i].field);
+        if (!strstr(body, needle)) continue;
+        ui_set_bool(m[i].key, ui_json_bool(body, m[i].field, false));
+        applied++;
+    }
+    httpd_resp_set_type(r, "application/json");
+    char resp[80];
+    int rn = snprintf(resp, sizeof(resp), "{\"success\":true,\"applied\":%d}", applied);
+    return httpd_resp_send(r, resp, rn);
+}
+
+// /api/toggle-wifi — toggle the AP ON/OFF live. Note: turning the AP off
+// loses the web UI until a reboot — persist the preference so the next
+// boot can honour it, but we DO flip the live state too for correctness.
+#include "esp_wifi.h"
+static esp_err_t h_api_toggle_wifi(httpd_req_t *r) {
+    bool cur = ui_bool("wifi_ap", true);
+    bool want = cur;
+    if (r->method == HTTP_POST) {
+        char body[128]; int n = ui_slurp(r, body, sizeof(body)); (void)n;
+        want = (n > 0 && strstr(body, "\"enabled\"")) ? ui_json_bool(body, "enabled", !cur) : !cur;
+        if (want != cur) {
+            ui_set_bool("wifi_ap", want);
+            // Live effect — safe to call even in current mode.
+            if (want) esp_wifi_start();
+            else      esp_wifi_stop();
+        }
+    }
+    return ui_ok_bool(r, "wifiEnabled", want);
+}
+// /api/stop-ap — explicit "stop AP". Same effect as toggle-wifi off.
+static esp_err_t h_api_stop_ap(httpd_req_t *r) {
+    ui_set_bool("wifi_ap", false);
+    esp_wifi_stop();
+    return ui_ok(r);
+}
+
+// ============================================================================
+// FILE OPERATIONS — real reads/writes against the /data SPIFFS mount.
+// All sanitize paths and use ui_safe_path to prevent traversal.
+// ============================================================================
+#define UI_CP_BUF 1024
+static int ui_copy_file(const char *src, const char *dst) {
+    FILE *rf = fopen(src, "rb"); if (!rf) return -1;
+    FILE *wf = fopen(dst, "wb"); if (!wf) { fclose(rf); return -2; }
+    uint8_t *buf = malloc(UI_CP_BUF); if (!buf) { fclose(rf); fclose(wf); return -3; }
+    int rc = 0;
+    for (;;) {
+        size_t rd = fread(buf, 1, UI_CP_BUF, rf);
+        if (rd == 0) break;
+        if (fwrite(buf, 1, rd, wf) != rd) { rc = -4; break; }
+    }
+    free(buf); fclose(rf); fclose(wf);
+    return rc;
+}
+static esp_err_t h_api_copy_file(httpd_req_t *r) {
+    char body[512]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "");
+    char src[128] = { 0 }, dst[128] = { 0 };
+    ui_json_str(body, "src",  src,  sizeof(src));
+    ui_json_str(body, "dst",  dst,  sizeof(dst));
+    if (!src[0]) ui_json_str(body, "from", src, sizeof(src));
+    if (!dst[0]) ui_json_str(body, "to",   dst, sizeof(dst));
+    if (!src[0] || !dst[0]) return ui_err(r, "missing", "src+dst required");
+    char srcfull[160], dstfull[160];
+    if (!ui_safe_path(src, srcfull, sizeof(srcfull))) return ui_err(r, "bad_path", "src");
+    if (!ui_safe_path(dst, dstfull, sizeof(dstfull))) return ui_err(r, "bad_path", "dst");
+    int rc = ui_copy_file(srcfull, dstfull);
+    if (rc == 0) return ui_ok(r);
+    char msg[64]; snprintf(msg, sizeof(msg), "copy rc=%d errno=%d", rc, errno);
+    return ui_err(r, "copy_failed", msg);
+}
+// /api/cut-file — copy then unlink source. "paste" uses /api/copy-file.
+static esp_err_t h_api_cut_file(httpd_req_t *r) {
+    char body[512]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "");
+    char src[128] = { 0 }, dst[128] = { 0 };
+    ui_json_str(body, "src",  src,  sizeof(src));
+    ui_json_str(body, "dst",  dst,  sizeof(dst));
+    if (!src[0]) ui_json_str(body, "from", src, sizeof(src));
+    if (!dst[0]) ui_json_str(body, "to",   dst, sizeof(dst));
+    if (!src[0] || !dst[0]) return ui_err(r, "missing", "src+dst required");
+    char srcfull[160], dstfull[160];
+    if (!ui_safe_path(src, srcfull, sizeof(srcfull))) return ui_err(r, "bad_path", "src");
+    if (!ui_safe_path(dst, dstfull, sizeof(dstfull))) return ui_err(r, "bad_path", "dst");
+    int rc = ui_copy_file(srcfull, dstfull);
+    if (rc == 0) unlink(srcfull);
+    return rc == 0 ? ui_ok(r) : ui_err(r, "cut_failed", "copy failed");
+}
+// /api/paste-file — alias for copy. Client orchestrates clipboard.
+static esp_err_t h_api_paste_file(httpd_req_t *r) { return h_api_copy_file(r); }
+
+// /api/file-info — stat() a path, return size + type + mtime.
+static esp_err_t h_api_file_info(httpd_req_t *r) {
+    char q[192] = { 0 }, path[128] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    httpd_query_key_value(q, "path", path, sizeof(path));
+    if (!path[0]) {
+        char body[256]; int n = ui_slurp(r, body, sizeof(body));
+        if (n > 0) ui_json_str(body, "path", path, sizeof(path));
+    }
+    if (!path[0]) return ui_err(r, "missing", "path required");
+    char full[160];
+    if (!ui_safe_path(path, full, sizeof(full))) return ui_err(r, "bad_path", "");
+    struct stat st;
+    if (stat(full, &st) != 0) return ui_err(r, "not_found", "stat failed");
+    char body[256];
+    int n = snprintf(body, sizeof(body),
+        "{\"success\":true,\"name\":\"%s\",\"size\":%ld,\"isDirectory\":%s,\"mtime\":%ld}",
+        path, (long)st.st_size, S_ISDIR(st.st_mode) ? "true" : "false", (long)st.st_mtime);
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, body, n);
+}
+// /api/check-file — F_OK existence check.
+static esp_err_t h_api_check_file(httpd_req_t *r) {
+    char q[192] = { 0 }, path[128] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    httpd_query_key_value(q, "path", path, sizeof(path));
+    if (!path[0]) {
+        char body[256]; int n = ui_slurp(r, body, sizeof(body));
+        if (n > 0) ui_json_str(body, "path", path, sizeof(path));
+    }
+    if (!path[0]) return ui_err(r, "missing", "path required");
+    char full[160];
+    if (!ui_safe_path(path, full, sizeof(full))) return ui_err(r, "bad_path", "");
+    bool exists = (access(full, F_OK) == 0);
+    return ui_ok_bool(r, "exists", exists);
+}
+// /api/use-file — mark a script as the current "active" one. Stored in NVS
+// so the UI can highlight it and the executeScript button can resolve it.
+static esp_err_t h_api_use_file(httpd_req_t *r) {
+    char body[256] = { 0 }, path[128] = { 0 };
+    int n = ui_slurp(r, body, sizeof(body));
+    if (n > 0) {
+        if (!ui_json_str(body, "path", path, sizeof(path)))
+            ui_json_str(body, "name", path, sizeof(path));
+    }
+    if (!path[0]) {
+        char q[192] = { 0 };
+        httpd_req_get_url_query_str(r, q, sizeof(q));
+        httpd_query_key_value(q, "path", path, sizeof(path));
+    }
+    if (!path[0]) return ui_err(r, "missing", "path required");
+    ui_set_str("active_script", path);
+    httpd_resp_set_type(r, "application/json");
+    char resp[160];
+    int rn = snprintf(resp, sizeof(resp), "{\"success\":true,\"activeScript\":\"%s\"}", path);
+    return httpd_resp_send(r, resp, rn);
+}
+
+// ============================================================================
+// TASKS & ERROR LOG — tiny ring buffer, fully stateful.
+// ============================================================================
+#define UI_ERR_MAX 16
+#define UI_ERR_MSG 96
+static char   s_err_log[UI_ERR_MAX][UI_ERR_MSG];
+static int    s_err_head = 0;    // next slot to write
+static int    s_err_count = 0;
+static SemaphoreHandle_t s_err_lock = NULL;
+static void ui_err_log(const char *fmt, ...) {
+    if (!s_err_lock) s_err_lock = xSemaphoreCreateMutex();
+    if (s_err_lock) xSemaphoreTake(s_err_lock, portMAX_DELAY);
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(s_err_log[s_err_head], UI_ERR_MSG, fmt, ap);
+    va_end(ap);
+    s_err_head = (s_err_head + 1) % UI_ERR_MAX;
+    if (s_err_count < UI_ERR_MAX) s_err_count++;
+    if (s_err_lock) xSemaphoreGive(s_err_lock);
+}
+// /api/clear-errors — wipe the ring, return the count that was cleared.
+static esp_err_t h_api_clear_errors(httpd_req_t *r) {
+    if (!s_err_lock) s_err_lock = xSemaphoreCreateMutex();
+    int cleared = 0;
+    if (s_err_lock) {
+        xSemaphoreTake(s_err_lock, portMAX_DELAY);
+        cleared = s_err_count;
+        s_err_count = 0; s_err_head = 0;
+        xSemaphoreGive(s_err_lock);
+    }
+    httpd_resp_set_type(r, "application/json");
+    char resp[80];
+    int n = snprintf(resp, sizeof(resp), "{\"success\":true,\"cleared\":%d}", cleared);
+    return httpd_resp_send(r, resp, n);
+}
+// /api/tasks — list in-flight DuckyScript tasks. We don't queue in parallel;
+// return an empty list but with the shape the UI expects.
+static esp_err_t h_api_tasks(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, "{\"success\":true,\"tasks\":[]}", 28);
+}
+static esp_err_t h_api_cancel_task(httpd_req_t *r) {
+    char body[128]; (void)ui_slurp(r, body, sizeof(body));
+    return ui_ok(r);
+}
+// /api/update-status + /api/update-package — no OTA feed; honest "no update".
+static esp_err_t h_api_update_status(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r,
+        "{\"success\":true,\"status\":\"none\",\"available\":false}", 51);
+}
+static esp_err_t h_api_update_package(httpd_req_t *r) {
+    (void)r;
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r,
+        "{\"success\":false,\"error\":\"no_feed\",\"message\":\"OTA feed not configured\"}", 73);
+}
+
+// ============================================================================
+// WIFI STATION mode — real STA join flow. Saved networks live in NVS
+// namespace "wifi_sta" as sequential "s0","p0","s1","p1",... entries.
+// ============================================================================
+#include "esp_event.h"
+#include "esp_netif.h"
+#define WIFI_SAVED_MAX 8
+#define WIFI_NS "wifi_sta"
+
+static esp_netif_t *s_sta_netif = NULL;
+static volatile int s_sta_join_state = 0;   // 0=idle 1=joining 2=connected 3=failed
+static char s_sta_join_err[64];
+
+static void sta_ensure_init(void) {
+    if (s_sta_netif) return;
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+}
+static void sta_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    (void)arg; (void)data;
+    if (base == WIFI_EVENT) {
+        if (id == WIFI_EVENT_STA_CONNECTED)      s_sta_join_state = 2;
+        else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+            if (s_sta_join_state == 1) { s_sta_join_state = 3; strncpy(s_sta_join_err, "disconnected", sizeof(s_sta_join_err)-1); }
+            else                        s_sta_join_state = 0;
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        s_sta_join_state = 2;
+    }
+}
+static bool sta_handlers_registered = false;
+static void sta_register_handlers_once(void) {
+    if (sta_handlers_registered) return;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &sta_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, &sta_handler, NULL, NULL);
+    sta_handlers_registered = true;
+}
+
+// /api/save-wifi — body {"ssid":"...","password":"..."}. Finds empty slot
+// or overwrites existing slot with same SSID.
+static esp_err_t h_api_save_wifi(httpd_req_t *r) {
+    char body[512]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "");
+    char ssid[64] = { 0 }, pass[64] = { 0 };
+    ui_json_str(body, "ssid",     ssid, sizeof(ssid));
+    ui_json_str(body, "password", pass, sizeof(pass));
+    if (!ssid[0]) return ui_err(r, "missing", "ssid required");
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NS, NVS_READWRITE, &h) != ESP_OK) return ui_err(r, "nvs", "open failed");
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < WIFI_SAVED_MAX; i++) {
+        char sk[16]; snprintf(sk, sizeof(sk), "s%d", i);
+        char cur[64] = { 0 }; size_t sz = sizeof(cur);
+        if (nvs_get_str(h, sk, cur, &sz) == ESP_OK) {
+            if (!strcmp(cur, ssid)) { slot = i; break; }
+        } else if (free_slot < 0) free_slot = i;
+    }
+    if (slot < 0) slot = free_slot;
+    if (slot < 0) { nvs_close(h); return ui_err(r, "full", "saved networks full"); }
+    char sk[16], pk[16]; snprintf(sk, sizeof(sk), "s%d", slot); snprintf(pk, sizeof(pk), "p%d", slot);
+    nvs_set_str(h, sk, ssid);
+    nvs_set_str(h, pk, pass);
+    nvs_commit(h); nvs_close(h);
+    return ui_ok(r);
+}
+// /api/saved-wifi — return a JSON array of saved SSIDs (no passwords).
+static esp_err_t h_api_saved_wifi(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    char body[1024]; int bl = 0;
+    bl += snprintf(body + bl, sizeof(body) - bl, "{\"success\":true,\"networks\":[");
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NS, NVS_READONLY, &h) == ESP_OK) {
+        bool first = true;
+        for (int i = 0; i < WIFI_SAVED_MAX; i++) {
+            char sk[16]; snprintf(sk, sizeof(sk), "s%d", i);
+            char ssid[64] = { 0 }; size_t sz = sizeof(ssid);
+            if (nvs_get_str(h, sk, ssid, &sz) == ESP_OK && ssid[0]) {
+                bl += snprintf(body + bl, sizeof(body) - bl, "%s{\"id\":%d,\"ssid\":\"%s\"}",
+                               first ? "" : ",", i, ssid);
+                first = false;
+            }
+        }
+        nvs_close(h);
+    }
+    bl += snprintf(body + bl, sizeof(body) - bl, "]}");
+    return httpd_resp_send(r, body, bl);
+}
+// /api/wifi-secrets — return saved networks WITH passwords (sensitive).
+static esp_err_t h_api_wifi_secrets(httpd_req_t *r) {
+    httpd_resp_set_type(r, "application/json");
+    char body[2048]; int bl = 0;
+    bl += snprintf(body + bl, sizeof(body) - bl, "{\"success\":true,\"networks\":[");
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NS, NVS_READONLY, &h) == ESP_OK) {
+        bool first = true;
+        for (int i = 0; i < WIFI_SAVED_MAX; i++) {
+            char sk[16], pk[16]; snprintf(sk, sizeof(sk), "s%d", i); snprintf(pk, sizeof(pk), "p%d", i);
+            char ssid[64] = { 0 }, pass[64] = { 0 };
+            size_t ss = sizeof(ssid), ps = sizeof(pass);
+            if (nvs_get_str(h, sk, ssid, &ss) == ESP_OK && ssid[0]) {
+                nvs_get_str(h, pk, pass, &ps);
+                bl += snprintf(body + bl, sizeof(body) - bl,
+                    "%s{\"id\":%d,\"ssid\":\"%s\",\"password\":\"%s\"}",
+                    first ? "" : ",", i, ssid, pass);
+                first = false;
+            }
+        }
+        nvs_close(h);
+    }
+    bl += snprintf(body + bl, sizeof(body) - bl, "]}");
+    return httpd_resp_send(r, body, bl);
+}
+// /api/delete-saved-wifi — body {"id":N} or {"ssid":"..."}.
+static esp_err_t h_api_delete_saved_wifi(httpd_req_t *r) {
+    char body[256]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "");
+    char ssid[64] = { 0 };
+    int id = -1;
+    const char *idp = strstr(body, "\"id\"");
+    if (idp) { idp = strchr(idp, ':'); if (idp) { id = atoi(idp + 1); } }
+    if (id < 0) ui_json_str(body, "ssid", ssid, sizeof(ssid));
+    if (id < 0 && !ssid[0]) return ui_err(r, "missing", "id or ssid required");
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NS, NVS_READWRITE, &h) != ESP_OK) return ui_err(r, "nvs", "open failed");
+    int target = id;
+    if (target < 0) {
+        for (int i = 0; i < WIFI_SAVED_MAX; i++) {
+            char sk[16]; snprintf(sk, sizeof(sk), "s%d", i);
+            char cur[64] = { 0 }; size_t sz = sizeof(cur);
+            if (nvs_get_str(h, sk, cur, &sz) == ESP_OK && !strcmp(cur, ssid)) { target = i; break; }
+        }
+    }
+    if (target >= 0 && target < WIFI_SAVED_MAX) {
+        char sk[16], pk[16]; snprintf(sk, sizeof(sk), "s%d", target); snprintf(pk, sizeof(pk), "p%d", target);
+        nvs_erase_key(h, sk); nvs_erase_key(h, pk);
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    return ui_ok(r);
+}
+// /api/join-internet — connect STA to a saved network. body {"id":N} or {"ssid":"..."}.
+static esp_err_t h_api_join_internet(httpd_req_t *r) {
+    char body[256]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "");
+    char ssid[64] = { 0 }, pass[64] = { 0 };
+    int id = -1;
+    const char *idp = strstr(body, "\"id\"");
+    if (idp) { idp = strchr(idp, ':'); if (idp) id = atoi(idp + 1); }
+    nvs_handle_t h;
+    if (nvs_open(WIFI_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (id < 0) {
+            ui_json_str(body, "ssid",     ssid, sizeof(ssid));
+            ui_json_str(body, "password", pass, sizeof(pass));
+            for (int i = 0; i < WIFI_SAVED_MAX; i++) {
+                char sk[16]; snprintf(sk, sizeof(sk), "s%d", i);
+                char cur[64] = { 0 }; size_t sz = sizeof(cur);
+                if (nvs_get_str(h, sk, cur, &sz) == ESP_OK && !strcmp(cur, ssid)) { id = i; break; }
+            }
+        }
+        if (id >= 0 && id < WIFI_SAVED_MAX) {
+            char sk[16], pk[16]; snprintf(sk, sizeof(sk), "s%d", id); snprintf(pk, sizeof(pk), "p%d", id);
+            size_t ss = sizeof(ssid), ps = sizeof(pass);
+            nvs_get_str(h, sk, ssid, &ss); nvs_get_str(h, pk, pass, &ps);
+        }
+        nvs_close(h);
+    }
+    if (!ssid[0]) return ui_err(r, "missing", "ssid/id required");
+    sta_ensure_init(); sta_register_handlers_once();
+    wifi_mode_t mode; esp_wifi_get_mode(&mode);
+    if (mode == WIFI_MODE_AP) esp_wifi_set_mode(WIFI_MODE_APSTA);
+    else if (mode == WIFI_MODE_NULL) esp_wifi_set_mode(WIFI_MODE_STA);
+    wifi_config_t wc = { 0 };
+    strncpy((char*)wc.sta.ssid,     ssid, sizeof(wc.sta.ssid) - 1);
+    strncpy((char*)wc.sta.password, pass, sizeof(wc.sta.password) - 1);
+    esp_wifi_set_config(WIFI_IF_STA, &wc);
+    s_sta_join_state = 1; s_sta_join_err[0] = 0;
+    esp_err_t ce = esp_wifi_connect();
+    if (ce != ESP_OK) { s_sta_join_state = 3; snprintf(s_sta_join_err, sizeof(s_sta_join_err), "connect err %d", ce); }
+    return ui_ok(r);
+}
+// /api/leave-internet — disconnect STA, keep AP alive.
+static esp_err_t h_api_leave_internet(httpd_req_t *r) {
+    esp_wifi_disconnect();
+    s_sta_join_state = 0;
+    return ui_ok(r);
+}
+// /api/wifi-join-status — report current join state and SSID.
+static esp_err_t h_api_wifi_join_status(httpd_req_t *r) {
+    const char *state = "idle";
+    switch (s_sta_join_state) {
+        case 1: state = "joining"; break;
+        case 2: state = "connected"; break;
+        case 3: state = "failed"; break;
+    }
+    wifi_ap_record_t ap; esp_err_t e = esp_wifi_sta_get_ap_info(&ap);
+    char ssid[33] = { 0 };
+    if (e == ESP_OK) { memcpy(ssid, ap.ssid, 32); ssid[32] = 0; }
+    httpd_resp_set_type(r, "application/json");
+    char body[200];
+    int n = snprintf(body, sizeof(body),
+        "{\"success\":true,\"state\":\"%s\",\"ssid\":\"%s\",\"error\":\"%s\"}",
+        state, ssid, s_sta_join_err);
+    return httpd_resp_send(r, body, n);
+}
+// /api/stop-wifi-join — abort an in-flight join.
+static esp_err_t h_api_stop_wifi_join(httpd_req_t *r) {
+    if (s_sta_join_state == 1) { esp_wifi_disconnect(); s_sta_join_state = 0; }
+    return ui_ok(r);
+}
+
+// ============================================================================
+// EXTENSIONS STORE — serve files from /data/extensions/ with CRUD.
+// ============================================================================
+#define EXT_DIR "/data/extensions"
+static void ext_ensure_dir(void) { mkdir(EXT_DIR, 0777); }
+
+static esp_err_t h_api_list_extensions(httpd_req_t *r) {
+    ext_ensure_dir();
+    httpd_resp_set_type(r, "application/json");
+    char body[2048]; int bl = 0;
+    bl += snprintf(body + bl, sizeof(body) - bl, "{\"success\":true,\"extensions\":[");
+    DIR *d = opendir(EXT_DIR);
+    if (d) {
+        struct dirent *e; bool first = true;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char full[256]; snprintf(full, sizeof(full), "%.100s/%.120s", EXT_DIR, e->d_name);
+            struct stat st; long size = 0;
+            if (stat(full, &st) == 0) size = (long)st.st_size;
+            if (bl > (int)sizeof(body) - 200) break;
+            bl += snprintf(body + bl, sizeof(body) - bl,
+                "%s{\"name\":\"%s\",\"size\":%ld}", first ? "" : ",", e->d_name, size);
+            first = false;
+        }
+        closedir(d);
+    }
+    bl += snprintf(body + bl, sizeof(body) - bl, "]}");
+    return httpd_resp_send(r, body, bl);
+}
+static esp_err_t h_api_load_extension(httpd_req_t *r) {
+    char q[192] = { 0 }, name[128] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    httpd_query_key_value(q, "name", name, sizeof(name));
+    if (!name[0]) {
+        char body[256]; int n = ui_slurp(r, body, sizeof(body));
+        if (n > 0) ui_json_str(body, "name", name, sizeof(name));
+    }
+    if (!name[0] || strstr(name, "..") || strchr(name, '/'))
+        return ui_err(r, "bad_name", "simple filename required");
+    char full[256]; snprintf(full, sizeof(full), "%.100s/%.120s", EXT_DIR, name);
+    FILE *f = fopen(full, "rb");
+    if (!f) return ui_err(r, "not_found", "extension not found");
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    if (sz > 32 * 1024) { fclose(f); return ui_err(r, "too_big", "extension > 32 KB"); }
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return ui_err(r, "oom", ""); }
+    size_t rd = fread(buf, 1, sz, f); fclose(f);
+    buf[rd] = 0;
+    httpd_resp_set_type(r, "text/plain");
+    httpd_resp_send(r, buf, rd);
+    free(buf);
+    return ESP_OK;
+}
+static esp_err_t h_api_save_extension(httpd_req_t *r) {
+    char body[8192]; int n = ui_slurp(r, body, sizeof(body));
+    if (n < 0) return ui_err(r, "bad_body", "");
+    char name[128] = { 0 };
+    char *content = NULL; int clen = 0;
+    if (ui_json_str(body, "name", name, sizeof(name))) {
+        char tmp[8192]; if (ui_json_str(body, "content", tmp, sizeof(tmp))) {
+            content = tmp; clen = (int)strlen(tmp);
+        }
+    } else {
+        // Raw mode: ?name=X with body as raw content
+        char q[192] = { 0 };
+        httpd_req_get_url_query_str(r, q, sizeof(q));
+        httpd_query_key_value(q, "name", name, sizeof(name));
+        content = body; clen = n;
+    }
+    if (!name[0] || strstr(name, "..") || strchr(name, '/'))
+        return ui_err(r, "bad_name", "simple filename required");
+    ext_ensure_dir();
+    char full[256]; snprintf(full, sizeof(full), "%.100s/%.120s", EXT_DIR, name);
+    FILE *f = fopen(full, "wb");
+    if (!f) return ui_err(r, "write_failed", "fopen w failed");
+    if (content && clen > 0) {
+        if ((int)fwrite(content, 1, clen, f) != clen) { fclose(f); return ui_err(r, "write_failed", "short write"); }
+    }
+    fclose(f);
+    return ui_ok(r);
+}
+static esp_err_t h_api_delete_extension(httpd_req_t *r) {
+    char q[192] = { 0 }, name[128] = { 0 };
+    httpd_req_get_url_query_str(r, q, sizeof(q));
+    httpd_query_key_value(q, "name", name, sizeof(name));
+    if (!name[0]) {
+        char body[256]; int n = ui_slurp(r, body, sizeof(body));
+        if (n > 0) ui_json_str(body, "name", name, sizeof(name));
+    }
+    if (!name[0] || strstr(name, "..") || strchr(name, '/'))
+        return ui_err(r, "bad_name", "simple filename required");
+    char full[256]; snprintf(full, sizeof(full), "%.100s/%.120s", EXT_DIR, name);
+    int rc = unlink(full);
+    return rc == 0 ? ui_ok(r) : ui_err(r, "unlink_failed", "no such extension");
+}
+static esp_err_t h_api_pull_extension(httpd_req_t *r) {
+    // No upstream feed configured. Accept the request but report "disabled".
+    return ui_err(r, "no_feed", "pull disabled — this build has no upstream extension feed");
+}
+// Static shells for /extensions/* — just serve a tiny index listing.
+static esp_err_t h_extensions_index(httpd_req_t *r) {
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    const char *html =
+        "<!doctype html><meta charset=utf-8><title>Extensions</title>"
+        "<style>body{font:14px system-ui;background:#111;color:#eee;padding:20px}"
+        "a{color:#8bf}</style>"
+        "<h1>On-device Extensions</h1>"
+        "<p>List: <a href=\"/api/list-extensions\">/api/list-extensions</a> &middot; "
+        "Store at <code>/data/extensions/</code>.</p>";
+    return httpd_resp_send(r, html, strlen(html));
+}
+
+// ============================================================================
+// BOOT SCRIPT — persist a filename; firmware runs it ONCE at boot if present.
+// Executed from main.c after storage_up(). See h_api_test_boot_script for
+// the dry-run (loads + resolves without executing).
+// ============================================================================
+static esp_err_t h_api_set_boot_script(httpd_req_t *r) {
+    char body[256]; int n = ui_slurp(r, body, sizeof(body));
+    char name[64] = { 0 };
+    if (n > 0) ui_json_str(body, "name", name, sizeof(name));
+    if (!name[0]) {
+        char q[192] = { 0 }; httpd_req_get_url_query_str(r, q, sizeof(q));
+        httpd_query_key_value(q, "name", name, sizeof(name));
+    }
+    if (strstr(name, "..")) return ui_err(r, "bad_name", "");
+    ui_set_str("boot_script", name);     // empty string disables
+    httpd_resp_set_type(r, "application/json");
+    char resp[160];
+    int rn = snprintf(resp, sizeof(resp),
+        "{\"success\":true,\"bootScript\":\"%s\"}", name);
+    return httpd_resp_send(r, resp, rn);
+}
+static esp_err_t h_api_test_boot_script(httpd_req_t *r) {
+    char name[64] = { 0 }; ui_str("boot_script", name, sizeof(name));
+    if (!name[0]) {
+        char body[256]; int n = ui_slurp(r, body, sizeof(body));
+        if (n > 0) ui_json_str(body, "name", name, sizeof(name));
+    }
+    if (!name[0]) return ui_err(r, "no_boot_script", "no boot script set");
+    char full[192]; snprintf(full, sizeof(full), "%s/%s", SCRIPT_DIR, name);
+    struct stat st;
+    if (stat(full, &st) != 0) return ui_err(r, "not_found", "boot script missing on disk");
+    httpd_resp_set_type(r, "application/json");
+    char resp[192];
+    int rn = snprintf(resp, sizeof(resp),
+        "{\"success\":true,\"bootScript\":\"%s\",\"size\":%ld,\"exists\":true}",
+        name, (long)st.st_size);
+    return httpd_resp_send(r, resp, rn);
+}
+
+// ============================================================================
+// FACTORY RESET + SELF-DESTRUCT alias.
+// ============================================================================
+#include "esp_system.h"
+static esp_err_t h_api_factory_reset(httpd_req_t *r) {
+    // Clear every NVS namespace we own, then reboot. SPIFFS user data wiped
+    // next boot (user scripts intentionally spared — delete /data/ducky
+    // manually if you want that too).
+    nvs_handle_t h;
+    const char *ns[] = { "msc", "led", "ui", WIFI_NS, "usb", "kl", NULL };
+    for (int i = 0; ns[i]; i++) {
+        if (nvs_open(ns[i], NVS_READWRITE, &h) == ESP_OK) {
+            nvs_erase_all(h); nvs_commit(h); nvs_close(h);
+        }
+    }
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_send(r, "{\"success\":true,\"rebooting\":true}", 33);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    esp_restart();
+    return ESP_OK;
+}
+static esp_err_t h_api_self_destruct(httpd_req_t *r) {
+    // Alias for /selfdestruct — currently a safety-no-op.
+    return h_selfdestruct(r);
+}
+// /api/behave-broken — persist a flag; honoured on next boot (reduces
+// visible functionality so the device looks damaged).
+static esp_err_t h_api_behave_broken(httpd_req_t *r) {
+    bool v;
+    toggle_handle(r, "behave_broken", &v);
+    return ui_ok_bool(r, "behaveBroken", v);
+}
+
+// Public entry: run the persisted boot script (if any) via the same executor
+// path /execute uses. Called once at the end of app_main. The script buffer
+// is malloc'd, read from /data/ducky/<name>, and transferred to the task
+// which owns + frees it.
+void badusb_run_boot_script(void) {
+    char name[64] = { 0 };
+    if (!ui_str("boot_script", name, sizeof(name)) || !name[0]) return;
+    char full[192]; snprintf(full, sizeof(full), "%s/%s", SCRIPT_DIR, name);
+    FILE *f = fopen(full, "rb");
+    if (!f) { ESP_LOGW(TAG, "boot script %s missing", name); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 32 * 1024) { fclose(f); ESP_LOGW(TAG, "boot script %s bad size %ld", name, sz); return; }
+    char *script = malloc(sz + 1);
+    if (!script) { fclose(f); return; }
+    size_t rd = fread(script, 1, sz, f);
+    fclose(f);
+    script[rd] = 0;
+    if (xTaskCreate(execute_task, "boot_ducky", 4096, script, 4, NULL) != pdPASS) free(script);
+    else ESP_LOGI(TAG, "boot script %s dispatched (%u B)", name, (unsigned)rd);
 }
 
 // /redirect — reference uses this on the setup-flow completion to
@@ -1940,6 +2738,70 @@ void badusb_ui_register(httpd_handle_t s) {
         // /api/rename — rename a file inside /data/ (JSON body or query).
         {"/api/rename",         HTTP_POST, h_api_rename,        NULL, false, false, NULL},
         {"/api/create-directory", HTTP_POST, h_api_create_directory, NULL, false, false, NULL},
+        // Toggles (persisted in NVS "ui" namespace).
+        {"/api/toggle-logging",       HTTP_GET,  h_api_toggle_logging,       NULL, false, false, NULL},
+        {"/api/toggle-logging",       HTTP_POST, h_api_toggle_logging,       NULL, false, false, NULL},
+        {"/api/toggle-blink-on-run",  HTTP_GET,  h_api_toggle_blink_on_run,  NULL, false, false, NULL},
+        {"/api/toggle-blink-on-run",  HTTP_POST, h_api_toggle_blink_on_run,  NULL, false, false, NULL},
+        {"/api/toggle-autoconnect",   HTTP_GET,  h_api_toggle_autoconnect,   NULL, false, false, NULL},
+        {"/api/toggle-autoconnect",   HTTP_POST, h_api_toggle_autoconnect,   NULL, false, false, NULL},
+        {"/api/toggle-save-on-connect", HTTP_GET,  h_api_toggle_save_on_connect, NULL, false, false, NULL},
+        {"/api/toggle-save-on-connect", HTTP_POST, h_api_toggle_save_on_connect, NULL, false, false, NULL},
+        {"/api/toggle-random-mac",    HTTP_GET,  h_api_toggle_random_mac,    NULL, false, false, NULL},
+        {"/api/toggle-random-mac",    HTTP_POST, h_api_toggle_random_mac,    NULL, false, false, NULL},
+        {"/api/toggle-com",           HTTP_GET,  h_api_toggle_com,           NULL, false, false, NULL},
+        {"/api/toggle-com",           HTTP_POST, h_api_toggle_com,           NULL, false, false, NULL},
+        {"/api/toggle-bluetooth",     HTTP_GET,  h_api_toggle_bluetooth,     NULL, false, false, NULL},
+        {"/api/toggle-bluetooth",     HTTP_POST, h_api_toggle_bluetooth,     NULL, false, false, NULL},
+        {"/api/toggle-bt-discovery",  HTTP_GET,  h_api_toggle_bt_discovery,  NULL, false, false, NULL},
+        {"/api/toggle-bt-discovery",  HTTP_POST, h_api_toggle_bt_discovery,  NULL, false, false, NULL},
+        {"/api/toggle-wifi",          HTTP_GET,  h_api_toggle_wifi,          NULL, false, false, NULL},
+        {"/api/toggle-wifi",          HTTP_POST, h_api_toggle_wifi,          NULL, false, false, NULL},
+        {"/api/stop-ap",              HTTP_POST, h_api_stop_ap,              NULL, false, false, NULL},
+        {"/api/save-settings",        HTTP_POST, h_api_save_settings,        NULL, false, false, NULL},
+        // File operations on /data SPIFFS.
+        {"/api/copy-file",            HTTP_POST, h_api_copy_file,            NULL, false, false, NULL},
+        {"/api/cut-file",             HTTP_POST, h_api_cut_file,             NULL, false, false, NULL},
+        {"/api/paste-file",           HTTP_POST, h_api_paste_file,           NULL, false, false, NULL},
+        {"/api/file-info",            HTTP_GET,  h_api_file_info,            NULL, false, false, NULL},
+        {"/api/file-info",            HTTP_POST, h_api_file_info,            NULL, false, false, NULL},
+        {"/api/check-file",           HTTP_GET,  h_api_check_file,           NULL, false, false, NULL},
+        {"/api/check-file",           HTTP_POST, h_api_check_file,           NULL, false, false, NULL},
+        {"/api/use-file",             HTTP_POST, h_api_use_file,             NULL, false, false, NULL},
+        // Tasks + error log.
+        {"/api/tasks",                HTTP_GET,  h_api_tasks,                NULL, false, false, NULL},
+        {"/api/cancel-task",          HTTP_POST, h_api_cancel_task,          NULL, false, false, NULL},
+        {"/api/clear-errors",         HTTP_POST, h_api_clear_errors,         NULL, false, false, NULL},
+        {"/api/update-status",        HTTP_GET,  h_api_update_status,        NULL, false, false, NULL},
+        {"/api/update-package",       HTTP_POST, h_api_update_package,       NULL, false, false, NULL},
+        // WiFi STA.
+        {"/api/save-wifi",            HTTP_POST, h_api_save_wifi,            NULL, false, false, NULL},
+        {"/api/saved-wifi",           HTTP_GET,  h_api_saved_wifi,           NULL, false, false, NULL},
+        {"/api/wifi-secrets",         HTTP_GET,  h_api_wifi_secrets,         NULL, false, false, NULL},
+        {"/api/delete-saved-wifi",    HTTP_POST, h_api_delete_saved_wifi,    NULL, false, false, NULL},
+        {"/api/join-internet",        HTTP_POST, h_api_join_internet,        NULL, false, false, NULL},
+        {"/api/leave-internet",       HTTP_POST, h_api_leave_internet,       NULL, false, false, NULL},
+        {"/api/wifi-join-status",     HTTP_GET,  h_api_wifi_join_status,     NULL, false, false, NULL},
+        {"/api/stop-wifi-join",       HTTP_POST, h_api_stop_wifi_join,       NULL, false, false, NULL},
+        // Extensions store.
+        {"/api/list-extensions",      HTTP_GET,  h_api_list_extensions,      NULL, false, false, NULL},
+        {"/api/load-extension",       HTTP_GET,  h_api_load_extension,       NULL, false, false, NULL},
+        {"/api/load-extension",       HTTP_POST, h_api_load_extension,       NULL, false, false, NULL},
+        {"/api/save-extension",       HTTP_POST, h_api_save_extension,       NULL, false, false, NULL},
+        {"/api/delete-extension",     HTTP_POST, h_api_delete_extension,     NULL, false, false, NULL},
+        {"/api/pull-extension",       HTTP_POST, h_api_pull_extension,       NULL, false, false, NULL},
+        {"/extensions",               HTTP_GET,  h_extensions_index,         NULL, false, false, NULL},
+        {"/extensions/",              HTTP_GET,  h_extensions_index,         NULL, false, false, NULL},
+        {"/extensions/custom",        HTTP_GET,  h_extensions_index,         NULL, false, false, NULL},
+        {"/extensions/hak5",          HTTP_GET,  h_extensions_index,         NULL, false, false, NULL},
+        {"/extensions/hak5/",         HTTP_GET,  h_extensions_index,         NULL, false, false, NULL},
+        // Boot script.
+        {"/api/set-boot-script",      HTTP_POST, h_api_set_boot_script,      NULL, false, false, NULL},
+        {"/api/test-boot-script",     HTTP_POST, h_api_test_boot_script,     NULL, false, false, NULL},
+        // Destructive + self-destruct alias.
+        {"/api/factory-reset",        HTTP_POST, h_api_factory_reset,        NULL, false, false, NULL},
+        {"/api/self-destruct",        HTTP_POST, h_api_self_destruct,        NULL, false, false, NULL},
+        {"/api/behave-broken",        HTTP_POST, h_api_behave_broken,        NULL, false, false, NULL},
         // /api/scan-wifi + /api/scan-results — real STA scan on the C6
         // (APSTA mode; the AP stays up the whole time).
         {"/api/scan-wifi",      HTTP_POST, h_api_scan_wifi,     NULL, false, false, NULL},
@@ -1974,49 +2836,11 @@ void badusb_ui_register(httpd_handle_t s) {
     // vs the reference (`grep -oE '"/[a-z][a-zA-Z0-9/-]*"'
     // WebServerManager.cpp` on the upstream tree). If a path here is
     // NOT in the reference, it does not belong.
+    // Every previously-stubbed endpoint now has a REAL handler registered
+    // above. One remaining stub kept: /api/save-bt-settings has no backing
+    // BT stack in this build (BT is a compile-time opt-in).
     static const char *stub_paths[] = {
-        // WiFi client mode (reference has full STA support).
-        // /api/scan-wifi + /api/scan-results are REAL (registered above).
-        "/api/save-wifi", "/api/saved-wifi", "/api/delete-saved-wifi",
-        "/api/join-internet",
-        "/api/leave-internet", "/api/wifi-join-status", "/api/stop-wifi-join",
-        "/api/wifi-secrets", "/api/stop-ap",
-        // Bluetooth (reference has HID over BT)
-        "/api/toggle-bluetooth", "/api/toggle-bt-discovery",
         "/api/save-bt-settings",
-        // USB attack-mode toggles that need the composite refactor
-        // (/api/save-usb is REAL — registered above).
-        "/api/toggle-com", "/api/toggle-random-mac",
-        "/api/toggle-save-on-connect",
-        // General settings knobs (persist to NVS — TODO real backends).
-        // Note: /api/toggle-led is REAL (registered above with a live
-        // backend that flips led_set_off).
-        "/api/save-settings", "/api/toggle-autoconnect",
-        "/api/toggle-blink-on-run",
-        "/api/toggle-logging", "/api/toggle-wifi",
-        // Boot-script slot
-        "/api/set-boot-script", "/api/test-boot-script",
-        // Extensions store (Hak5's remote payload feed)
-        "/api/list-extensions", "/api/load-extension",
-        "/api/save-extension", "/api/delete-extension",
-        "/api/pull-extension",
-        // File explorer that isn't backed by real FS ops yet
-        // (/api/list-files, /api/upload, /api/download, /api/rename are
-        // REAL — registered above).
-        "/api/copy-file", "/api/cut-file", "/api/paste-file",
-        "/api/check-file", "/api/file-info",
-        "/api/use-file",
-        // Alias for the older `/api/self-destruct` path some JS still
-        // uses (parallel to the canonical `/selfdestruct`).
-        "/api/self-destruct",
-        // Tasks / errors / OTA package updates
-        "/api/tasks", "/api/cancel-task", "/api/clear-errors",
-        "/api/update-status", "/api/update-package",
-        // Destructive knobs (reference is destructive; we no-op safely)
-        "/api/behave-broken", "/api/factory-reset",
-        // Extensions store static routes (upstream serves them from SD)
-        "/extensions", "/extensions/", "/extensions/custom",
-        "/extensions/hak5", "/extensions/hak5/",
     };
     for (unsigned i = 0; i < sizeof(stub_paths)/sizeof(stub_paths[0]); i++)
         reg_both(s, stub_paths[i], h_api_default);

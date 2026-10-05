@@ -1146,5 +1146,11 @@ void app_main(void) {
     ESP_LOGI(TAG, "SSID \"%s\" PASS \"%s\" -> http://192.168.4.1  rec=%d adl=%d",
              AP_SSID, AP_PASS, s_recording, s_auto_dl);
     boot_trace(BOOT_PHASE_RUNNING);
+    // Run the user's configured boot script, if any (set via /api/set-boot-script).
+    // Delayed briefly so the C6 ↔ P4 SDIO link is up before DuckyScript HID
+    // commands start firing.
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    extern void badusb_run_boot_script(void);
+    badusb_run_boot_script();
     while (1) vTaskDelay(pdMS_TO_TICKS(5000));
 }
