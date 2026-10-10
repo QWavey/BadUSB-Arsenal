@@ -1,0 +1,15 @@
+#!/bin/sh
+# GhostLink autostart. Installed at /etc/init.d/S99ghost (rw rootfs).
+case "$1" in
+  start)
+    setsid nohup /bin/sh /root/ghostlink/ghostlink.sh > /dev/kmsg 2>&1 </dev/null &
+    ;;
+  stop)
+    for name in ghostlink.sh sniff.py webui.py redirect302.py ghostlink-dnsmasq; do
+        for p in $(ps 2>/dev/null | awk -v n="$name" 'index($0, n) && $0!~"awk" {print $1}'); do
+            kill "$p" 2>/dev/null
+        done
+    done
+    ;;
+esac
+exit 0

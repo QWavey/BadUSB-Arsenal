@@ -1,0 +1,53 @@
+# GhostLink on-device config (no-SD variant).
+# Lives at /root/ghostlink/config.txt on the WebBee. Edit via the WebUI or SSH.
+
+HOSTNAME=ghostlink
+DEVICE_NAME=WebBee-Ghost-01
+
+# USB personality: we stay on the stock rockchip gadget (RNDIS + ADB) and
+# optionally add HID. ENABLE_HID=TRUE triggers a one-time rebind (which drops
+# adb for ~2s; sshd on usb0 keeps you connected).
+ENABLE_HID=FALSE
+
+# Which iface the sniffer attaches to. eth0 is the LAN side; usb0 is host side.
+# "both" opens two sockets. "br0" if a bridge exists.
+SNIFF_IFACE=usb0
+
+# Recording to the writable rootfs. Ring of small files to protect the 30 MB
+# we have on /root. Verdicts are JSONL, far smaller than pcap, so they get
+# their own ring that we actually keep.
+LOG=TRUE
+RECORD_PCAP=TRUE
+RECORD_ROTATE_KB=1024          # 1 MB files
+RECORD_RING_FILES=4            # 4 x 1 MB = 4 MB max for pcap
+VERDICT_STREAM=TRUE
+VERDICT_RING_FILES=10          # 10 x whatever rotation emits
+
+WEBUI=TRUE
+WEBUI_PORT=80
+WEBUI_BIND=0.0.0.0
+
+# DNS/DHCP via dnsmasq
+DNSMASQ=TRUE
+DNSMASQ_IFACE=usb0
+DHCP_RANGE=172.32.0.100,172.32.0.120,255.255.0.0,12h
+DNS_UPSTREAM=1.1.1.1,9.9.9.9
+
+# Redirect: pure DNS answer rewrite. HTTP 302 redirector listens on :8080
+# but needs DNS to steer traffic to it, which is the point.
+REDIRECT=FALSE
+REDIRECT_FROM=                   # example.com,www.example.com (comma-sep)
+REDIRECT_TO=172.32.0.93          # answer IP (device itself serves 302)
+REDIRECT_HTTP_302=TRUE
+
+# DNS spoof file (/etc/hosts syntax). Simple blocklist / overrides.
+DNS_SPOOF=FALSE
+DNS_SPOOF_HOSTS=                 # a /path/to/hosts file
+
+# HID payload (triggered only when ENABLE_HID=TRUE and /dev/hidg0 appears)
+HID_LAYOUT=us
+HID_PAYLOAD=                     # /root/ghostlink/payloads/hello.ducky
+HID_DELAY_MS=1500
+
+# Log level: DEBUG|INFO|WARN|ERROR
+LOG_LEVEL=INFO

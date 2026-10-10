@@ -1,0 +1,10 @@
+REM Hello-from-GhostLink smoke test.
+DEFAULTDELAY 50
+DELAY 500
+GUI r
+DELAY 400
+STRING notepad
+ENTER
+DELAY 800
+STRING hello from GhostLink
+ENTER
