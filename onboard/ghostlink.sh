@@ -85,6 +85,7 @@ if truthy "${DNSMASQ:-TRUE}" && command -v dnsmasq >/dev/null 2>&1; then
         fi
         echo "log-facility=$ROOT/logs/dnsmasq.log"
         echo "pid-file=/run/ghostlink-dnsmasq.pid"
+        echo "dhcp-leasefile=/tmp/dnsmasq.leases"
     } > "$DNS_CONF"
     dnsmasq -C "$DNS_CONF" -x /run/ghostlink-dnsmasq.pid -z >>"$LOG" 2>&1 &
     log "dnsmasq on $IFACE"
