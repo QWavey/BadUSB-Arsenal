@@ -1,0 +1,4 @@
+# /etc/hosts-style DNS spoof file. Enabled when DNS_SPOOF=TRUE.
+# ip   hostname
+# 172.16.24.1   google.com
+# 172.16.24.1   www.google.com

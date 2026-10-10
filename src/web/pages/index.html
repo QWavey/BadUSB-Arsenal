@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GhostLink</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>GhostLink <span class="dot"></span></h1>
+  <nav>
+    <a href="#live">Live</a>
+    <a href="#records">Records</a>
+    <a href="#query">Query</a>
+    <a href="#config">Config</a>
+    <a href="#hid">HID</a>
+  </nav>
+</header>
+
+<section id="live">
+  <h2>Live status</h2>
+  <div id="status" class="card">loading...</div>
+  <div class="row">
+    <button data-fn="toggleRedirect">Toggle REDIRECT</button>
+    <button data-fn="toggleRecording">Toggle RECORDING</button>
+    <button data-fn="toggleDeadnet" class="warn">Toggle DEADNET</button>
+    <button data-fn="reboot" class="danger">Reboot</button>
+  </div>
+</section>
+
+<section id="records">
+  <h2>Records on SD</h2>
+  <div id="recordlist" class="card">loading...</div>
+</section>
+
+<section id="query">
+  <h2>Query verdict stream</h2>
+  <p>Ask the recording a question. Example: <code>rule=REDIRECT</code> or
+     <code>host=google.com</code>. Returns matching frames with ns-level timestamps.</p>
+  <div class="row">
+    <input id="qhost" placeholder="host= (contains)">
+    <input id="qrule" placeholder="rule= (REDIRECT, DEADNET, DNS_SPOOF...)">
+    <button data-fn="runQuery">Run</button>
+  </div>
+  <pre id="qout" class="card mono">(idle)</pre>
+</section>
+
+<section id="config">
+  <h2>config.txt</h2>
+  <p>Edit, save, services hot-reload. No reboot needed for most keys.</p>
+  <textarea id="cfg" rows="30" spellcheck="false"></textarea>
+  <div class="row">
+    <button data-fn="loadCfg">Reload from device</button>
+    <button data-fn="saveCfg" class="ok">Save &amp; hot-reload</button>
+  </div>
+</section>
+
+<section id="hid">
+  <h2>HID / BadUSB</h2>
+  <p>Fire a payload from <code>/Payloads/</code> at the host.</p>
+  <div class="row">
+    <input id="pl" placeholder="/Payloads/win_recon.ducky">
+    <button data-fn="runHid" class="warn">Fire</button>
+  </div>
+</section>
+
+<footer>GhostLink firmware — <a href="https://github.com/QWavey/webbee-ghostlink">source</a></footer>
+<script src="/app.js"></script>
+</body>
+</html>

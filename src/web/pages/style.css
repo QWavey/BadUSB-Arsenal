@@ -1,0 +1,54 @@
+:root {
+  --bg: #0a0d10;
+  --panel: #141a20;
+  --fg: #e4e8ec;
+  --muted: #7d8691;
+  --accent: #4ac0a1;
+  --warn: #d9a450;
+  --danger: #e05858;
+  --ok: #4ac0a1;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f7f8f9;
+    --panel: #ffffff;
+    --fg: #1a1f24;
+    --muted: #6b7682;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.5 system-ui, -apple-system, sans-serif; }
+header { padding: 20px 24px; display: flex; align-items: center;
+  justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,.06); }
+header h1 { margin: 0; font-weight: 600; font-size: 20px; letter-spacing: .3px; }
+header .dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); margin-left: 6px; vertical-align: middle;
+  animation: pulse 1.6s infinite;
+}
+@keyframes pulse { 50% { opacity: .35; } }
+nav a { color: var(--muted); margin-left: 16px; text-decoration: none; }
+nav a:hover { color: var(--fg); }
+section { padding: 24px; max-width: 1100px; }
+section h2 { margin: 0 0 10px; font-weight: 500; font-size: 16px;
+  color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+.card { background: var(--panel); border: 1px solid rgba(255,255,255,.05);
+  border-radius: 6px; padding: 16px; margin-bottom: 12px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+button, input, textarea {
+  background: var(--panel); color: var(--fg);
+  border: 1px solid rgba(255,255,255,.1); padding: 8px 12px;
+  border-radius: 4px; font: inherit;
+}
+button { cursor: pointer; }
+button.ok { border-color: var(--ok); color: var(--ok); }
+button.warn { border-color: var(--warn); color: var(--warn); }
+button.danger { border-color: var(--danger); color: var(--danger); }
+textarea { width: 100%; min-height: 480px; font-family: var(--mono); font-size: 13px; }
+input { flex: 1 1 240px; }
+pre.mono, code { font-family: var(--mono); font-size: 13px; }
+pre.mono { max-height: 400px; overflow: auto; white-space: pre-wrap; }
+footer { padding: 24px; color: var(--muted); text-align: center; font-size: 13px; }
+footer a { color: var(--accent); }
