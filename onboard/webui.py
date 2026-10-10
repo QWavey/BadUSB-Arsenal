@@ -1070,25 +1070,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(413, "text/plain", "payload too large\n")
         body = self.rfile.read(n) if n else b""
         if u.path == "/api/config":
-            # read the previous value of ENABLE_HID so we can detect a flip
-            old_hid = load_cfg().get("ENABLE_HID","FALSE").upper() == "TRUE"
             tmp = CFG_PATH.with_suffix(".new")
             tmp.write_bytes(body); tmp.replace(CFG_PATH)
-            new_hid = load_cfg().get("ENABLE_HID","FALSE").upper() == "TRUE"
             # kick dnsmasq to pick up new address= rules
             try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
                                 timeout=5, capture_output=True)
             except Exception: pass
-            # if HID just got enabled, trigger the gadget rebind
-            hid_result = None
-            if new_hid and (not old_hid or not Path("/dev/hidg0").exists()):
-                try:
-                    r = subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "rebind-gadget"],
-                                       timeout=10, capture_output=True)
-                    hid_result = "ok" if r.returncode == 0 and Path("/dev/hidg0").exists() else "failed"
-                except Exception as e:
-                    hid_result = f"error: {e}"
-            return self._send_json({"ok": True, "hid_rebind": hid_result})
+            # NOTE: HID gadget rebind is intentionally NOT triggered here. On
+            # the Luckfox RV1106 stock gadget, writing to UDC tears down
+            # ffs.adb (FunctionFS backed by adbd); adbd does not survive the
+            # rebind, so the entire composite gadget — RNDIS + HID + ADB —
+            # fails to come back up. The device appears bricked over USB
+            # until a physical power-cycle. The safe rebind requires
+            # orchestrating adbd across the UDC flap; see HID.md for the
+            # SSH-watchdog procedure, which is the only approved path.
+            return self._send_json({"ok": True})
         if u.path == "/api/clear":
             removed = 0
             for d, pat in ((REC_DIR,"*.pcap"), (VER_DIR,"*.jsonl")):

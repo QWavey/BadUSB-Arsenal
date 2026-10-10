@@ -172,12 +172,20 @@ for mine in sniff.py webui.py redirect302.py ghostlink-dnsmasq; do
 done
 sleep 0.3
 
-# -- optional: wire up HID (uses the rebind-gadget subcommand) ----------------
-# Delegates to the subcommand so webui.py can also trigger it on config save
-# without a reboot. Idempotent — no-op if /dev/hidg0 already exists.
-if truthy "${ENABLE_HID:-FALSE}" && [ ! -e /dev/hidg0 ]; then
-    log "ENABLE_HID=TRUE and /dev/hidg0 missing — calling rebind-gadget"
+# -- HID gadget rebind — DISABLED by default ----------------------------------
+# On the Luckfox stock gadget, writing to UDC tears down ffs.adb (FunctionFS
+# backed by adbd); adbd doesn't survive it. The whole composite gadget then
+# fails to come back up and the device appears bricked over USB. Rebind
+# only when the user explicitly accepts the risk via HID_FORCE_REBIND=TRUE
+# AND has a recovery channel (serial console or a safe adbd-orchestration
+# script). See docs/HID.md.
+if truthy "${ENABLE_HID:-FALSE}" && \
+   truthy "$(getcfg HID_FORCE_REBIND)" && \
+   [ ! -e /dev/hidg0 ]; then
+    log "HID_FORCE_REBIND=TRUE accepted — calling rebind-gadget (RISKY)"
     sh "$0" rebind-gadget || log "WARN: rebind-gadget failed; HID disabled this boot"
+elif truthy "${ENABLE_HID:-FALSE}" && [ ! -e /dev/hidg0 ]; then
+    log "ENABLE_HID=TRUE but HID_FORCE_REBIND != TRUE — skipping rebind (safe default)"
 fi
 
 # -- dnsmasq (DHCP + optional DNS spoof/redirect) -----------------------------
