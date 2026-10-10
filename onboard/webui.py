@@ -19,6 +19,7 @@ import http.server
 import json
 import os
 import re
+import secrets
 import socketserver
 import subprocess
 import sys
@@ -31,9 +32,67 @@ ROOT       = Path(os.environ.get("GL_ROOT", "/root/ghostlink"))
 CFG_PATH   = ROOT / "config.txt"
 REC_DIR    = ROOT / "records"
 VER_DIR    = ROOT / "verdicts"
+PAY_DIR    = ROOT / "payloads"       # scripts library
+LAY_DIR    = ROOT / "layouts"        # keyboard layouts
 LOG_PATH   = ROOT / "logs" / "ghostlink.log"
 STATS_PATH = Path("/tmp/ghostlink.stats.json")
 LEASE_PATH = Path("/tmp/dnsmasq.leases")
+
+# -------- session store (web-cli auth) --------------------------------------
+# Memory-only token table: {token: expiry_ts}. Lost on webui restart (that is
+# the correct behavior — a reboot forces re-auth). CLI endpoints MUST have an
+# authed session. Script/config/live endpoints are open on the trusted RNDIS
+# subnet (same model as everything else here).
+SESSIONS = {}
+SESSION_TTL = 3600                   # 1 hour
+SESSION_LOCK = threading.Lock()
+
+# Rate-limit login attempts per source IP to blunt brute force.
+LOGIN_ATTEMPTS = {}                  # {ip: [t1, t2, ...]}
+LOGIN_MAX = 10                       # per 60s
+
+
+def _session_new(user: str) -> str:
+    tok = secrets.token_urlsafe(32)
+    with SESSION_LOCK:
+        SESSIONS[tok] = (user, time.time() + SESSION_TTL)
+    return tok
+
+
+def _session_valid(tok: str) -> str:
+    if not tok: return ""
+    with SESSION_LOCK:
+        v = SESSIONS.get(tok)
+        if not v: return ""
+        user, exp = v
+        if time.time() > exp:
+            del SESSIONS[tok]
+            return ""
+        # sliding window: refresh on each use
+        SESSIONS[tok] = (user, time.time() + SESSION_TTL)
+        return user
+
+
+def _session_drop(tok: str):
+    with SESSION_LOCK:
+        SESSIONS.pop(tok, None)
+
+
+def _login_throttled(ip: str) -> bool:
+    now = time.time()
+    with SESSION_LOCK:
+        hist = [t for t in LOGIN_ATTEMPTS.get(ip, []) if now - t < 60]
+        LOGIN_ATTEMPTS[ip] = hist
+        return len(hist) >= LOGIN_MAX
+
+
+def _login_record(ip: str):
+    with SESSION_LOCK:
+        LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+# Script-library filename rule: ascii word-chars, dash, dot, underscore.
+# No slashes, no ..  Length 1..64. One of a few allowed extensions.
+SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(ducky|txt|sh|dd)$")
 
 
 def load_cfg():
@@ -67,6 +126,9 @@ HTML = r"""<!doctype html>
     <button class="tablinks"        data-tab="Query">Query</button>
     <button class="tablinks"        data-tab="Config">Config</button>
     <button class="tablinks"        data-tab="HID">HID</button>
+    <button class="tablinks"        data-tab="Scripting">Scripting</button>
+    <button class="tablinks"        data-tab="LiveType">Live Type</button>
+    <button class="tablinks"        data-tab="Terminal">Terminal</button>
     <button class="tablinks"        data-tab="System">System</button>
   </nav>
 
@@ -209,6 +271,133 @@ HTML = r"""<!doctype html>
     <div class="section">
       <h4>Available Payloads</h4>
       <ul id="payloads" class="file-list"><li class="dim">&hellip;</li></ul>
+    </div>
+  </section>
+
+  <!-- =========== SCRIPTING (DuckyScript IDE) =========== -->
+  <section id="tab-Scripting" class="tabcontent">
+    <div class="flex-row" style="justify-content:space-between; align-items:center;">
+      <h3>DuckyScript IDE</h3>
+      <div id="scriptStatus" class="dim" style="font-size:12px;">idle</div>
+    </div>
+
+    <div class="ide-grid">
+      <!-- LEFT: library + layout picker -->
+      <aside class="ide-side">
+        <div class="section" style="margin:0;">
+          <h4>Scripts <span class="dim" id="scriptCount"></span></h4>
+          <div class="setting-row flex-row" style="gap:6px; margin-bottom:8px;">
+            <input type="text" id="newScriptName" placeholder="new_name.ducky" style="min-width:0;" class="flex-grow">
+            <button onclick="scriptsNew()">+ New</button>
+          </div>
+          <ul id="scriptList" class="file-list"><li class="dim">&hellip;</li></ul>
+        </div>
+        <div class="section" style="margin:12px 0 0;">
+          <h4>Keyboard layout</h4>
+          <select id="layoutSel" onchange="setLayout(this.value)" style="width:100%;"></select>
+          <p class="dim" style="font-size:12px;margin-top:6px;">
+            Affects STRING char lookup when payloads run. Set live, no reboot.
+          </p>
+        </div>
+      </aside>
+
+      <!-- RIGHT: editor -->
+      <main class="ide-main">
+        <div class="editor-toolbar flex-row">
+          <span id="editorTitle" class="dim">(untitled)</span>
+          <span class="spacer"></span>
+          <button onclick="scriptRun()" class="btn-run">Run</button>
+          <button onclick="scriptStop()" class="btn-ghost">Stop</button>
+          <button onclick="scriptSave()" class="btn-save">Save</button>
+          <button onclick="scriptSaveAs()" class="btn-ghost">Save as&hellip;</button>
+          <button onclick="scriptClear()" class="btn-ghost">Clear</button>
+        </div>
+        <div class="editor-wrapper" id="editorWrapper">
+          <div class="editor-gutter" id="editorGutter">1</div>
+          <textarea id="scriptArea" spellcheck="false" placeholder="REM write DuckyScript here&#10;DELAY 500&#10;GUI r&#10;STRING notepad&#10;ENTER&#10;STRING hello" autocomplete="off" autocorrect="off"></textarea>
+          <div class="autocomplete-popup" id="acPopup"></div>
+        </div>
+        <div class="editor-foot flex-row">
+          <span id="editorLines">0 lines</span>
+          <span class="spacer"></span>
+          <span id="editorIssues" class="dim">no issues</span>
+        </div>
+      </main>
+    </div>
+  </section>
+
+  <!-- =========== LIVE TYPING (interactive HID) =========== -->
+  <section id="tab-LiveType" class="tabcontent">
+    <h3>Live Typing <span class="dim" style="font-size:12px;">(interactive HID)</span></h3>
+    <div class="section">
+      <p class="dim" style="font-size:13px;">
+        Focus the textarea below. Every key you press is sent to the host as a
+        single HID report. Modifiers (shift/ctrl/alt/gui) and special keys
+        (enter/tab/esc/backspace/arrows/F-keys) are forwarded as well. The
+        target host sees it as a wireless keyboard.
+      </p>
+      <div class="flex-row" style="justify-content:space-between; align-items:center;">
+        <label class="sw">
+          <input type="checkbox" id="liveEn" checked>
+          <span>Live typing enabled</span>
+        </label>
+        <span id="liveStatus" class="dim" style="font-size:12px;">armed</span>
+      </div>
+      <textarea id="liveInput" spellcheck="false"
+                placeholder="click here, then every keypress is sent to the host"
+                style="width:100%; min-height:220px; margin-top:12px;"
+                autocomplete="off" autocorrect="off"></textarea>
+      <div class="flex-row" style="gap:8px; margin-top:12px; flex-wrap:wrap;">
+        <button onclick="liveSendSpecial('ENTER')" class="btn-ghost">Enter</button>
+        <button onclick="liveSendSpecial('TAB')" class="btn-ghost">Tab</button>
+        <button onclick="liveSendSpecial('ESC')" class="btn-ghost">Esc</button>
+        <button onclick="liveSendSpecial('BACKSPACE')" class="btn-ghost">Back</button>
+        <button onclick="liveSendCombo('GUI','r')" class="btn-ghost">Win+R</button>
+        <button onclick="liveSendCombo('CTRL','c')" class="btn-ghost">Ctrl+C</button>
+        <button onclick="liveSendCombo('CTRL','v')" class="btn-ghost">Ctrl+V</button>
+        <button onclick="liveSendCombo('CTRL','ALT','DELETE')" class="btn-ghost">Ctrl+Alt+Del</button>
+        <span class="spacer"></span>
+        <button onclick="document.getElementById('liveInput').value=''" class="btn-ghost">Clear local text</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========== TERMINAL (Web CLI) =========== -->
+  <section id="tab-Terminal" class="tabcontent">
+    <h3>Terminal <span class="dim" style="font-size:12px;">(web shell)</span></h3>
+    <div id="termLogin" class="section">
+      <h4>Login required</h4>
+      <p class="dim" style="font-size:13px;">
+        Session is HttpOnly, 1h sliding, local only. User + pass are set in
+        <code>config.txt</code> (<code>WEBUI_USER</code> / <code>WEBUI_PASS</code>).
+        Default: <code>root / ghostlink</code> — <b>change them</b>.
+      </p>
+      <div class="setting-row flex-row" style="gap:8px;">
+        <input type="text" id="loginUser" placeholder="user" style="min-width:120px;">
+        <input type="password" id="loginPass" placeholder="password" style="min-width:160px;">
+        <button onclick="cliLogin()">Login</button>
+        <span id="loginMsg" class="dim" style="font-size:12px;"></span>
+      </div>
+    </div>
+    <div id="termView" class="section" style="display:none;">
+      <div class="flex-row" style="justify-content:space-between;">
+        <h4>shell &middot; <span id="termUser" class="dim" style="font-weight:400;"></span></h4>
+        <div class="flex-row" style="gap:8px;">
+          <button onclick="termClear()" class="btn-ghost">Clear</button>
+          <button onclick="cliLogout()" class="btn-ghost">Logout</button>
+        </div>
+      </div>
+      <pre id="termOut" class="log-pane" style="min-height:300px; max-height:420px;"></pre>
+      <div class="flex-row" style="gap:8px; margin-top:10px;">
+        <span class="dim" style="font-family:'Fira Code',monospace;">root@ghost:/root#</span>
+        <input type="text" id="termIn" class="flex-grow"
+               placeholder="type a command, Enter to run (↑/↓ for history)"
+               style="font-family:'Fira Code','Consolas',monospace;" autocomplete="off">
+      </div>
+      <div class="dim" style="font-size:11px; margin-top:6px;">
+        timeout 15 s per command &middot; stdout+stderr captured &middot;
+        tip: <code>ls /root/ghostlink/</code>, <code>top -b -n1 | head -20</code>
+      </div>
     </div>
   </section>
 
@@ -539,6 +728,160 @@ td.actions a { font-size: 12px; }
 .toast.err { border-left-color: var(--danger); }
 
 /* Mobile */
+/* ---- IDE (Scripting pane) ---------------------------------------------- */
+.ide-grid {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 14px;
+  margin: 20px 0;
+}
+.ide-side { min-width: 0; }
+.ide-main { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+
+.editor-toolbar {
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--bg-section);
+  border: 1px solid var(--glass-border);
+  border-radius: 10px 10px 0 0;
+}
+.editor-toolbar #editorTitle { font-family: 'Fira Code','Consolas',monospace; }
+button.btn-run   { background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dim) 100%); }
+button.btn-save  { background: linear-gradient(135deg, #4a90e2 0%, #2d6fbe 100%); }
+button.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--glass-border);
+  color: var(--text-main);
+}
+button.btn-ghost:hover { border-color: var(--primary); color: var(--primary); transform: none; filter: none; }
+
+.editor-wrapper {
+  display: flex;
+  background: #0b0e13;
+  border: 1px solid var(--glass-border);
+  border-top: none;
+  border-radius: 0;
+  min-height: 440px;
+  position: relative;
+}
+.editor-gutter {
+  width: 44px;
+  background: rgba(255,255,255,0.03);
+  border-right: 1px solid var(--glass-border);
+  color: var(--text-muted);
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 13px;
+  padding: 12px 6px 12px 0;
+  text-align: right;
+  user-select: none;
+  line-height: 20px;
+  white-space: pre;
+  overflow: hidden;
+}
+.editor-wrapper textarea {
+  flex-grow: 1;
+  background: transparent;
+  color: var(--text-main);
+  border: none;
+  padding: 12px 14px;
+  margin: 0;
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 13px;
+  line-height: 20px;
+  resize: vertical;
+  outline: none;
+  min-height: 440px;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+}
+.editor-wrapper textarea:focus { border: none; outline: none; }
+.editor-foot {
+  padding: 8px 14px;
+  background: var(--bg-section);
+  border: 1px solid var(--glass-border);
+  border-top: none;
+  border-radius: 0 0 10px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.editor-foot .err { color: var(--danger); }
+.autocomplete-popup {
+  position: absolute;
+  display: none;
+  background: #141a20;
+  border: 1px solid var(--primary);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 220px;
+  max-height: 240px;
+  overflow-y: auto;
+  z-index: 50;
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 13px;
+  box-shadow: var(--shadow);
+}
+.autocomplete-popup .ac-item {
+  padding: 5px 12px;
+  cursor: pointer;
+  color: var(--text-main);
+  display: flex;
+  gap: 10px;
+}
+.autocomplete-popup .ac-item .ac-kind {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-left: auto;
+}
+.autocomplete-popup .ac-item.selected,
+.autocomplete-popup .ac-item:hover {
+  background: var(--primary);
+  color: #000;
+}
+.autocomplete-popup .ac-item.selected .ac-kind,
+.autocomplete-popup .ac-item:hover .ac-kind { color: #000; }
+
+ul.file-list li.active {
+  background: rgba(76,175,80,0.1);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+ul.file-list li .fl-size {
+  color: var(--text-muted);
+  font-size: 10px;
+  margin-left: 10px;
+}
+ul.file-list li .fl-del {
+  float: right;
+  color: var(--danger);
+  cursor: pointer;
+  opacity: 0.5;
+  margin-left: 6px;
+}
+ul.file-list li:hover .fl-del { opacity: 1; }
+
+/* ---- Live Type pane ---------------------------------------------------- */
+label.sw { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+label.sw input { accent-color: var(--primary); width: 16px; height: 16px; }
+
+/* ---- Terminal pane ----------------------------------------------------- */
+#termOut {
+  background: #000;
+  color: #c3e3bd;
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 13px;
+  overflow-x: auto;
+}
+#termOut .cmd  { color: var(--primary); }
+#termOut .err  { color: var(--danger); }
+#termOut .rc0  { color: var(--text-muted); font-size: 11px; }
+#termOut .rc1  { color: var(--danger);     font-size: 11px; }
+
+@media (max-width: 1000px) {
+  .ide-grid { grid-template-columns: 1fr; }
+  .ide-side { order: 2; }
+}
+
 @media (max-width: 760px) {
   body { padding: 12px; }
   .container { padding: 18px; border-radius: 14px; }
@@ -579,9 +922,12 @@ function openTab(name) {
   const el = $('#tab-' + name); if (el) el.style.display = 'block';
   $$('.tablinks').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   location.hash = name;
-  if (name === 'Records') refreshRecords();
-  if (name === 'System')  refreshSystem();
-  if (name === 'HID')     refreshPayloads();
+  if (name === 'Records')   refreshRecords();
+  if (name === 'System')    refreshSystem();
+  if (name === 'HID')       refreshPayloads();
+  if (name === 'Scripting') { scriptsRefresh(); layoutsRefresh(); }
+  if (name === 'LiveType')  { $('#liveInput').focus(); }
+  if (name === 'Terminal')  { cliProbe(); setTimeout(() => $('#termIn') && $('#termIn').focus(), 50); }
 }
 
 /* --- live tick ------------------------------------------------- */
@@ -774,16 +1120,445 @@ document.addEventListener('click', e => {
   const t = e.target.closest('.tablinks');
   if (t && t.dataset.tab) openTab(t.dataset.tab);
 });
+const TABS = ['Live','Records','Query','Config','HID','Scripting','LiveType','Terminal','System'];
 window.addEventListener('hashchange', () => {
   const h = location.hash.slice(1);
-  if (['Live','Records','Query','Config','HID','System'].includes(h)) openTab(h);
+  if (TABS.includes(h)) openTab(h);
 });
+
+/* ============================================================
+   DuckyScript IDE
+   ============================================================ */
+const DUCKY_KEYWORDS = [
+  // commands
+  {w:'REM',           kind:'cmd', hint:'comment'},
+  {w:'REM_BLOCK',     kind:'cmd', hint:'start block comment'},
+  {w:'END_REM',       kind:'cmd', hint:'end block comment'},
+  {w:'STRING',        kind:'cmd', hint:'type a literal string'},
+  {w:'DELAY',         kind:'cmd', hint:'wait N ms'},
+  {w:'DEFAULTDELAY',  kind:'cmd', hint:'ms between every command'},
+  {w:'DEFAULTCHARDELAY', kind:'cmd', hint:'ms between STRING chars'},
+  {w:'REPEAT',        kind:'cmd', hint:'repeat previous line N times'},
+  // modifiers
+  {w:'GUI',    kind:'mod'}, {w:'WINDOWS', kind:'mod'}, {w:'WIN', kind:'mod'},
+  {w:'SUPER',  kind:'mod'}, {w:'COMMAND', kind:'mod'}, {w:'CMD', kind:'mod'},
+  {w:'CTRL',   kind:'mod'}, {w:'CONTROL', kind:'mod'},
+  {w:'SHIFT',  kind:'mod'}, {w:'ALT',     kind:'mod'},
+  // named keys
+  {w:'ENTER',kind:'key'},{w:'RETURN',kind:'key'},{w:'ESC',kind:'key'},{w:'ESCAPE',kind:'key'},
+  {w:'TAB',kind:'key'},{w:'SPACE',kind:'key'},{w:'BACKSPACE',kind:'key'},
+  {w:'DELETE',kind:'key'},{w:'DEL',kind:'key'},{w:'INSERT',kind:'key'},
+  {w:'UP',kind:'key'},{w:'UPARROW',kind:'key'},{w:'DOWN',kind:'key'},{w:'DOWNARROW',kind:'key'},
+  {w:'LEFT',kind:'key'},{w:'LEFTARROW',kind:'key'},{w:'RIGHT',kind:'key'},{w:'RIGHTARROW',kind:'key'},
+  {w:'HOME',kind:'key'},{w:'END',kind:'key'},{w:'PAGEUP',kind:'key'},{w:'PAGEDOWN',kind:'key'},
+  {w:'CAPSLOCK',kind:'key'},{w:'NUMLOCK',kind:'key'},{w:'SCROLLLOCK',kind:'key'},
+  {w:'PRINTSCREEN',kind:'key'},{w:'PAUSE',kind:'key'},{w:'BREAK',kind:'key'},
+  {w:'MENU',kind:'key'},{w:'APP',kind:'key'},
+];
+for (let i = 1; i <= 12; i++) DUCKY_KEYWORDS.push({w:`F${i}`, kind:'key'});
+const KW_SET = new Set(DUCKY_KEYWORDS.map(k => k.w));
+
+let currentScript = null;        // name of script currently open
+
+/* --- gutter + validation --- */
+function updateGutter() {
+  const ta = $('#scriptArea');
+  const n = (ta.value.match(/\n/g) || []).length + 1;
+  const lines = Array.from({length: n}, (_, i) => i + 1).join('\n');
+  $('#editorGutter').textContent = lines;
+  $('#editorLines').textContent = n + ' lines';
+  validateScript();
+}
+function validateScript() {
+  const text = $('#scriptArea').value;
+  const errs = [];
+  text.split('\n').forEach((raw, i) => {
+    const s = raw.trim();
+    if (!s) return;
+    if (/^(REM|REM_BLOCK|END_REM|#)/i.test(s)) return;
+    if (/^(STRING|DELAY|DEFAULTDELAY|DEFAULT_DELAY|DEFAULTCHARDELAY|REPEAT) /i.test(s)) return;
+    const toks = s.split(/\s+/).map(t => t.toUpperCase());
+    if (toks.every(t => KW_SET.has(t))) return;
+    errs.push(`L${i+1}: unknown "${s.slice(0,40)}"`);
+  });
+  const el = $('#editorIssues');
+  if (!errs.length) { el.textContent = 'no issues'; el.className = 'dim'; }
+  else { el.textContent = errs.length + ' issue' + (errs.length>1?'s':'') + ': ' + errs[0]; el.className = 'err'; }
+}
+
+/* --- autocomplete popup --- */
+function acClose() { $('#acPopup').style.display = 'none'; acItems = []; acIndex = 0; }
+let acItems = []; let acIndex = 0; let acWordStart = 0;
+function acOpen() {
+  const ta = $('#scriptArea');
+  const pos = ta.selectionStart;
+  // extract current word (prefix before caret)
+  const before = ta.value.slice(0, pos);
+  const m = before.match(/[A-Za-z_][A-Za-z0-9_]*$/);
+  if (!m) { acClose(); return; }
+  const word = m[0].toUpperCase();
+  acWordStart = pos - m[0].length;
+  const matches = DUCKY_KEYWORDS.filter(k => k.w.startsWith(word)).slice(0, 10);
+  if (!matches.length || word.length < 1) { acClose(); return; }
+  acItems = matches; acIndex = 0;
+  const pop = $('#acPopup');
+  pop.innerHTML = matches.map((k, i) =>
+    `<div class="ac-item${i===0?' selected':''}" data-i="${i}">
+       <span>${esc(k.w)}</span><span class="ac-kind">${esc(k.kind)}${k.hint?' · '+esc(k.hint):''}</span>
+     </div>`).join('');
+  // position near caret — rough estimate using line/col of caret
+  const lineNo = (before.match(/\n/g) || []).length;
+  const colNo  = before.length - before.lastIndexOf('\n') - 1;
+  const taRect = ta.getBoundingClientRect();
+  const wrapRect = $('#editorWrapper').getBoundingClientRect();
+  pop.style.left = Math.min(taRect.width - 240, colNo * 7.6 + 48) + 'px';
+  pop.style.top  = (lineNo * 20 + 36 - ta.scrollTop) + 'px';
+  pop.style.display = 'block';
+}
+function acAccept(idx) {
+  if (!acItems.length) return;
+  const k = acItems[idx != null ? idx : acIndex].w;
+  const ta = $('#scriptArea');
+  const pos = ta.selectionStart;
+  ta.value = ta.value.slice(0, acWordStart) + k + ta.value.slice(pos);
+  const newCaret = acWordStart + k.length;
+  ta.selectionStart = ta.selectionEnd = newCaret;
+  acClose();
+  updateGutter();
+  ta.focus();
+}
+
+/* --- editor events --- */
+function bindEditor() {
+  const ta = $('#scriptArea');
+  ta.addEventListener('input', () => { updateGutter(); acOpen(); });
+  ta.addEventListener('scroll', () => { $('#editorGutter').scrollTop = ta.scrollTop; });
+  ta.addEventListener('keydown', e => {
+    const pop = $('#acPopup');
+    const open = pop.style.display !== 'none';
+    if (open) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); acIndex = Math.min(acItems.length-1, acIndex+1); refreshAcSel(); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); acIndex = Math.max(0, acIndex-1); refreshAcSel(); return; }
+      if (e.key === 'Tab' || e.key === 'Enter') { e.preventDefault(); acAccept(); return; }
+      if (e.key === 'Escape') { e.preventDefault(); acClose(); return; }
+    }
+    if (e.ctrlKey && e.key === 's') { e.preventDefault(); scriptSave(); }
+    if (e.ctrlKey && e.key === 'Enter') { e.preventDefault(); scriptRun(); }
+  });
+  $('#acPopup').addEventListener('click', e => {
+    const it = e.target.closest('.ac-item');
+    if (it) acAccept(parseInt(it.dataset.i, 10));
+  });
+  document.addEventListener('click', e => {
+    if (!e.target.closest('.editor-wrapper')) acClose();
+  });
+}
+function refreshAcSel() {
+  $$('.ac-item').forEach((el, i) => el.classList.toggle('selected', i === acIndex));
+}
+
+/* --- scripts library --- */
+async function scriptsRefresh() {
+  const list = await api('/api/scripts');
+  const ul = $('#scriptList');
+  if (!Array.isArray(list) || !list.length) {
+    ul.innerHTML = '<li class="dim">no scripts yet</li>';
+    $('#scriptCount').textContent = '(0)';
+    return;
+  }
+  $('#scriptCount').textContent = `(${list.length})`;
+  ul.innerHTML = list.map(f =>
+    `<li data-name="${esc(f.name)}" onclick="scriptOpen('${esc(f.name)}')"
+         class="${currentScript === f.name ? 'active' : ''}">
+       <span class="fl-del" onclick="event.stopPropagation(); scriptDelete('${esc(f.name)}')">✕</span>
+       ${esc(f.name)}
+       <span class="fl-size">${(f.size/1024).toFixed(1)}K</span>
+     </li>`
+  ).join('');
+}
+async function scriptOpen(name) {
+  const t = await api('/api/scripts/' + encodeURIComponent(name));
+  $('#scriptArea').value = typeof t === 'string' ? t : '';
+  currentScript = name;
+  $('#editorTitle').textContent = name;
+  $('#scriptStatus').textContent = 'opened ' + name;
+  updateGutter();
+  scriptsRefresh();
+}
+async function scriptSave() {
+  if (!currentScript) return scriptSaveAs();
+  const r = await fetch('/api/scripts/' + encodeURIComponent(currentScript), {
+    method:'POST', body: $('#scriptArea').value });
+  if (r.ok) { toast('saved ' + currentScript); $('#scriptStatus').textContent = 'saved'; scriptsRefresh(); }
+  else { toast('save failed', true); }
+}
+async function scriptSaveAs() {
+  const name = prompt('save as (letters, digits, dash, dot, underscore; .ducky/.sh)', currentScript || 'new.ducky');
+  if (!name) return;
+  const r = await fetch('/api/scripts/' + encodeURIComponent(name), {
+    method:'POST', body: $('#scriptArea').value });
+  const j = await r.json();
+  if (j.ok) { currentScript = name; $('#editorTitle').textContent = name; toast('saved ' + name); scriptsRefresh(); }
+  else { toast('save failed: ' + (j.err || ''), true); }
+}
+async function scriptNew() { scriptsNew(); }
+async function scriptsNew() {
+  const name = ($('#newScriptName').value || 'new.ducky').trim();
+  if (!/\.(ducky|txt|sh|dd)$/.test(name)) { toast('name must end in .ducky/.txt/.sh/.dd', true); return; }
+  const r = await fetch('/api/scripts/' + encodeURIComponent(name), {
+    method:'POST', body: 'REM new payload\nDELAY 500\n' });
+  const j = await r.json();
+  if (j.ok) {
+    $('#newScriptName').value = '';
+    scriptsRefresh();
+    scriptOpen(name);
+  } else { toast('create failed: ' + (j.err || ''), true); }
+}
+async function scriptDelete(name) {
+  if (!confirm('delete ' + name + ' ?')) return;
+  const r = await fetch('/api/scripts/' + encodeURIComponent(name), { method:'DELETE' });
+  if (r.ok) {
+    if (currentScript === name) {
+      currentScript = null;
+      $('#editorTitle').textContent = '(untitled)';
+      $('#scriptArea').value = '';
+      updateGutter();
+    }
+    scriptsRefresh();
+  }
+}
+async function scriptRun() {
+  if (!currentScript) return toast('nothing to run — save first', true);
+  // auto-save then run so what you see is what fires
+  await fetch('/api/scripts/' + encodeURIComponent(currentScript), {
+    method:'POST', body: $('#scriptArea').value });
+  $('#scriptStatus').textContent = 'running ' + currentScript + '...';
+  const r = await api('/api/scripts/' + encodeURIComponent(currentScript) + '/run', { method:'POST' });
+  if (r.ok) { toast('ran ' + currentScript); $('#scriptStatus').textContent = 'ok'; }
+  else { toast('run failed rc=' + (r.rc != null ? r.rc : '?'), true);
+         $('#scriptStatus').textContent = 'failed'; }
+}
+async function scriptStop() {
+  const r = await api('/api/hid/stop', { method:'POST' });
+  toast('stopped (killed ' + (r.killed||0) + ')');
+  $('#scriptStatus').textContent = 'stopped';
+}
+function scriptClear() {
+  if (!confirm('clear editor?')) return;
+  $('#scriptArea').value = '';
+  updateGutter();
+}
+
+/* --- layouts --- */
+async function layoutsRefresh() {
+  const l = await api('/api/layouts');
+  const sel = $('#layoutSel');
+  const cfg = await api('/api/config');
+  let current = 'us';
+  if (typeof cfg === 'string') {
+    const m = cfg.match(/^HID_LAYOUT=(.*)$/m);
+    if (m) current = m[1].split('#')[0].trim() || 'us';
+  }
+  sel.innerHTML = (Array.isArray(l) ? l : []).map(n =>
+    `<option value="${esc(n)}" ${n===current?'selected':''}>${esc(n)}</option>`
+  ).join('');
+}
+async function setLayout(name) {
+  let cfg = await api('/api/config');
+  if (typeof cfg !== 'string') return;
+  if (/^HID_LAYOUT=.*$/m.test(cfg)) cfg = cfg.replace(/^HID_LAYOUT=.*$/m, 'HID_LAYOUT=' + name);
+  else cfg = cfg.replace(/$/, '\nHID_LAYOUT=' + name + '\n');
+  const r = await api('/api/config', { method:'POST', body: cfg });
+  if (r.ok) toast('layout = ' + name);
+}
+
+/* ============================================================
+   Live Typing
+   ============================================================ */
+const JS_TO_HID = {
+  'Enter':0x28,'NumpadEnter':0x28,'Escape':0x29,'Tab':0x2B,'Space':0x2C,
+  'Backspace':0x2A,'Delete':0x4C,'Insert':0x49,
+  'ArrowUp':0x52,'ArrowDown':0x51,'ArrowLeft':0x50,'ArrowRight':0x4F,
+  'Home':0x4A,'End':0x4D,'PageUp':0x4B,'PageDown':0x4E,
+  'CapsLock':0x39,'NumLock':0x53,'ScrollLock':0x47,
+  'PrintScreen':0x46,'Pause':0x48,'ContextMenu':0x65,
+  'Minus':0x2D,'Equal':0x2E,'BracketLeft':0x2F,'BracketRight':0x30,
+  'Backslash':0x31,'Semicolon':0x33,'Quote':0x34,'Backquote':0x35,
+  'Comma':0x36,'Period':0x37,'Slash':0x38,
+};
+for (let i = 1; i <= 12; i++) JS_TO_HID[`F${i}`] = 0x39 + i;
+
+function keyEventToHid(e) {
+  // returns {mod, key} using the browser's physical key info (US positional).
+  // We rely on the device's HID_LAYOUT for STRING char lookup; here, Live
+  // typing is positional (US scancodes) because the browser gives us codes.
+  const code = e.code;
+  let key = 0;
+  if (JS_TO_HID[code] != null) key = JS_TO_HID[code];
+  else if (/^Key([A-Z])$/.test(code))    key = 0x04 + code.charCodeAt(3) - 65;        // KeyA..Z
+  else if (/^Digit([0-9])$/.test(code)) {
+    const d = parseInt(code.slice(5), 10);
+    key = d === 0 ? 0x27 : 0x1E + (d - 1);
+  }
+  else if (/^Numpad([0-9])$/.test(code)) {
+    const d = parseInt(code.slice(6), 10);
+    key = d === 0 ? 0x62 : 0x59 + (d - 1);
+  }
+  if (!key) return null;
+  let mod = 0;
+  if (e.shiftKey) mod |= 0x02;
+  if (e.ctrlKey)  mod |= 0x01;
+  if (e.altKey)   mod |= 0x04;
+  if (e.metaKey)  mod |= 0x08;
+  return { mod, key };
+}
+
+async function liveSend(mod, keys) {
+  try {
+    await fetch('/api/live/key', {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ mod, keys })
+    });
+  } catch(e) {}
+}
+async function liveSendSpecial(name) {
+  const K = {'ENTER':0x28,'TAB':0x2B,'ESC':0x29,'BACKSPACE':0x2A,'DELETE':0x4C,'SPACE':0x2C};
+  if (K[name]) await liveSend(0, [K[name]]);
+}
+async function liveSendCombo(...tokens) {
+  let mod = 0;
+  const keys = [];
+  const MOD_MAP = {'CTRL':0x01,'SHIFT':0x02,'ALT':0x04,'GUI':0x08,'WIN':0x08,'WINDOWS':0x08};
+  const NAMED = {'ENTER':0x28,'TAB':0x2B,'ESC':0x29,'BACKSPACE':0x2A,'DELETE':0x4C,'SPACE':0x2C};
+  for (const t of tokens) {
+    const up = t.toUpperCase();
+    if (MOD_MAP[up] != null) mod |= MOD_MAP[up];
+    else if (NAMED[up] != null) keys.push(NAMED[up]);
+    else if (t.length === 1 && /[a-z]/i.test(t)) keys.push(0x04 + t.toUpperCase().charCodeAt(0) - 65);
+  }
+  await liveSend(mod, keys);
+}
+
+function bindLiveTyping() {
+  const ta = $('#liveInput');
+  ta.addEventListener('keydown', e => {
+    if (!$('#liveEn').checked) return;
+    // Allow browser default for shortcuts outside the typing surface
+    const h = keyEventToHid(e);
+    if (!h) return;
+    e.preventDefault();
+    liveSend(h.mod, [h.key]);
+    const stat = $('#liveStatus');
+    stat.textContent = `sent mod=${h.mod.toString(16)} key=${h.key.toString(16)}`;
+    clearTimeout(stat._t);
+    stat._t = setTimeout(() => stat.textContent = 'armed', 1200);
+  });
+}
+
+/* ============================================================
+   Terminal (Web CLI)
+   ============================================================ */
+let termHist = [];
+let termHistIdx = -1;
+
+async function cliProbe() {
+  try {
+    const r = await fetch('/api/auth/me');
+    const j = await r.json();
+    if (j.authed) {
+      $('#termLogin').style.display = 'none';
+      $('#termView').style.display = 'block';
+      $('#termUser').textContent = j.user;
+    } else {
+      $('#termLogin').style.display = 'block';
+      $('#termView').style.display = 'none';
+    }
+  } catch(e) {
+    $('#termLogin').style.display = 'block';
+  }
+}
+async function cliLogin() {
+  const user = $('#loginUser').value;
+  const pass = $('#loginPass').value;
+  $('#loginMsg').textContent = 'checking...';
+  const r = await fetch('/api/auth/login', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({user, pass})
+  });
+  const j = await r.json();
+  if (j.ok) {
+    $('#loginMsg').textContent = '';
+    $('#loginPass').value = '';
+    cliProbe();
+  } else {
+    $('#loginMsg').textContent = j.err || 'login failed';
+  }
+}
+async function cliLogout() {
+  await fetch('/api/auth/logout', { method:'POST' });
+  cliProbe();
+}
+function termAppend(html) {
+  const out = $('#termOut');
+  out.insertAdjacentHTML('beforeend', html);
+  out.scrollTop = out.scrollHeight;
+}
+async function cliRun() {
+  const cmd = $('#termIn').value;
+  if (!cmd.trim()) return;
+  termHist.push(cmd); if (termHist.length > 200) termHist.shift();
+  termHistIdx = termHist.length;
+  $('#termIn').value = '';
+  termAppend(`<div><span class="cmd">root@ghost:/root# </span>${esc(cmd)}</div>`);
+  const r = await fetch('/api/cli/exec', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({cmd})
+  });
+  if (r.status === 401) { cliProbe(); termAppend('<div class="err">session expired</div>'); return; }
+  const j = await r.json();
+  if (j.out) termAppend('<div>' + esc(j.out) + '</div>');
+  if (j.err) termAppend('<div class="err">' + esc(j.err) + '</div>');
+  const rcClass = j.rc === 0 ? 'rc0' : 'rc1';
+  termAppend(`<div class="${rcClass}">[exit ${j.rc != null ? j.rc : (j.err||'?')}]</div>`);
+}
+function termClear() { $('#termOut').innerHTML = ''; }
+function bindTerminal() {
+  $('#termIn').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); cliRun(); return; }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (termHistIdx > 0) { termHistIdx--; $('#termIn').value = termHist[termHistIdx] || ''; }
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (termHistIdx < termHist.length - 1) { termHistIdx++; $('#termIn').value = termHist[termHistIdx]; }
+      else { termHistIdx = termHist.length; $('#termIn').value = ''; }
+      return;
+    }
+    if (e.key === 'l' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); termClear(); }
+  });
+  $('#loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); cliLogin(); } });
+}
+
+/* --- boot: wire everything + first paint ---------------------------------- */
 (function boot() {
   const h = (location.hash || '#Live').slice(1);
-  openTab(['Live','Records','Query','Config','HID','System'].includes(h) ? h : 'Live');
+  openTab(TABS.includes(h) ? h : 'Live');
   loadCfg();
   tick();
   setInterval(tick, 2000);
+  // Scripting
+  bindEditor();
+  updateGutter();
+  scriptsRefresh();
+  layoutsRefresh();
+  // Live typing
+  bindLiveTyping();
+  // Terminal
+  bindTerminal();
+  cliProbe();
 })();
 """
 
@@ -928,6 +1703,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             st = os.statvfs("/root"); return int(st.f_bavail * st.f_bsize / 1024 / 1024)
         except Exception: return -1
 
+    # ---- session helpers ---------------------------------------------------
+    def _cookie_token(self):
+        c = self.headers.get("Cookie", "") or ""
+        for part in c.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "gl_sess":
+                return v
+        return ""
+
+    def _auth_user(self):
+        """Return username if request has a valid session, else ''."""
+        tok = self._cookie_token()
+        if tok:
+            u = _session_valid(tok)
+            if u: return u
+        # Bearer header fallback
+        a = self.headers.get("Authorization", "") or ""
+        if a.lower().startswith("bearer "):
+            u = _session_valid(a[7:].strip())
+            if u: return u
+        return ""
+
+    def _require_auth(self):
+        """Return True if request passes; otherwise respond 401 + False."""
+        if self._auth_user():
+            return True
+        self._send_json({"ok": False, "err": "auth required"}, code=401)
+        return False
+
+    def _client_ip(self):
+        return self.client_address[0] if self.client_address else "?"
+
     def _maybe_redirect(self):
         host = self.headers.get("Host", "")
         cfg = load_cfg()
@@ -1038,6 +1845,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except Exception: pass
                 if len(lines) >= 500: break
             self._send(200, "application/x-ndjson", "\n".join(lines))
+        elif p == "/api/scripts":
+            # list scripts under PAY_DIR
+            out = []
+            PAY_DIR.mkdir(parents=True, exist_ok=True)
+            for f in PAY_DIR.iterdir():
+                if not f.is_file(): continue
+                try:
+                    st = f.stat()
+                    out.append({"name": f.name, "size": st.st_size, "mtime": int(st.st_mtime)})
+                except Exception: pass
+            out.sort(key=lambda x: x["name"])
+            self._send_json(out)
+        elif p.startswith("/api/scripts/"):
+            name = p[len("/api/scripts/"):]
+            if not SCRIPT_NAME_RE.match(name):
+                return self._send(400, "text/plain", "bad script name")
+            fp = PAY_DIR / name
+            if not fp.exists():
+                return self._send(404, "text/plain", "not found")
+            try: body = fp.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                return self._send(500, "text/plain", f"read err: {e}")
+            self._send(200, "text/plain; charset=utf-8", body)
+        elif p == "/api/layouts":
+            out = []
+            if LAY_DIR.exists():
+                for f in sorted(LAY_DIR.iterdir()):
+                    if f.suffix == ".json": out.append(f.stem)
+            self._send_json(out)
+        elif p == "/api/auth/me":
+            u = self._auth_user()
+            self._send_json({"authed": bool(u), "user": u or None})
         else:
             self._send(404, "text/plain", "not found\n")
 
@@ -1124,6 +1963,166 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             threading.Thread(target=lambda: (time.sleep(1), os.system("reboot"))).start()
             return
+
+        # ---- scripts library (save) --------------------------------------
+        if u.path.startswith("/api/scripts/") and not u.path.endswith("/rename") and not u.path.endswith("/run"):
+            name = u.path[len("/api/scripts/"):]
+            if not SCRIPT_NAME_RE.match(name):
+                return self._send_json({"ok": False, "err": "bad script name"}, code=400)
+            PAY_DIR.mkdir(parents=True, exist_ok=True)
+            # cap at 128 KB
+            if len(body) > 128 * 1024:
+                return self._send_json({"ok": False, "err": "too large"}, code=413)
+            fp = PAY_DIR / name
+            tmp = fp.with_suffix(fp.suffix + ".new")
+            try:
+                tmp.write_bytes(body); tmp.replace(fp)
+                if name.endswith(".sh"):
+                    try: os.chmod(fp, 0o755)
+                    except Exception: pass
+                return self._send_json({"ok": True, "size": fp.stat().st_size})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- scripts library (rename) ------------------------------------
+        if u.path.endswith("/rename") and u.path.startswith("/api/scripts/"):
+            old = u.path[len("/api/scripts/"):-len("/rename")]
+            try: data = json.loads(body)
+            except Exception: data = {}
+            new = data.get("new", "")
+            if not SCRIPT_NAME_RE.match(old) or not SCRIPT_NAME_RE.match(new):
+                return self._send_json({"ok": False, "err": "bad name"}, code=400)
+            op = PAY_DIR / old; np = PAY_DIR / new
+            if not op.exists():
+                return self._send_json({"ok": False, "err": "not found"}, code=404)
+            if np.exists():
+                return self._send_json({"ok": False, "err": "target exists"}, code=409)
+            try: op.rename(np); return self._send_json({"ok": True})
+            except Exception as e: return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- scripts library (run) ---------------------------------------
+        if u.path.endswith("/run") and u.path.startswith("/api/scripts/"):
+            name = u.path[len("/api/scripts/"):-len("/run")]
+            if not SCRIPT_NAME_RE.match(name):
+                return self._send_json({"ok": False, "err": "bad name"}, code=400)
+            fp = PAY_DIR / name
+            if not fp.exists():
+                return self._send_json({"ok": False, "err": "not found"}, code=404)
+            if name.endswith(".ducky") or name.endswith(".txt") or name.endswith(".dd"):
+                rc = subprocess.call(["python3", str(ROOT/"ducky.py"), str(fp)])
+            elif name.endswith(".sh"):
+                rc = subprocess.call(["sh", str(fp)])
+            else:
+                return self._send_json({"ok": False, "err": "unknown type"}, code=400)
+            return self._send_json({"ok": rc == 0, "rc": rc}, code=200 if rc == 0 else 500)
+
+        # ---- stop any running payload ------------------------------------
+        if u.path == "/api/hid/stop":
+            killed = 0
+            try:
+                r = subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
+                for ln in r.stdout.splitlines():
+                    if "ducky.py" in ln and "grep" not in ln:
+                        parts = ln.split()
+                        if parts and parts[0].isdigit():
+                            try: os.kill(int(parts[0]), 15); killed += 1
+                            except Exception: pass
+            except Exception: pass
+            return self._send_json({"ok": True, "killed": killed})
+
+        # ---- live key (one HID report + release) -------------------------
+        if u.path == "/api/live/key":
+            try: data = json.loads(body)
+            except Exception: data = {}
+            mod = int(data.get("mod", 0)) & 0xFF
+            keys = data.get("keys") or ([data["key"]] if "key" in data else [])
+            # cap to 6 simultaneous keys per boot keyboard protocol
+            keys = [int(k) & 0xFF for k in keys][:6]
+            buf = bytes([mod, 0] + keys + [0] * (6 - len(keys)))
+            rel = bytes(8)
+            try:
+                fd = os.open("/dev/hidg0", os.O_RDWR)
+                os.write(fd, buf); os.write(fd, rel); os.close(fd)
+                return self._send_json({"ok": True})
+            except OSError as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- auth: login / logout ----------------------------------------
+        if u.path == "/api/auth/login":
+            ip = self._client_ip()
+            if _login_throttled(ip):
+                return self._send_json({"ok": False, "err": "throttled"}, code=429)
+            try: data = json.loads(body)
+            except Exception: data = {}
+            cfg = load_cfg()
+            expect_user = cfg.get("WEBUI_USER", "root")
+            expect_pass = cfg.get("WEBUI_PASS", "ghostlink")
+            u_in = data.get("user", "")
+            p_in = data.get("pass", "")
+            if secrets.compare_digest(u_in, expect_user) and secrets.compare_digest(p_in, expect_pass):
+                tok = _session_new(u_in)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                # 1h cookie; HttpOnly stops JS exfiltration; Path=/ scopes all routes.
+                self.send_header("Set-Cookie", f"gl_sess={tok}; HttpOnly; Path=/; Max-Age={SESSION_TTL}; SameSite=Strict")
+                b = json.dumps({"ok": True, "user": u_in}).encode()
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers(); self.wfile.write(b)
+                return
+            _login_record(ip)
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} webui login FAIL from {ip} user={u_in[:16]}\n")
+            except Exception: pass
+            return self._send_json({"ok": False, "err": "bad credentials"}, code=401)
+
+        if u.path == "/api/auth/logout":
+            tok = self._cookie_token()
+            if tok: _session_drop(tok)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", "gl_sess=; Path=/; Max-Age=0; SameSite=Strict")
+            b = b'{"ok":true}'
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b)
+            return
+
+        # ---- CLI exec (session-gated) ------------------------------------
+        if u.path == "/api/cli/exec":
+            if not self._require_auth(): return
+            try: data = json.loads(body)
+            except Exception: data = {}
+            cmd = (data.get("cmd") or "").strip()
+            if not cmd:
+                return self._send_json({"ok": False, "err": "empty cmd"}, code=400)
+            if len(cmd) > 8 * 1024:
+                return self._send_json({"ok": False, "err": "cmd too long"}, code=413)
+            try:
+                r = subprocess.run(["sh", "-c", cmd],
+                                   capture_output=True, timeout=15, cwd="/root")
+                out = r.stdout.decode("utf-8", "replace")[-64*1024:]
+                err = r.stderr.decode("utf-8", "replace")[-16*1024:]
+                return self._send_json({"ok": True, "rc": r.returncode,
+                                        "out": out, "err": err})
+            except subprocess.TimeoutExpired:
+                return self._send_json({"ok": False, "err": "timeout (15s)"}, code=504)
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        self._send(404, "text/plain", "not found\n")
+
+    def do_DELETE(self):
+        if self._maybe_redirect(): return
+        u = urlparse(self.path)
+        if u.path.startswith("/api/scripts/"):
+            name = u.path[len("/api/scripts/"):]
+            if not SCRIPT_NAME_RE.match(name):
+                return self._send_json({"ok": False, "err": "bad name"}, code=400)
+            fp = PAY_DIR / name
+            if not fp.exists():
+                return self._send_json({"ok": False, "err": "not found"}, code=404)
+            try: fp.unlink(); return self._send_json({"ok": True})
+            except Exception as e: return self._send_json({"ok": False, "err": str(e)}, code=500)
         self._send(404, "text/plain", "not found\n")
 
 
