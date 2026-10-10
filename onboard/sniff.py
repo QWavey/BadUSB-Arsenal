@@ -496,6 +496,7 @@ def main():
             time.sleep(1.5)
     threading.Thread(target=_watcher, daemon=True).start()
 
+    cfg_mt = 0.0
     try:
         while True:
             try:
@@ -504,13 +505,18 @@ def main():
                 L(f"recv err {e}"); time.sleep(0.1); continue
             now = time.time()
             ts_s = int(now); ts_us = int((now - ts_s) * 1_000_000)
-            # pick up live config changes for REDIRECT_FROM too
-            if int(now) % 10 == 0 and now - last_stats > 2:
-                cur = load_cfg(CFG_PATH)
-                if truthy(cur.get("REDIRECT", "FALSE")) and cur.get("REDIRECT_FROM"):
-                    red_from = [p.strip().lower() for p in cur["REDIRECT_FROM"].split(",") if p.strip()]
-                else:
-                    red_from = []
+            # pick up live config changes for REDIRECT_FROM (mtime-triggered)
+            try:
+                m = CFG_PATH.stat().st_mtime
+                if m != cfg_mt:
+                    cfg_mt = m
+                    cur = load_cfg(CFG_PATH)
+                    if truthy(cur.get("REDIRECT", "FALSE")) and cur.get("REDIRECT_FROM"):
+                        red_from = [p.strip().lower() for p in cur["REDIRECT_FROM"].split(",") if p.strip()]
+                    else:
+                        red_from = []
+                    L(f"REDIRECT_FROM reloaded: {red_from}")
+            except Exception: pass
             v = classify(buf, red_from)
             if v.get("rule"): match_count += 1
             w.write(ts_s, ts_us, buf, v)

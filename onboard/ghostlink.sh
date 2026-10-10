@@ -37,7 +37,13 @@ write_dnsmasq_conf() {
         echo "dhcp-range=$DR"
         for s in $(echo "$DNS" | tr ',' ' '); do echo "server=$s"; done
         if truthy "$RED" && [ -n "$RED_FROM" ]; then
-            TARGET_IP=$(echo "$RED_TO" | sed -E 's#^https?://##; s#/.*##')
+            # address= needs a bare IP. We always point at ourselves (the
+            # device's usb0 IP) so the browser arrives at :80 here, and
+            # webui.py 302s to REDIRECT_TO via Host-header. REDIRECT_TO
+            # may be a hostname or URL — that is only used by the 302
+            # Location header, not by dnsmasq.
+            TARGET_IP=$(ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+            [ -n "$TARGET_IP" ] || TARGET_IP="172.32.0.93"
             for h in $(echo "$RED_FROM" | tr ',' ' '); do
                 h=$(echo "$h" | sed -E 's#^https?://##; s#/.*##')
                 echo "address=/$h/$TARGET_IP"
@@ -67,8 +73,17 @@ if [ "${1:-}" = "reload-dnsmasq" ]; then
         kill "$p" 2>/dev/null
     done
     sleep 0.3
-    dnsmasq -C /tmp/ghostlink.dnsmasq.conf -x /run/ghostlink-dnsmasq.pid -z >>"$LOG" 2>&1 &
-    log "dnsmasq reloaded (REDIRECT=$RED REDIRECT_FROM=$RF REDIRECT_TO=$RT)"
+    rm -f /run/ghostlink-dnsmasq.pid
+    # -k keeps dnsmasq in foreground; we background with & ourselves so the
+    # shell owns the lifetime. daemon mode (-z alone) was failing silently
+    # on this busybox init environment.
+    setsid nohup dnsmasq -C /tmp/ghostlink.dnsmasq.conf -k >>"$LOG" 2>&1 </dev/null &
+    sleep 0.5
+    if ps 2>/dev/null | grep -q "[d]nsmasq.*ghostlink"; then
+        log "dnsmasq reloaded (REDIRECT=$RED REDIRECT_FROM=$RF REDIRECT_TO=$RT)"
+    else
+        log "ERROR: dnsmasq failed to start after reload — check /tmp/ghostlink.dnsmasq.conf"
+    fi
     exit 0
 fi
 
@@ -125,7 +140,8 @@ if truthy "${DNSMASQ:-TRUE}" && command -v dnsmasq >/dev/null 2>&1; then
     IFACE=${DNSMASQ_IFACE:-usb0}
     write_dnsmasq_conf "$IFACE" "$DHCP_RANGE" "$DNS_UPSTREAM" \
                        "${REDIRECT:-FALSE}" "${REDIRECT_FROM:-}" "${REDIRECT_TO:-172.32.0.93}" >/dev/null
-    dnsmasq -C /tmp/ghostlink.dnsmasq.conf -x /run/ghostlink-dnsmasq.pid -z >>"$LOG" 2>&1 &
+    rm -f /run/ghostlink-dnsmasq.pid
+    setsid nohup dnsmasq -C /tmp/ghostlink.dnsmasq.conf -k >>"$LOG" 2>&1 </dev/null &
     log "dnsmasq on $IFACE (REDIRECT=${REDIRECT:-FALSE})"
 fi
 
