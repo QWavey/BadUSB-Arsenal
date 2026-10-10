@@ -15,6 +15,7 @@ Supports Hak5-format layout files (XX,YY,ZZ hex triplets) and the legacy
 """
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -119,6 +120,83 @@ def _ms(txt, default=0):
     except (TypeError, ValueError): return default
 
 
+# -------- GhostLink-only extensions ----------------------------------------
+# These are DuckyScript commands unique to GhostLink. They let a payload
+# flip config, kick dnsmasq, run a shell payload from the library, or write
+# to the log, without needing out-of-band actions.
+
+def _cfg_log(msg):
+    try:
+        logp = ROOT / "logs" / "ghostlink.log"
+        logp.parent.mkdir(parents=True, exist_ok=True)
+        with open(logp, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} ducky {msg}\n")
+    except Exception: pass
+
+
+def gl_set(key_value: str):
+    """GL_SET KEY=VALUE   — atomically update one config.txt line."""
+    key, _, val = key_value.partition("=")
+    key = key.strip()
+    val = val.strip()
+    if not key: return False
+    cfg_path = ROOT / "config.txt"
+    try:
+        txt = cfg_path.read_text() if cfg_path.exists() else ""
+    except Exception:
+        txt = ""
+    import re as _re
+    pat = _re.compile(r"^" + _re.escape(key) + r"=.*$", _re.MULTILINE)
+    new_line = f"{key}={val}"
+    if pat.search(txt):
+        txt = pat.sub(new_line, txt)
+    else:
+        if txt and not txt.endswith("\n"): txt += "\n"
+        txt += new_line + "\n"
+    tmp = cfg_path.with_suffix(".new")
+    try:
+        tmp.write_text(txt); tmp.replace(cfg_path)
+        _cfg_log(f"GL_SET {key}={val[:40]}")
+        return True
+    except Exception as e:
+        _cfg_log(f"GL_SET fail {e}")
+        return False
+
+
+def gl_reload_dnsmasq():
+    try:
+        subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
+                       timeout=5, capture_output=True)
+        _cfg_log("GL_RELOAD_DNSMASQ")
+        return True
+    except Exception as e:
+        _cfg_log(f"GL_RELOAD_DNSMASQ fail {e}")
+        return False
+
+
+def gl_run_script(name: str):
+    """GL_RUN script.sh — fire a sibling shell payload."""
+    name = name.strip()
+    import re as _re
+    if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(sh|dd|txt|ducky)$", name):
+        _cfg_log(f"GL_RUN bad name '{name}'")
+        return False
+    p = ROOT / "payloads" / name
+    if not p.exists():
+        _cfg_log(f"GL_RUN not found '{name}'")
+        return False
+    try:
+        if name.endswith(".sh"):
+            subprocess.Popen(["sh", str(p)])
+        else:
+            subprocess.Popen(["python3", str(ROOT/"ducky.py"), str(p)])
+        _cfg_log(f"GL_RUN {name}")
+        return True
+    except Exception as e:
+        _cfg_log(f"GL_RUN fail {e}")
+        return False
+
+
 def run(path, stop_event=None):
     """Interpret path. Returns 0 on success, non-zero on open-HID failure."""
     lines = Path(path).read_text().splitlines()
@@ -162,6 +240,41 @@ def run(path, stop_event=None):
             char_delay_ms = _ms(line[17:], 2); return False
         if up.startswith("DELAY "):
             time.sleep(max(0, _ms(line[6:], 0)) / 1000.0); return True
+        if up.startswith("WAIT "):
+            # GL_WAIT in whole seconds — nicer than DELAY for long waits
+            time.sleep(max(0, _ms(line[5:], 0))); return True
+
+        # ---- GhostLink extensions ---------------------------------------
+        if up.startswith("GL_SET "):
+            gl_set(line[7:]); return True
+        if up.startswith("GL_RELOAD_DNSMASQ") or up == "GL_RELOAD":
+            gl_reload_dnsmasq(); return True
+        if up.startswith("GL_RUN "):
+            gl_run_script(line[7:]); return True
+        if up.startswith("GL_LOG "):
+            _cfg_log(line[7:]); return True
+        if up.startswith("GL_WAIT "):
+            time.sleep(max(0, _ms(line[8:], 0))); return True
+        if up == "GL_REBOOT":
+            _cfg_log("GL_REBOOT requested"); os.system("sync; reboot &"); return True
+        if up.startswith("GL_SPOOF_ADD "):
+            # append host to REDIRECT_FROM and enable REDIRECT + reload
+            host = line[13:].strip()
+            cfg = ROOT / "config.txt"
+            try:
+                txt = cfg.read_text() if cfg.exists() else ""
+                cur = ""
+                import re as _re
+                m = _re.search(r"^REDIRECT_FROM=(.*)$", txt, _re.MULTILINE)
+                if m: cur = m.group(1).split("#", 1)[0].strip()
+                items = [s.strip() for s in cur.split(",") if s.strip()]
+                if host and host not in items: items.append(host)
+                gl_set("REDIRECT_FROM=" + ",".join(items))
+                gl_set("REDIRECT=TRUE")
+                gl_reload_dnsmasq()
+            except Exception as e:
+                _cfg_log(f"GL_SPOOF_ADD fail {e}")
+            return True
 
         if up.startswith("STRING "):
             miss = 0

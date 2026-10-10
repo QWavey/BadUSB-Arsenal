@@ -15,14 +15,20 @@ browser visit a spoofed domain and get redirected without needing a
 separate :8080 forwarder.
 """
 
+import fcntl
 import http.server
 import json
 import os
+import pty
 import re
 import secrets
+import select
+import signal
 import socketserver
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 from pathlib import Path
@@ -94,6 +100,184 @@ def _login_record(ip: str):
 # No slashes, no ..  Length 1..64. One of a few allowed extensions.
 SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(ducky|txt|sh|dd)$")
 
+# -------- pty-backed shell per session --------------------------------------
+# A real terminal keeps state across commands (cwd, env, exported vars,
+# interactive readers). We spawn one `sh` child per authed session, pipe cmds
+# in via the pty master fd, and read whatever comes back until the output
+# goes quiet. Session TTL + explicit logout close the child.
+
+PTY_SHELLS = {}  # {token: {"pid":..., "fd":..., "lock":Lock, "lastread":ts, "buf":str}}
+PTY_LOCK   = threading.Lock()
+
+def _pty_strip_ansi(s: str) -> str:
+    # Drop ANSI CSI / OSC and lonely CR for cleaner web output.
+    s = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s)
+    s = re.sub(r"\x1b\][^\x07]*\x07", "", s)
+    return s.replace("\r\n", "\n").replace("\r", "")
+
+
+def pty_open(token: str) -> dict:
+    """Open a persistent sh session for this token (or return existing)."""
+    with PTY_LOCK:
+        s = PTY_SHELLS.get(token)
+        if s and s.get("pid"):
+            # verify alive
+            try: os.kill(s["pid"], 0)
+            except OSError:
+                try: os.close(s["fd"])
+                except Exception: pass
+                PTY_SHELLS.pop(token, None)
+                s = None
+        if not s:
+            pid, fd = pty.fork()
+            if pid == 0:
+                os.chdir("/root")
+                os.environ["PS1"] = "$ "
+                os.environ["TERM"] = "dumb"
+                try:
+                    os.execvp("sh", ["sh"])
+                except Exception:
+                    os._exit(1)
+            # set winsize so programs that query TIOCGWINSZ don't trip
+            try:
+                fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+            except Exception: pass
+            fcntl.fcntl(fd, fcntl.F_SETFL, os.O_NONBLOCK)
+            s = {"pid": pid, "fd": fd, "lock": threading.Lock(), "lastread": 0.0}
+            PTY_SHELLS[token] = s
+            # drain any initial prompt output so the first user command isn't
+            # prefixed with it
+            try:
+                time.sleep(0.1)
+                while True:
+                    r, _, _ = select.select([fd], [], [], 0.1)
+                    if not r: break
+                    os.read(fd, 4096)
+            except Exception: pass
+        return s
+
+
+def pty_close(token: str):
+    with PTY_LOCK:
+        s = PTY_SHELLS.pop(token, None)
+    if s:
+        try: os.kill(s["pid"], signal.SIGTERM)
+        except Exception: pass
+        try: os.close(s["fd"])
+        except Exception: pass
+
+
+def pty_run(token: str, cmd: str, timeout: float = 15.0) -> dict:
+    """Send cmd to the token's shell, return captured output cleaned up."""
+    s = pty_open(token)
+    fd = s["fd"]
+    with s["lock"]:
+        # drain anything stale first (prior async output / lingering prompt)
+        try:
+            while True:
+                r, _, _ = select.select([fd], [], [], 0)
+                if not r: break
+                os.read(fd, 4096)
+        except Exception: pass
+
+        # Sentinel so we can detect end-of-command without parsing a prompt.
+        marker = "__GL_END_" + secrets.token_hex(6) + "__"
+        # printf prints the marker on its OWN new line and the rc. We echo
+        # with no leading space on the printf line so the shell's ECHO of
+        # that line is a predictable string we can scrub.
+        probe = f"printf '\\n{marker} rc=%d\\n' $?"
+        payload = f"{cmd}\n{probe}\n"
+        try:
+            os.write(fd, payload.encode())
+        except OSError as e:
+            return {"out": "", "err": f"write: {e}", "rc": -1}
+
+        buf = b""
+        rc_val = None
+        done = False
+        start = time.time()
+        while time.time() - start < timeout and not done:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r:
+                try:
+                    chunk = os.read(fd, 8192)
+                    if not chunk:
+                        done = True; break
+                    buf += chunk
+                    # Normalize line endings for the match (pty converts \n to
+                    # \r\n on echo — the previous regex failed because of this).
+                    text_so_far = buf.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "")
+                    m = re.search(re.escape(marker) + r" rc=(\d+)\n", text_so_far)
+                    if m:
+                        # Second occurrence is the printed one (the first is
+                        # the echoed probe line) — but the regex is non-greedy,
+                        # so it finds the first. We want the LAST match.
+                        for m2 in re.finditer(re.escape(marker) + r" rc=(\d+)\n", text_so_far):
+                            m = m2
+                        rc_val = int(m.group(1))
+                        buf = text_so_far[:m.start()].encode("utf-8", "replace")
+                        done = True
+                except OSError:
+                    done = True; break
+
+        text = buf.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "")
+        text = _pty_strip_ansi(text)
+        # Drop the echoed probe line itself (contains the marker name).
+        text = re.sub(r"[^\n]*" + re.escape(marker) + r"[^\n]*\n?", "", text)
+        # Drop a leading echoed user command (shell echoes before running).
+        if text.startswith(cmd + "\n"):
+            text = text[len(cmd) + 1:]
+        # Strip a lonely "$ " prompt at the end.
+        text = re.sub(r"\n?\$\s*$", "", text)
+        # Collapse trailing whitespace.
+        text = text.rstrip() + ("\n" if text.strip() else "")
+
+    return {
+        "out": text[-64*1024:],
+        "err": "",
+        "rc":  rc_val if rc_val is not None else -1,
+        "timeout": not done,
+    }
+
+
+# ---- canonical default config.txt ------------------------------------------
+# POST /api/config/defaults rewrites config.txt to this. Keeps the user's
+# device_name and hostname if they were customized.
+DEFAULT_CONFIG = """\
+# GhostLink on-device config
+HOSTNAME=ghostlink
+DEVICE_NAME=WebBee-Ghost-01
+ENABLE_HID=TRUE
+SNIFF_IFACE=usb0
+LOG=TRUE
+RECORD_PCAP=TRUE
+RECORD_ROTATE_KB=1024
+RECORD_RING_FILES=4
+VERDICT_STREAM=TRUE
+VERDICT_RING_FILES=10
+RECORD_MAX_AGE_H=24
+RECORD_MIN_FREE_MB=10
+WEBUI=TRUE
+WEBUI_PORT=80
+WEBUI_BIND=0.0.0.0
+WEBUI_USER=root
+WEBUI_PASS=ghostlink
+DNSMASQ=TRUE
+DNSMASQ_IFACE=usb0
+DHCP_RANGE=172.32.0.100,172.32.0.120,255.255.0.0,12h
+DNS_UPSTREAM=1.1.1.1,9.9.9.9
+REDIRECT=FALSE
+REDIRECT_FROM=
+REDIRECT_TO=http://example.com
+REDIRECT_PRESERVE_PATH=TRUE
+DNS_SPOOF=FALSE
+DNS_SPOOF_HOSTS=
+HID_LAYOUT=us
+HID_PAYLOAD=
+HID_DELAY_MS=1500
+LOG_LEVEL=INFO
+"""
+
 
 def load_cfg():
     cfg = {}
@@ -139,7 +323,10 @@ HTML = r"""<!doctype html>
   <section id="tab-Live" class="tabcontent" style="display:block">
     <div class="flex-row" style="justify-content: space-between; align-items: center;">
       <h3>Live Monitor</h3>
-      <div id="recBadge" class="status-badge">REC OFF</div>
+      <div class="flex-row" style="gap:10px;">
+        <button id="btnRec" onclick="toggleRecord()" class="btn-ghost">&hellip;</button>
+        <div id="recBadge" class="status-badge">REC OFF</div>
+      </div>
     </div>
 
     <div class="stat-grid">
@@ -231,6 +418,7 @@ HTML = r"""<!doctype html>
       <div class="flex-row" style="gap:10px;">
         <button onclick="loadCfg()">Reload</button>
         <button onclick="saveCfg()">Save</button>
+        <button onclick="applyStandard()" class="btn-ghost">Apply standard</button>
       </div>
     </div>
     <div class="section">
@@ -384,6 +572,7 @@ HTML = r"""<!doctype html>
         <h4>shell &middot; <span id="termUser" class="dim" style="font-weight:400;"></span></h4>
         <div class="flex-row" style="gap:8px;">
           <button onclick="termClear()" class="btn-ghost">Clear</button>
+          <button onclick="cliReset()" class="btn-ghost">Reset shell</button>
           <button onclick="cliLogout()" class="btn-ghost">Logout</button>
         </div>
       </div>
@@ -925,6 +1114,9 @@ function openTab(name) {
   if (name === 'Records')   refreshRecords();
   if (name === 'System')    refreshSystem();
   if (name === 'HID')       refreshPayloads();
+  // Config tab: always refetch so changes made via other tabs
+  // (quick-spoof, DuckyScript GL_SET, external edits) are visible
+  if (name === 'Config')    { loadCfg(); }
   if (name === 'Scripting') { scriptsRefresh(); layoutsRefresh(); }
   if (name === 'LiveType')  { $('#liveInput').focus(); }
   if (name === 'Terminal')  { cliProbe(); setTimeout(() => $('#termIn') && $('#termIn').focus(), 50); }
@@ -935,8 +1127,14 @@ async function tick() {
   try {
     const [st, live] = await Promise.all([api('/api/status'), api('/api/live')]);
     const b = $('#recBadge');
-    if (st.record_pcap) { b.classList.add('on'); b.textContent = 'REC ON'; }
-    else                { b.classList.remove('on'); b.textContent = 'REC OFF'; }
+    const btn = $('#btnRec');
+    if (st.record_pcap) {
+      b.classList.add('on'); b.textContent = 'REC ON';
+      if (btn) btn.textContent = 'Stop recording';
+    } else {
+      b.classList.remove('on'); b.textContent = 'REC OFF';
+      if (btn) btn.textContent = 'Start recording';
+    }
     $('#s-pps').textContent     = live.pps ?? 0;
     $('#s-mps').textContent     = live.mps ?? 0;
     $('#s-frames').textContent  = (live.frames ?? 0).toLocaleString();
@@ -1106,6 +1304,41 @@ async function reboot() {
   await api('/api/reboot', { method:'POST' });
 }
 
+async function toggleRecord() {
+  // Flip RECORD_PCAP live. sniff.py mtime-watches config and will wipe/open
+  // pcap files to match within ~1.5 s.
+  let txt = await api('/api/config');
+  if (typeof txt !== 'string') return;
+  const re = /^RECORD_PCAP=.*$/m;
+  const cur = (txt.match(re) || [''])[0];
+  const next = cur.endsWith('TRUE') ? 'RECORD_PCAP=FALSE' : 'RECORD_PCAP=TRUE';
+  txt = cur ? txt.replace(re, next) : (txt + '\n' + next + '\n');
+  const r = await api('/api/config', { method:'POST', body: txt });
+  if (r.ok) {
+    toast(next.endsWith('TRUE') ? 'recording' : 'stopped');
+    tick();
+  } else {
+    toast('toggle failed', true);
+  }
+}
+
+async function applyStandard() {
+  if (!confirm('Overwrite config.txt with the shipped defaults?\n\n'
+             + 'This keeps the device password at root/ghostlink — change it after.'))
+    return;
+  const r = await api('/api/config/defaults', { method:'POST' });
+  if (r.ok) { toast('defaults applied'); loadCfg(); tick(); }
+  else      { toast('apply failed: ' + (r.err||''), true); }
+}
+
+async function cliReset() {
+  const r = await api('/api/cli/reset', { method:'POST' });
+  if (r.ok) {
+    $('#termOut').innerHTML = '';
+    termAppend('<div class="rc0">[fresh shell]</div>');
+  }
+}
+
 /* --- toast --------------------------------------------------- */
 function toast(msg, err) {
   const el = document.createElement('div');
@@ -1139,6 +1372,15 @@ const DUCKY_KEYWORDS = [
   {w:'DEFAULTDELAY',  kind:'cmd', hint:'ms between every command'},
   {w:'DEFAULTCHARDELAY', kind:'cmd', hint:'ms between STRING chars'},
   {w:'REPEAT',        kind:'cmd', hint:'repeat previous line N times'},
+  // GhostLink extensions
+  {w:'GL_SET',          kind:'gl',  hint:'KEY=VALUE  — write config.txt'},
+  {w:'GL_RELOAD_DNSMASQ', kind:'gl', hint:'kick dnsmasq to pick up new rules'},
+  {w:'GL_RELOAD',       kind:'gl',  hint:'alias for GL_RELOAD_DNSMASQ'},
+  {w:'GL_RUN',          kind:'gl',  hint:'name.sh — run a sibling payload'},
+  {w:'GL_LOG',          kind:'gl',  hint:'append to ghostlink.log'},
+  {w:'GL_WAIT',          kind:'gl', hint:'N seconds'},
+  {w:'GL_SPOOF_ADD',    kind:'gl',  hint:'host — append to REDIRECT_FROM'},
+  {w:'GL_REBOOT',       kind:'gl',  hint:'reboot the device'},
   // modifiers
   {w:'GUI',    kind:'mod'}, {w:'WINDOWS', kind:'mod'}, {w:'WIN', kind:'mod'},
   {w:'SUPER',  kind:'mod'}, {w:'COMMAND', kind:'mod'}, {w:'CMD', kind:'mod'},
@@ -1176,7 +1418,8 @@ function validateScript() {
     const s = raw.trim();
     if (!s) return;
     if (/^(REM|REM_BLOCK|END_REM|#)/i.test(s)) return;
-    if (/^(STRING|DELAY|DEFAULTDELAY|DEFAULT_DELAY|DEFAULTCHARDELAY|REPEAT) /i.test(s)) return;
+    if (/^(STRING|DELAY|DEFAULTDELAY|DEFAULT_DELAY|DEFAULTCHARDELAY|REPEAT|WAIT) /i.test(s)) return;
+    if (/^GL_/i.test(s)) return;              // GhostLink extensions
     const toks = s.split(/\s+/).map(t => t.toUpperCase());
     if (toks.every(t => KW_SET.has(t))) return;
     errs.push(`L${i+1}: unknown "${s.slice(0,40)}"`);
@@ -1328,15 +1571,25 @@ async function scriptDelete(name) {
   }
 }
 async function scriptRun() {
-  if (!currentScript) return toast('nothing to run — save first', true);
-  // auto-save then run so what you see is what fires
-  await fetch('/api/scripts/' + encodeURIComponent(currentScript), {
-    method:'POST', body: $('#scriptArea').value });
-  $('#scriptStatus').textContent = 'running ' + currentScript + '...';
-  const r = await api('/api/scripts/' + encodeURIComponent(currentScript) + '/run', { method:'POST' });
-  if (r.ok) { toast('ran ' + currentScript); $('#scriptStatus').textContent = 'ok'; }
-  else { toast('run failed rc=' + (r.rc != null ? r.rc : '?'), true);
-         $('#scriptStatus').textContent = 'failed'; }
+  const body = $('#scriptArea').value;
+  if (!body.trim()) return toast('empty', true);
+  if (currentScript) {
+    // save then run named script (so what you see is what fires)
+    await fetch('/api/scripts/' + encodeURIComponent(currentScript), {
+      method:'POST', body });
+    $('#scriptStatus').textContent = 'running ' + currentScript + '...';
+    const r = await api('/api/scripts/' + encodeURIComponent(currentScript) + '/run', { method:'POST' });
+    if (r.ok) { toast('ran ' + currentScript); $('#scriptStatus').textContent = 'ok'; }
+    else      { toast('run failed rc=' + (r.rc != null ? r.rc : '?'), true);
+                $('#scriptStatus').textContent = 'failed'; }
+  } else {
+    // unsaved buffer — run via tmp endpoint without needing a name
+    $('#scriptStatus').textContent = 'running temp...';
+    const r = await api('/api/scripts/_runtemp', { method:'POST', body });
+    if (r.ok) { toast('ran (unsaved buffer)'); $('#scriptStatus').textContent = 'ok (temp)'; }
+    else      { toast('run failed rc=' + (r.rc != null ? r.rc : '?'), true);
+                $('#scriptStatus').textContent = 'failed'; }
+  }
 }
 async function scriptStop() {
   const r = await api('/api/hid/stop', { method:'POST' });
@@ -1687,13 +1940,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, code, ctype, body, extra=None):
         if isinstance(body, str): body = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items(): self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (extra or {}).items(): self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # client closed the connection mid-response (tab switch, poll
+            # cycle collide). This is noise — swallow it so the thread
+            # doesn't dump a stack trace into the log.
+            pass
 
     def _send_json(self, obj, code=200):
         self._send(code, "application/json", json.dumps(obj))
@@ -1964,6 +2223,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             threading.Thread(target=lambda: (time.sleep(1), os.system("reboot"))).start()
             return
 
+        # ---- run temporary (unsaved) DuckyScript -------------------------
+        # Must come BEFORE the generic /api/scripts/<name> save handler so
+        # the "_runtemp" path doesn't get name-validated as a save target.
+        if u.path == "/api/scripts/_runtemp":
+            if len(body) > 128 * 1024:
+                return self._send_json({"ok": False, "err": "too large"}, code=413)
+            if not body.strip():
+                return self._send_json({"ok": False, "err": "empty"}, code=400)
+            tmp = Path("/tmp") / f"gl_tmp_{os.getpid()}_{int(time.time()*1000)}.ducky"
+            try:
+                tmp.write_bytes(body)
+                rc = subprocess.call(["python3", str(ROOT/"ducky.py"), str(tmp)])
+                return self._send_json({"ok": rc == 0, "rc": rc},
+                                       code=200 if rc == 0 else 500)
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+            finally:
+                try: tmp.unlink()
+                except Exception: pass
+
         # ---- scripts library (save) --------------------------------------
         if u.path.startswith("/api/scripts/") and not u.path.endswith("/rename") and not u.path.endswith("/run"):
             name = u.path[len("/api/scripts/"):]
@@ -2078,7 +2357,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if u.path == "/api/auth/logout":
             tok = self._cookie_token()
-            if tok: _session_drop(tok)
+            if tok:
+                pty_close(tok)
+                _session_drop(tok)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Set-Cookie", "gl_sess=; Path=/; Max-Age=0; SameSite=Strict")
@@ -2087,25 +2368,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers(); self.wfile.write(b)
             return
 
-        # ---- CLI exec (session-gated) ------------------------------------
+        # ---- CLI exec: persistent pty-backed shell per session -----------
+        # The shell is a real `sh` child that stays alive between requests, so
+        # cd / exports / variables / loops survive like a terminal. The POST
+        # writes the command to the shell's pty master and reads back until
+        # the end-of-command sentinel appears (or 15 s elapses).
         if u.path == "/api/cli/exec":
             if not self._require_auth(): return
+            tok = self._cookie_token() or (self.headers.get("Authorization","") or "")[7:].strip()
             try: data = json.loads(body)
             except Exception: data = {}
-            cmd = (data.get("cmd") or "").strip()
-            if not cmd:
+            cmd = data.get("cmd") or ""
+            if not cmd.strip():
                 return self._send_json({"ok": False, "err": "empty cmd"}, code=400)
             if len(cmd) > 8 * 1024:
                 return self._send_json({"ok": False, "err": "cmd too long"}, code=413)
             try:
-                r = subprocess.run(["sh", "-c", cmd],
-                                   capture_output=True, timeout=15, cwd="/root")
-                out = r.stdout.decode("utf-8", "replace")[-64*1024:]
-                err = r.stderr.decode("utf-8", "replace")[-16*1024:]
-                return self._send_json({"ok": True, "rc": r.returncode,
-                                        "out": out, "err": err})
-            except subprocess.TimeoutExpired:
-                return self._send_json({"ok": False, "err": "timeout (15s)"}, code=504)
+                r = pty_run(tok, cmd, timeout=15.0)
+                return self._send_json({
+                    "ok":  not r.get("timeout"),
+                    "rc":  r.get("rc", -1),
+                    "out": r.get("out", ""),
+                    "err": r.get("err", ""),
+                    "timeout": r.get("timeout", False),
+                })
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- CLI session reset: kill the shell and start a fresh one -----
+        if u.path == "/api/cli/reset":
+            if not self._require_auth(): return
+            tok = self._cookie_token()
+            pty_close(tok)
+            pty_open(tok)
+            return self._send_json({"ok": True})
+
+        # ---- reset config.txt to canonical defaults ----------------------
+        if u.path == "/api/config/defaults":
+            try:
+                tmp = CFG_PATH.with_suffix(".new")
+                tmp.write_text(DEFAULT_CONFIG, encoding="utf-8")
+                tmp.replace(CFG_PATH)
+                try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
+                                    timeout=5, capture_output=True)
+                except Exception: pass
+                return self._send_json({"ok": True})
             except Exception as e:
                 return self._send_json({"ok": False, "err": str(e)}, code=500)
 
