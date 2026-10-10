@@ -30,10 +30,28 @@ ROOT      = Path(os.environ.get("GL_ROOT", "/root/ghostlink"))
 CFG_PATH  = ROOT / "config.txt"
 REC_DIR   = ROOT / "records"
 VER_DIR   = ROOT / "verdicts"
-LOG_PATH  = ROOT / "logs" / "ghostlink.log"
+LOG_DIR   = ROOT / "logs"
+LOG_PATH  = LOG_DIR / "ghostlink.log"
 
 WATCH_FRAMES = 10      # re-read config.txt every N frames
 WATCH_SECONDS = 1.5    # or every N seconds, whichever comes first
+
+# Disk-pressure thresholds (MB free on /root).
+# Overridable via config: WARN_FREE_MB / CRIT_FREE_MB / PANIC_FREE_MB.
+# WARN  — start proactively pruning oldest records + log tails.
+# CRIT  — nuke ALL records and verdicts now, log loud warning, pause.
+# PANIC — stop ALL writes (even verdicts). Protect the OS.
+WARN_FREE_MB  = 15
+CRIT_FREE_MB  = 8
+PANIC_FREE_MB = 5
+
+# Independent log-rotation cap. Even without disk pressure, don't let any
+# single log file grow past this.
+LOG_MAX_KB = 256
+
+# Rotate verdicts if a single jsonl file exceeds this. Important because
+# a chatty Windows host can push verdicts to MBs quickly.
+VERDICT_MAX_KB = 512
 
 
 # -------- config --------------------------------------------------------------
@@ -65,6 +83,37 @@ def free_mb(path: str = "/root") -> int:
         return int(st.f_bavail * st.f_bsize / 1024 / 1024)
     except Exception:
         return 10_000
+
+
+def trim_log(p: Path, keep_kb: int = LOG_MAX_KB):
+    """Keep only the last keep_kb KB of a log file, atomically."""
+    try:
+        if not p.exists(): return
+        sz = p.stat().st_size
+        if sz < keep_kb * 1024 * 2: return  # headroom before trim
+        with open(p, "rb") as f:
+            f.seek(max(0, sz - keep_kb * 1024))
+            tail = f.read()
+        # drop partial first line
+        nl = tail.find(b"\n")
+        if nl >= 0: tail = tail[nl+1:]
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_bytes(tail)
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def pressure_level() -> int:
+    f = free_mb()
+    if f < PANIC_FREE_MB: return 2  # PANIC
+    if f < CRIT_FREE_MB:  return 2  # treat crit as panic for writes
+    if f < WARN_FREE_MB:  return 1
+    return 0
+
+
+# Shared state so stats + log can report it
+PRESSURE_STATE = {"level": 0, "free_mb": 100, "last_change": 0.0}
 
 
 def nuke(d: Path, pattern: str):
@@ -134,6 +183,8 @@ class Writer:
         self.min_free_mb  = int(cfg.get("RECORD_MIN_FREE_MB", "10"))
         self.want_pcap    = truthy(cfg.get("RECORD_PCAP", "TRUE"))
         self.want_verd    = truthy(cfg.get("VERDICT_STREAM", "TRUE"))
+        # per-session verdict byte counter for size-based rotation
+        self.verd_bytes   = 0
 
     def _next_idx(self) -> int:
         used = []
@@ -215,8 +266,11 @@ class Writer:
         if self.frame % WATCH_FRAMES == 0 or (now - self.last_check) > WATCH_SECONDS:
             self.last_check = now
             self._check_config()
-            if free_mb() < self.min_free_mb:
-                self._prune()
+            self._enforce_disk()
+
+        # PANIC: refuse to write anything that touches the FS until free recovers
+        if PRESSURE_STATE["level"] >= 2:
+            return
 
         caplen = len(frame_bytes)
         verdict["f"]  = self.frame
@@ -224,8 +278,12 @@ class Writer:
         verdict["sz"] = caplen
 
         if self.want_verd and self.verd_f:
-            self.verd_f.write((json.dumps(verdict, separators=(",", ":")) + "\n").encode())
+            line = (json.dumps(verdict, separators=(",", ":")) + "\n").encode()
+            self.verd_f.write(line)
             self.verd_f.flush()
+            self.verd_bytes += len(line)
+            if self.verd_bytes >= VERDICT_MAX_KB * 1024:
+                self._rotate()
 
         if self.want_pcap and self.pcap_f:
             rec = struct.pack("<IIII", ts_s, ts_us, caplen, caplen)
@@ -236,6 +294,49 @@ class Writer:
             if self.pcap_bytes >= self.rotate_kb * 1024:
                 self._rotate()
 
+    def _enforce_disk(self):
+        """Called every ~1.5s. Decide pressure level and act."""
+        f = free_mb()
+        PRESSURE_STATE["free_mb"] = f
+        prev = PRESSURE_STATE["level"]
+        if   f < CRIT_FREE_MB:  level = 2
+        elif f < WARN_FREE_MB:  level = 1
+        else:                   level = 0
+
+        if level != prev:
+            PRESSURE_STATE["level"] = level
+            PRESSURE_STATE["last_change"] = time.time()
+            try:
+                with open(LOG_PATH, "a") as lf:
+                    lf.write(f"{time.strftime('%H:%M:%S')} sniff "
+                             f"PRESSURE level {prev} -> {level} (free={f}MB)\n")
+            except Exception: pass
+
+        if level == 2:
+            # EMERGENCY: close everything, nuke all records + verdicts, trim logs.
+            if self.pcap_f: self.pcap_f.close(); self.pcap_f = None
+            if self.verd_f: self.verd_f.close(); self.verd_f = None
+            nuke(REC_DIR, "rec_*.pcap")
+            nuke(VER_DIR, "rec_*.jsonl")
+            for lp in LOG_DIR.glob("*.log"):
+                trim_log(lp, 64)
+            self.verd_bytes = 0
+            # keep writer stopped; on next recovery we'll re-open
+            return
+
+        if level == 1:
+            # WARN: proactive prune — oldest files first.
+            self._prune()
+            for lp in LOG_DIR.glob("*.log"):
+                trim_log(lp, LOG_MAX_KB)
+            return
+
+        # level 0: if files were closed during emergency, reopen for the active modes
+        if self.want_pcap and not self.pcap_f and f > WARN_FREE_MB + 3:
+            self.idx = self._next_idx()
+            self._open()
+            self.verd_bytes = 0
+
     def _rotate(self):
         if self.pcap_f:
             self.pcap_f.close()
@@ -245,8 +346,12 @@ class Writer:
             self.verd_f = None
         self.idx += 1
         self.pcap_bytes = 0
+        self.verd_bytes = 0
         self._open()
         self._prune()
+        # also trim logs on every rotation (cheap)
+        for lp in LOG_DIR.glob("*.log"):
+            trim_log(lp, LOG_MAX_KB)
 
     def close(self):
         if self.pcap_f: self.pcap_f.close()
@@ -342,11 +447,13 @@ def dump_stats(frame_count: int, match_count: int, start: float, iface: str):
             "matches": match_count,
             "pps":     round(frame_count / elapsed, 2),
             "mps":     round(match_count / elapsed, 2),
-            "if_rx_b": rx_b,
-            "if_tx_b": tx_b,
-            "if_rx_p": rx_p,
-            "if_tx_p": tx_p,
-            "free_mb": free_mb(),
+            "if_rx_b": rx_b, "if_tx_b": tx_b,
+            "if_rx_p": rx_p, "if_tx_p": tx_p,
+            "free_mb":    free_mb(),
+            "warn_level": PRESSURE_STATE["level"],
+            "warn_text":  ("ok", "pruning (low disk)", "EMERGENCY: writes paused")[PRESSURE_STATE["level"]],
+            "warn_free_mb":  WARN_FREE_MB,
+            "crit_free_mb":  CRIT_FREE_MB,
         }
         STATS_PATH.write_text(json.dumps(data))
     except Exception:
@@ -379,10 +486,12 @@ def main():
     match_count = 0
     last_stats = 0.0
 
-    # keep config polling alive even when the network is quiet
+    # Even when the network is quiet, keep the config poll + disk guard alive.
     def _watcher():
         while True:
-            try: w._check_config()
+            try:
+                w._check_config()
+                w._enforce_disk()
             except Exception: pass
             time.sleep(1.5)
     threading.Thread(target=_watcher, daemon=True).start()

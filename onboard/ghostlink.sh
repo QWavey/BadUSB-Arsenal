@@ -1,6 +1,11 @@
 #!/bin/sh
 # GhostLink on-device launcher. Runs from /root/ghostlink. No SD required.
 # Started by /etc/init.d/S99ghost at boot.
+#
+# Subcommands:
+#   (none)            start all services
+#   reload-dnsmasq    rebuild dnsmasq config from current config.txt and
+#                     restart dnsmasq only (used by webui on config save).
 
 set -u
 ROOT=/root/ghostlink
@@ -9,16 +14,68 @@ LOG=$ROOT/logs/ghostlink.log
 mkdir -p "$ROOT/logs" "$ROOT/records" "$ROOT/verdicts"
 
 log() { echo "$(date +'%H:%M:%S') ghostlink $*" | tee -a "$LOG"; }
-log "starting"
 
-# -- config -------------------------------------------------------------------
 CFG=$ROOT/config.txt
-[ -f "$CFG" ] || { log "no config.txt, bailing"; exit 1; }
-
 getcfg() {
     grep -E "^$1=" "$CFG" | tail -n1 | sed -E "s/^$1=//; s/#.*$//; s/[[:space:]]+$//"
 }
 truthy() { case "$1" in TRUE|true|1|YES|yes|on|ON) return 0 ;; *) return 1 ;; esac; }
+
+write_dnsmasq_conf() {
+    IFACE=${1:-usb0}
+    DR=${2:-172.32.0.100,172.32.0.120,255.255.0.0,12h}
+    DNS=${3:-1.1.1.1,9.9.9.9}
+    RED=${4:-FALSE}
+    RED_FROM=${5:-}
+    RED_TO=${6:-172.32.0.93}
+    DNS_CONF=/tmp/ghostlink.dnsmasq.conf
+    {
+        echo "interface=$IFACE"
+        echo "bind-interfaces"
+        echo "no-resolv"
+        echo "no-hosts"
+        echo "dhcp-range=$DR"
+        for s in $(echo "$DNS" | tr ',' ' '); do echo "server=$s"; done
+        if truthy "$RED" && [ -n "$RED_FROM" ]; then
+            TARGET_IP=$(echo "$RED_TO" | sed -E 's#^https?://##; s#/.*##')
+            for h in $(echo "$RED_FROM" | tr ',' ' '); do
+                h=$(echo "$h" | sed -E 's#^https?://##; s#/.*##')
+                echo "address=/$h/$TARGET_IP"
+            done
+        fi
+        # IMPORTANT: log to /tmp (tmpfs), not /root. tmpfs is RAM-backed so
+        # it never wears flash and never fills the rootfs. Also keep the
+        # file tiny and never request log-queries.
+        echo "log-facility=/tmp/dnsmasq.log"
+        echo "pid-file=/run/ghostlink-dnsmasq.pid"
+        echo "dhcp-leasefile=/tmp/dnsmasq.leases"
+    } > $DNS_CONF
+    echo $DNS_CONF
+}
+
+if [ "${1:-}" = "reload-dnsmasq" ]; then
+    [ -f "$CFG" ] || { echo "no config.txt"; exit 1; }
+    IFACE=$(getcfg DNSMASQ_IFACE); IFACE=${IFACE:-usb0}
+    DR=$(getcfg DHCP_RANGE)
+    DNS=$(getcfg DNS_UPSTREAM)
+    RED=$(getcfg REDIRECT)
+    RF=$(getcfg REDIRECT_FROM)
+    RT=$(getcfg REDIRECT_TO)
+    write_dnsmasq_conf "$IFACE" "$DR" "$DNS" "$RED" "$RF" "$RT" > /dev/null
+    # kill old
+    for p in $(ps 2>/dev/null | awk '/dnsmasq.*ghostlink/ && !/awk/ {print $1}'); do
+        kill "$p" 2>/dev/null
+    done
+    sleep 0.3
+    dnsmasq -C /tmp/ghostlink.dnsmasq.conf -x /run/ghostlink-dnsmasq.pid -z >>"$LOG" 2>&1 &
+    log "dnsmasq reloaded (REDIRECT=$RED REDIRECT_FROM=$RF REDIRECT_TO=$RT)"
+    exit 0
+fi
+
+log "starting"
+
+# -- config -------------------------------------------------------------------
+[ -f "$CFG" ] || { log "no config.txt, bailing"; exit 1; }
 
 ENABLE_HID=$(getcfg ENABLE_HID)
 WEBUI=$(getcfg WEBUI)
@@ -65,30 +122,11 @@ fi
 
 # -- dnsmasq (DHCP + optional DNS spoof/redirect) -----------------------------
 if truthy "${DNSMASQ:-TRUE}" && command -v dnsmasq >/dev/null 2>&1; then
-    DNS_CONF=/tmp/ghostlink.dnsmasq.conf
     IFACE=${DNSMASQ_IFACE:-usb0}
-    {
-        echo "interface=$IFACE"
-        echo "bind-interfaces"
-        echo "no-resolv"
-        echo "no-hosts"
-        echo "dhcp-range=${DHCP_RANGE:-172.32.0.100,172.32.0.120,255.255.0.0,12h}"
-        for s in $(echo "${DNS_UPSTREAM:-1.1.1.1}" | tr ',' ' '); do
-            echo "server=$s"
-        done
-        if truthy "${REDIRECT:-FALSE}" && [ -n "${REDIRECT_FROM:-}" ]; then
-            TARGET_IP=$(echo "$REDIRECT_TO" | sed -E 's#^https?://##; s#/.*##')
-            for h in $(echo "$REDIRECT_FROM" | tr ',' ' '); do
-                h=$(echo "$h" | sed -E 's#^https?://##')
-                echo "address=/$h/$TARGET_IP"
-            done
-        fi
-        echo "log-facility=$ROOT/logs/dnsmasq.log"
-        echo "pid-file=/run/ghostlink-dnsmasq.pid"
-        echo "dhcp-leasefile=/tmp/dnsmasq.leases"
-    } > "$DNS_CONF"
-    dnsmasq -C "$DNS_CONF" -x /run/ghostlink-dnsmasq.pid -z >>"$LOG" 2>&1 &
-    log "dnsmasq on $IFACE"
+    write_dnsmasq_conf "$IFACE" "$DHCP_RANGE" "$DNS_UPSTREAM" \
+                       "${REDIRECT:-FALSE}" "${REDIRECT_FROM:-}" "${REDIRECT_TO:-172.32.0.93}" >/dev/null
+    dnsmasq -C /tmp/ghostlink.dnsmasq.conf -x /run/ghostlink-dnsmasq.pid -z >>"$LOG" 2>&1 &
+    log "dnsmasq on $IFACE (REDIRECT=${REDIRECT:-FALSE})"
 fi
 
 # -- sniffer + verdict stream (Python) ----------------------------------------
@@ -103,12 +141,52 @@ if truthy "${WEBUI:-TRUE}"; then
     log "webui.py started"
 fi
 
-# -- redirect: tiny HTTP 302 on :8080 -----------------------------------------
-# dnsmasq already steers A records to our IP; this answers HTTP there.
-if truthy "${REDIRECT:-FALSE}" && truthy "$(getcfg REDIRECT_HTTP_302)"; then
+# redirect is handled inline by webui.py (Host-header 302 on :80), so the
+# separate redirect302.py service is no longer needed. Still ship it for
+# anyone who wants a secondary :8080 forwarder:
+if truthy "${REDIRECT:-FALSE}" && truthy "$(getcfg REDIRECT_HTTP_302_8080)"; then
     python3 "$ROOT/redirect302.py" >>"$LOG" 2>&1 &
-    log "redirect 302 on :8080"
+    log "redirect-8080 enabled"
 fi
+
+# -- disk guard: independent shell watchdog ----------------------------------
+# Belt-and-braces for the Python disk guard. Checks /root free space every
+# 2s and nukes records+verdicts if free drops into emergency. Also trims
+# any logs that have grown past LOG_MAX_KB. Writes a one-line warning to
+# kmsg so the problem is visible even with no console.
+(
+    LOG_MAX_KB=256
+    WARN=15
+    CRIT=8
+    PANIC=5
+    while :; do
+        free=$(df -Pm /root 2>/dev/null | awk 'NR==2 {print $4}')
+        [ -n "$free" ] || { sleep 2; continue; }
+        # trim any oversized log, always (cheap, no stat per file)
+        for lf in "$ROOT/logs"/*.log /tmp/dnsmasq.log; do
+            [ -f "$lf" ] || continue
+            sz=$(stat -c %s "$lf" 2>/dev/null || echo 0)
+            if [ "$sz" -gt $((LOG_MAX_KB * 1024 * 2)) ]; then
+                tail -c $((LOG_MAX_KB * 1024)) "$lf" > "$lf.tmp" 2>/dev/null && mv "$lf.tmp" "$lf"
+            fi
+        done
+        if [ "$free" -lt "$CRIT" ]; then
+            echo "GhostLink: EMERGENCY free=${free}MB, wiping records+verdicts" > /dev/kmsg 2>/dev/null
+            rm -f "$ROOT/records"/*.pcap "$ROOT/verdicts"/*.jsonl 2>/dev/null
+            # also hard-trim logs
+            for lf in "$ROOT/logs"/*.log /tmp/dnsmasq.log; do
+                [ -f "$lf" ] || continue
+                tail -c $((32 * 1024)) "$lf" > "$lf.tmp" 2>/dev/null && mv "$lf.tmp" "$lf"
+            done
+        elif [ "$free" -lt "$WARN" ]; then
+            # prune oldest half of records+verdicts
+            ls -t "$ROOT/records"/rec_*.pcap 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null
+            ls -t "$ROOT/verdicts"/rec_*.jsonl 2>/dev/null | tail -n +6 | xargs -r rm -f 2>/dev/null
+        fi
+        sleep 2
+    done
+) &
+log "disk guard watchdog online"
 
 # -- settle message -----------------------------------------------------------
 log "up. ssh root@172.32.0.93  |  http://172.32.0.93/"
