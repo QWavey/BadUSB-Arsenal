@@ -59,6 +59,59 @@ write_dnsmasq_conf() {
     echo $DNS_CONF
 }
 
+if [ "${1:-}" = "rebind-gadget" ]; then
+    # Add hid.usb0 into the stock gadget's config and rebind UDC. Drops adb
+    # for ~2s; sshd on 172.32.0.93 stays reachable because RNDIS gets re-
+    # bound in the same cycle. Idempotent: no-op if hid.usb0 is already linked
+    # and /dev/hidg0 exists.
+    G=/sys/kernel/config/usb_gadget/rockchip
+    if [ ! -d "$G" ]; then
+        log "ERROR: gadget rockchip not found at $G"
+        exit 1
+    fi
+    # discover the active config dir — stock Luckfox uses b.1 but future
+    # buildroots may differ. Find the first configs/*/ dir.
+    CFG_DIR=$(ls -d $G/configs/*/ 2>/dev/null | head -n1)
+    [ -n "$CFG_DIR" ] || { log "ERROR: no gadget config dir under $G/configs/"; exit 1; }
+
+    if [ -e "$CFG_DIR/hid.usb0" ] && [ -e /dev/hidg0 ]; then
+        log "rebind-gadget: already up ($CFG_DIR/hid.usb0, /dev/hidg0)"
+        exit 0
+    fi
+
+    UDC=$(cat "$G/UDC" 2>/dev/null)
+    if [ -z "$UDC" ]; then
+        # Gadget may already be unbound. Discover first UDC available.
+        UDC=$(ls /sys/class/udc 2>/dev/null | head -n1)
+    fi
+    [ -n "$UDC" ] || { log "ERROR: no UDC available"; exit 1; }
+    log "rebind-gadget: unbinding UDC=$UDC"
+    echo "" > "$G/UDC" 2>/dev/null
+
+    # Add the symlink if missing
+    if [ ! -e "$CFG_DIR/hid.usb0" ]; then
+        ln -s "$G/functions/hid.usb0" "$CFG_DIR/hid.usb0" 2>/dev/null \
+            || { log "ERROR: symlink hid.usb0 failed"; echo "$UDC" > "$G/UDC" 2>/dev/null; exit 1; }
+    fi
+
+    # Rebind
+    echo "$UDC" > "$G/UDC" 2>/dev/null
+    sleep 1
+
+    # Verify
+    if [ -e /dev/hidg0 ]; then
+        log "rebind-gadget: /dev/hidg0 is up"
+        chmod 666 /dev/hidg0 2>/dev/null
+        exit 0
+    else
+        log "ERROR: rebind returned but /dev/hidg0 missing — rolling back"
+        echo "" > "$G/UDC" 2>/dev/null
+        rm -f "$CFG_DIR/hid.usb0"
+        echo "$UDC" > "$G/UDC" 2>/dev/null
+        exit 1
+    fi
+fi
+
 if [ "${1:-}" = "reload-dnsmasq" ]; then
     [ -f "$CFG" ] || { echo "no config.txt"; exit 1; }
     IFACE=$(getcfg DNSMASQ_IFACE); IFACE=${IFACE:-usb0}
@@ -119,20 +172,12 @@ for mine in sniff.py webui.py redirect302.py ghostlink-dnsmasq; do
 done
 sleep 0.3
 
-# -- optional: wire up HID (one-time rebind) ----------------------------------
-# The stock gadget 'rockchip' has hid.usb0 declared under functions/ but not
-# linked into config b.1. Linking it + rebinding gives us /dev/hidg0.
-# This drops adb for ~2s. SSH on 172.32.0.93 keeps you reachable.
+# -- optional: wire up HID (uses the rebind-gadget subcommand) ----------------
+# Delegates to the subcommand so webui.py can also trigger it on config save
+# without a reboot. Idempotent — no-op if /dev/hidg0 already exists.
 if truthy "${ENABLE_HID:-FALSE}" && [ ! -e /dev/hidg0 ]; then
-    G=/sys/kernel/config/usb_gadget/rockchip
-    if [ -d "$G/functions/hid.usb0" ] && [ ! -e "$G/configs/b.1/hid.usb0" ]; then
-        log "wiring HID into gadget (adb will drop briefly)"
-        UDC=$(cat "$G/UDC")
-        echo "" > "$G/UDC"
-        ln -s "$G/functions/hid.usb0" "$G/configs/b.1/hid.usb0"
-        echo "$UDC" > "$G/UDC"
-        sleep 0.5
-    fi
+    log "ENABLE_HID=TRUE and /dev/hidg0 missing — calling rebind-gadget"
+    sh "$0" rebind-gadget || log "WARN: rebind-gadget failed; HID disabled this boot"
 fi
 
 # -- dnsmasq (DHCP + optional DNS spoof/redirect) -----------------------------

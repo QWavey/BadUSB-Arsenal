@@ -934,6 +934,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         to = should_redirect(host, cfg)
         if to is None: return False
         if not to.startswith("http"): to = "http://" + to
+        # Loop guard: if the destination host is itself a REDIRECT_FROM
+        # pattern, we'd just send the browser back to ourselves. Refuse
+        # and serve the UI instead (so the admin sees the misconfiguration).
+        try:
+            to_host = (urlparse(to).hostname or "").lower()
+        except Exception:
+            to_host = ""
+        pats = [p.strip().lower() for p in (cfg.get("REDIRECT_FROM","") or "").split(",") if p.strip()]
+        pats_norm = []
+        for pp in pats:
+            if pp.startswith("http://"):  pp = pp[7:]
+            if pp.startswith("https://"): pp = pp[8:]
+            pats_norm.append(pp.split("/")[0])
+        if to_host and (to_host in pats_norm or
+                        any(to_host.endswith("." + p) for p in pats_norm) or
+                        to_host == "172.32.0.93"):
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} webui REFUSE self-redirect loop Host={host} -> {to}\n")
+            except Exception: pass
+            return False  # fall through to serve UI
         preserve = cfg.get("REDIRECT_PRESERVE_PATH","TRUE").upper() == "TRUE"
         loc = to + (self.path if preserve and self.path and self.path != "/" else "")
         self.send_response(302)
@@ -1023,16 +1044,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self._maybe_redirect(): return
         u = urlparse(self.path)
-        n = int(self.headers.get("Content-Length") or 0)
+
+        # Lightweight CSRF guard. Reject if an Origin/Referer is present and
+        # does NOT point at our own origin. A page the admin was redirected
+        # to can't then fetch('http://172.32.0.93/api/reboot') and nuke the
+        # device. Requests from our own UI either omit Origin (same-origin
+        # fetch in some browsers) or set it to our Host — both pass.
+        origin = self.headers.get("Origin") or self.headers.get("Referer") or ""
+        host   = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        if origin:
+            try:
+                oh = urlparse(origin).hostname or ""
+                if oh.lower() not in (host, "172.32.0.93", "ghostlink.local",
+                                      "localhost", "127.0.0.1"):
+                    return self._send(403, "text/plain", "cross-origin blocked\n")
+            except Exception:
+                return self._send(400, "text/plain", "bad origin\n")
+
+        try: n = int(self.headers.get("Content-Length") or 0)
+        except ValueError: n = 0
+        # cap request bodies at 256 KB. config.txt is < 4 KB in practice; a
+        # bigger body is either malformed or an attempt to fill flash via
+        # /api/config POST — refuse early rather than reading it all.
+        if n > 256 * 1024:
+            return self._send(413, "text/plain", "payload too large\n")
         body = self.rfile.read(n) if n else b""
         if u.path == "/api/config":
+            # read the previous value of ENABLE_HID so we can detect a flip
+            old_hid = load_cfg().get("ENABLE_HID","FALSE").upper() == "TRUE"
             tmp = CFG_PATH.with_suffix(".new")
             tmp.write_bytes(body); tmp.replace(CFG_PATH)
+            new_hid = load_cfg().get("ENABLE_HID","FALSE").upper() == "TRUE"
             # kick dnsmasq to pick up new address= rules
             try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
                                 timeout=5, capture_output=True)
             except Exception: pass
-            return self._send_json({"ok": True})
+            # if HID just got enabled, trigger the gadget rebind
+            hid_result = None
+            if new_hid and (not old_hid or not Path("/dev/hidg0").exists()):
+                try:
+                    r = subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "rebind-gadget"],
+                                       timeout=10, capture_output=True)
+                    hid_result = "ok" if r.returncode == 0 and Path("/dev/hidg0").exists() else "failed"
+                except Exception as e:
+                    hid_result = f"error: {e}"
+            return self._send_json({"ok": True, "hid_rebind": hid_result})
         if u.path == "/api/clear":
             removed = 0
             for d, pat in ((REC_DIR,"*.pcap"), (VER_DIR,"*.jsonl")):
@@ -1053,7 +1109,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if u.path == "/api/hid":
             payload = body.decode("utf-8","replace").strip()
             if not payload: return self._send_json({"ok": False}, code=400)
-            ok = subprocess.call(["python3", str(ROOT/"ducky.py"), payload]) == 0
+            # Constrain to files under /root/ghostlink/payloads. Reject
+            # absolute paths that would escape (e.g. /etc/shadow) and
+            # resolve ../ segments.
+            pay_root = (ROOT / "payloads").resolve()
+            if payload.startswith("/"):
+                target = Path(payload).resolve()
+            else:
+                target = (pay_root / payload).resolve()
+            try: target.relative_to(pay_root)
+            except ValueError:
+                return self._send_json({"ok": False, "reason": "payload must be under /root/ghostlink/payloads"}, code=403)
+            if not target.is_file():
+                return self._send_json({"ok": False, "reason": "not found"}, code=404)
+            ok = subprocess.call(["python3", str(ROOT/"ducky.py"), str(target)]) == 0
             return self._send_json({"ok": ok}, code=200 if ok else 500)
         if u.path == "/api/reboot":
             self._send_json({"ok": True})

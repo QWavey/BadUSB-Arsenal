@@ -175,14 +175,26 @@ class Writer:
         self._open()
 
     def _apply(self, cfg: dict):
+        def _int(key, default):
+            try: return int(cfg.get(key, default))
+            except (TypeError, ValueError):
+                # bad value in config shouldn't crash the sniffer
+                sys.stderr.write(f"sniff: bad int for {key}, using default {default}\n")
+                return int(default)
         self.cfg          = cfg
-        self.rotate_kb    = int(cfg.get("RECORD_ROTATE_KB", "1024"))
-        self.pcap_ring    = int(cfg.get("RECORD_RING_FILES", "4"))
-        self.verd_ring    = int(cfg.get("VERDICT_RING_FILES", "10"))
-        self.max_age_h    = int(cfg.get("RECORD_MAX_AGE_H", "24"))
-        self.min_free_mb  = int(cfg.get("RECORD_MIN_FREE_MB", "10"))
+        self.rotate_kb    = _int("RECORD_ROTATE_KB",   1024)
+        self.pcap_ring    = _int("RECORD_RING_FILES",     4)
+        self.verd_ring    = _int("VERDICT_RING_FILES",   10)
+        self.max_age_h    = _int("RECORD_MAX_AGE_H",     24)
+        self.min_free_mb  = _int("RECORD_MIN_FREE_MB",   10)
         self.want_pcap    = truthy(cfg.get("RECORD_PCAP", "TRUE"))
         self.want_verd    = truthy(cfg.get("VERDICT_STREAM", "TRUE"))
+        # sanity: refuse zero/negative rotation sizes that would spin forever
+        if self.rotate_kb < 16:   self.rotate_kb = 1024
+        if self.pcap_ring < 1:    self.pcap_ring = 4
+        if self.verd_ring < 1:    self.verd_ring = 10
+        if self.max_age_h < 1:    self.max_age_h = 24
+        if self.min_free_mb < 1:  self.min_free_mb = 10
         # per-session verdict byte counter for size-based rotation
         self.verd_bytes   = 0
 
@@ -277,22 +289,33 @@ class Writer:
         verdict["t"]  = f"{ts_s}.{ts_us:06d}"
         verdict["sz"] = caplen
 
-        if self.want_verd and self.verd_f:
-            line = (json.dumps(verdict, separators=(",", ":")) + "\n").encode()
-            self.verd_f.write(line)
-            self.verd_f.flush()
-            self.verd_bytes += len(line)
-            if self.verd_bytes >= VERDICT_MAX_KB * 1024:
-                self._rotate()
+        # Capture file-handle refs under the GIL — the watcher thread may null
+        # them between our check and the write. Using the local ref makes the
+        # worst case a write to a closed handle (ValueError) which we swallow.
+        vf = self.verd_f
+        if self.want_verd and vf is not None:
+            try:
+                line = (json.dumps(verdict, separators=(",", ":")) + "\n").encode()
+                vf.write(line)
+                vf.flush()
+                self.verd_bytes += len(line)
+                if self.verd_bytes >= VERDICT_MAX_KB * 1024:
+                    self._rotate()
+            except (ValueError, OSError):
+                pass
 
-        if self.want_pcap and self.pcap_f:
-            rec = struct.pack("<IIII", ts_s, ts_us, caplen, caplen)
-            self.pcap_f.write(rec)
-            self.pcap_f.write(frame_bytes)
-            self.pcap_f.flush()
-            self.pcap_bytes += 16 + caplen
-            if self.pcap_bytes >= self.rotate_kb * 1024:
-                self._rotate()
+        pf = self.pcap_f
+        if self.want_pcap and pf is not None:
+            try:
+                rec = struct.pack("<IIII", ts_s, ts_us, caplen, caplen)
+                pf.write(rec)
+                pf.write(frame_bytes)
+                pf.flush()
+                self.pcap_bytes += 16 + caplen
+                if self.pcap_bytes >= self.rotate_kb * 1024:
+                    self._rotate()
+            except (ValueError, OSError):
+                pass
 
     def _enforce_disk(self):
         """Called every ~1.5s. Decide pressure level and act."""
@@ -331,8 +354,12 @@ class Writer:
                 trim_log(lp, LOG_MAX_KB)
             return
 
-        # level 0: if files were closed during emergency, reopen for the active modes
-        if self.want_pcap and not self.pcap_f and f > WARN_FREE_MB + 3:
+        # level 0: if files were closed during emergency, reopen whichever
+        # stream is still enabled. Previously only triggered when want_pcap,
+        # so verdict-only configs stayed dead after a disk crisis.
+        need_pcap_reopen = self.want_pcap and self.pcap_f is None
+        need_verd_reopen = self.want_verd and self.verd_f is None
+        if (need_pcap_reopen or need_verd_reopen) and f > WARN_FREE_MB + 3:
             self.idx = self._next_idx()
             self._open()
             self.verd_bytes = 0
@@ -471,8 +498,15 @@ def main():
         red_from = [p.strip().lower() for p in cfg["REDIRECT_FROM"].split(",") if p.strip()]
 
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    log = open(LOG_PATH, "a", buffering=1)
-    def L(m): log.write(f"{time.strftime('%H:%M:%S')} sniff {m}\n"); sys.stderr.write(m + "\n")
+    # No long-lived append handle: trim_log replaces the inode, and an open
+    # fd would keep the old (deleted) inode alive so trim never frees space.
+    # Reopen per write — syscall cost is trivial at this log rate.
+    def L(m):
+        line = f"{time.strftime('%H:%M:%S')} sniff {m}\n"
+        try:
+            with open(LOG_PATH, "a") as f: f.write(line)
+        except Exception: pass
+        sys.stderr.write(m + "\n")
 
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
     try:
@@ -497,6 +531,7 @@ def main():
     threading.Thread(target=_watcher, daemon=True).start()
 
     cfg_mt = 0.0
+    cfg_check_count = 0
     try:
         while True:
             try:
@@ -505,18 +540,21 @@ def main():
                 L(f"recv err {e}"); time.sleep(0.1); continue
             now = time.time()
             ts_s = int(now); ts_us = int((now - ts_s) * 1_000_000)
-            # pick up live config changes for REDIRECT_FROM (mtime-triggered)
-            try:
-                m = CFG_PATH.stat().st_mtime
-                if m != cfg_mt:
-                    cfg_mt = m
-                    cur = load_cfg(CFG_PATH)
-                    if truthy(cur.get("REDIRECT", "FALSE")) and cur.get("REDIRECT_FROM"):
-                        red_from = [p.strip().lower() for p in cur["REDIRECT_FROM"].split(",") if p.strip()]
-                    else:
-                        red_from = []
-                    L(f"REDIRECT_FROM reloaded: {red_from}")
-            except Exception: pass
+            # pick up live config changes for REDIRECT_FROM, rate-limited
+            # (used to stat() on every packet — 50+ syscalls/sec wasted)
+            cfg_check_count += 1
+            if cfg_check_count % 20 == 0:
+                try:
+                    m = CFG_PATH.stat().st_mtime
+                    if m != cfg_mt:
+                        cfg_mt = m
+                        cur = load_cfg(CFG_PATH)
+                        if truthy(cur.get("REDIRECT", "FALSE")) and cur.get("REDIRECT_FROM"):
+                            red_from = [p.strip().lower() for p in cur["REDIRECT_FROM"].split(",") if p.strip()]
+                        else:
+                            red_from = []
+                        L(f"REDIRECT_FROM reloaded: {red_from}")
+                except Exception: pass
             v = classify(buf, red_from)
             if v.get("rule"): match_count += 1
             w.write(ts_s, ts_us, buf, v)
@@ -526,7 +564,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        w.close(); L("exiting")
+        w.close()
+        L("exiting")
 
 
 if __name__ == "__main__":

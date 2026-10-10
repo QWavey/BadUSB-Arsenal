@@ -70,38 +70,65 @@ def main(path):
         sys.stderr.write(f"open {HID}: {e}\n")
         return 1
 
+    def _ms(txt, default=0):
+        try: return int(txt)
+        except (TypeError, ValueError): return default
+
     default_delay = 0
-    for raw in lines:
-        s = raw.strip()
-        if not s or s.startswith("REM") or s.startswith("#"):
-            continue
-        if s.startswith("DELAY "):
-            time.sleep(int(s[6:]) / 1000.0)
-            continue
-        if s.startswith("DEFAULTDELAY "):
-            default_delay = int(s[13:])
-            continue
-        if s.startswith("STRING "):
-            for ch in s[7:]:
+    last_executed = None   # for REPEAT
+    inter_key_ms = 2       # tiny delay between consecutive HID reports so
+                           # a slow or busy host doesn't drop keys
+
+    def _exec_cmd(line):
+        """Execute one DuckyScript line. Returns True if it was a real action
+        (eligible for REPEAT), False for comments/empty/REPEAT itself."""
+        nonlocal default_delay
+        if not line or line.startswith("REM") or line.startswith("#"):
+            return False
+        if line.startswith("DELAY "):
+            time.sleep(_ms(line[6:], 0) / 1000.0)
+            return True
+        if line.startswith("DEFAULTDELAY "):
+            default_delay = _ms(line[13:], 0)
+            return False
+        if line.startswith("STRING "):
+            missed = 0
+            for ch in line[7:]:
                 if ch in lay:
                     m, k = (lay[ch] + [0, 0])[:2]
                     press(fd, m, k)
+                    if inter_key_ms: time.sleep(inter_key_ms / 1000.0)
+                else:
+                    missed += 1
+            if missed:
+                sys.stderr.write(f"ducky: {missed} char(s) not in layout\n")
             if default_delay: time.sleep(default_delay / 1000.0)
-            continue
-
+            return True
         mod = 0
         keys = []
-        for tok in s.split():
+        for tok in line.split():
             if tok in MOD:
                 mod |= MOD[tok]
             else:
                 m, k = key_of(tok, lay)
                 mod |= m
-                if k:
-                    keys.append(k)
+                if k: keys.append(k)
         if keys:
             press(fd, mod, keys[0], keys[1] if len(keys) > 1 else 0)
             if default_delay: time.sleep(default_delay / 1000.0)
+            return True
+        return False
+
+    for raw in lines:
+        s = raw.strip()
+        if s.startswith("REPEAT "):
+            n = _ms(s[7:], 0)
+            if last_executed:
+                for _ in range(n):
+                    _exec_cmd(last_executed)
+            continue
+        if _exec_cmd(s):
+            last_executed = s
     os.close(fd)
     return 0
 
