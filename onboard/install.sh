@@ -20,6 +20,10 @@ cp payloads/*.ducky "$DEST/payloads/" 2>/dev/null || true
 cp payloads/*.sh    "$DEST/payloads/" 2>/dev/null || true
 cp payloads/*.txt   "$DEST/payloads/" 2>/dev/null || true
 cp extensions/*.ducky "$DEST/extensions/" 2>/dev/null || true
+# vendored Hak5 extensions
+mkdir -p "$DEST/extensions/hak5"
+cp extensions/hak5/*.txt   "$DEST/extensions/hak5/" 2>/dev/null || true
+cp extensions/hak5/*.ducky "$DEST/extensions/hak5/" 2>/dev/null || true
 chmod +x "$DEST"/*.sh "$DEST"/*.py
 install -m 0755 S99ghost /etc/init.d/S99ghost
 echo "GhostLink installed to $DEST. Start now with:"
