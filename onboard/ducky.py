@@ -119,10 +119,17 @@ def _cfg_log(msg):
     except Exception: pass
 
 
-def press(fd, mod, k1, k2=0):
+def press(fd, mod, k1, k2=0, dwell_ms: int = 3):
+    """Send a boot-keyboard press then release report. A short dwell between
+    the two reports is required — some hosts (notably Windows at 125 Hz USB
+    poll) will coalesce back-to-back reports and miss the key, which looked
+    on the German layout like the comma "hanging" (the . → , transition
+    appeared to drop keys)."""
     rep = bytes([mod, 0, k1, k2, 0, 0, 0, 0])
     try:
-        os.write(fd, rep); os.write(fd, b"\x00" * 8)
+        os.write(fd, rep)
+        if dwell_ms: time.sleep(dwell_ms / 1000.0)
+        os.write(fd, b"\x00" * 8)
     except OSError:
         pass
 
@@ -269,7 +276,9 @@ class Interp:
         self.fd = None
         self.lay = {}
         self.default_delay = 0
-        self.char_delay_ms = 2
+        self.char_delay_ms = 8      # was 2 — too aggressive, caused host-side
+                                    # key drops on some layouts (German . → ,)
+        self.press_dwell_ms = 3     # time key is "held" before release report
         self.in_rem_block = False
         # built-ins that are random each access (regenerated per read)
         self._rand = random.Random()
@@ -425,8 +434,8 @@ class Interp:
         return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", repl, text)
 
     # -------- primitive HID actions --------------------------------------
-    def _press(self, mod, k1, k2=0):   press(self.fd, mod, k1, k2)
-    def _press_mod_only(self, mod):    press(self.fd, mod, 0)
+    def _press(self, mod, k1, k2=0):   press(self.fd, mod, k1, k2, self.press_dwell_ms)
+    def _press_mod_only(self, mod):    press(self.fd, mod, 0, 0, self.press_dwell_ms)
 
     def _type_string(self, s):
         s = self._subst_string(s)
