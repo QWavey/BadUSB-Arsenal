@@ -7,7 +7,7 @@ mkdir -p "$DEST" "$DEST/logs" "$DEST/records" "$DEST/verdicts" \
          "$DEST/layouts" "$DEST/payloads" "$DEST/extensions"
 # don't clobber a user-edited config
 if [ ! -f "$DEST/config.txt" ]; then cp config.txt "$DEST/config.txt"; fi
-cp sniff.py webui.py ducky.py redirect302.py ghostlink.sh button.py "$DEST/"
+cp sniff.py webui.py ducky.py redirect302.py ghostlink.sh button.py forwarder.py "$DEST/"
 # hid_enable.sh — manual HID rebind helper, only pushed if present
 cp hid_enable.sh "$DEST/" 2>/dev/null || true
 cp layouts/*.json "$DEST/layouts/" 2>/dev/null || true
