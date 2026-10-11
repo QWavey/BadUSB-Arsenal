@@ -414,29 +414,99 @@ HTML = r"""<!doctype html>
   <!-- =========== CONFIG =========== -->
   <section id="tab-Config" class="tabcontent">
     <div class="flex-row" style="justify-content: space-between; align-items: center;">
-      <h3>config.txt</h3>
+      <h3>Config</h3>
       <div class="flex-row" style="gap:10px;">
-        <button onclick="loadCfg()">Reload</button>
-        <button onclick="saveCfg()">Save</button>
+        <button onclick="cfgReload()">Reload</button>
+        <button onclick="cfgSave()">Save</button>
         <button onclick="applyStandard()" class="btn-ghost">Apply standard</button>
+        <label class="sw" style="margin-left:14px;">
+          <input type="checkbox" id="cfgAdv" onchange="cfgToggleAdvanced()">
+          <span>Advanced (raw)</span>
+        </label>
       </div>
     </div>
-    <div class="section">
-      <h4>Quick Redirect</h4>
-      <p class="dim" style="font-size:13px;">
-        Appends to <code>REDIRECT_FROM</code>, sets <code>REDIRECT=TRUE</code> and saves. dnsmasq picks it up on save.
-      </p>
-      <div class="setting-row flex-row" style="gap:10px; flex-wrap: wrap;">
-        <input type="text" id="spoof-host" placeholder="newhost.com" class="flex-grow">
-        <input type="text" id="spoof-to" placeholder="REDIRECT_TO (optional, defaults to 172.32.0.93)" style="min-width:260px;">
-        <button onclick="addSpoof()">+ Append &amp; Save</button>
+
+    <!-- form view (default) ------------------------------------------- -->
+    <div id="cfgForm">
+      <div class="section">
+        <h4>Core</h4>
+        <div class="cfg-grid">
+          <div class="cfg-row"><label>Device name</label><input data-k="DEVICE_NAME"></div>
+          <div class="cfg-row"><label>Hostname</label><input data-k="HOSTNAME"></div>
+          <div class="cfg-row sw-row"><label>Enable HID</label>
+            <label class="sw"><input type="checkbox" data-k="ENABLE_HID"><span></span></label>
+            <span class="dim" style="font-size:11px;">reboot after flip</span>
+          </div>
+          <div class="cfg-row"><label>WebUI port</label><input data-k="WEBUI_PORT" type="number" min="1" max="65535"></div>
+          <div class="cfg-row"><label>WebUI user</label><input data-k="WEBUI_USER"></div>
+          <div class="cfg-row"><label>WebUI pass</label><input data-k="WEBUI_PASS" type="password"></div>
+          <div class="cfg-row"><label>HID layout</label><input data-k="HID_LAYOUT" placeholder="us"></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h4>Sniffer / Recording</h4>
+        <div class="cfg-grid">
+          <div class="cfg-row sw-row"><label>Logging on</label>
+            <label class="sw"><input type="checkbox" data-k="LOG"><span></span></label>
+          </div>
+          <div class="cfg-row sw-row"><label>Record PCAP</label>
+            <label class="sw"><input type="checkbox" data-k="RECORD_PCAP"><span></span></label>
+          </div>
+          <div class="cfg-row sw-row"><label>Verdict stream</label>
+            <label class="sw"><input type="checkbox" data-k="VERDICT_STREAM"><span></span></label>
+          </div>
+          <div class="cfg-row"><label>Sniff iface</label><input data-k="SNIFF_IFACE" placeholder="usb0 / eth0"></div>
+          <div class="cfg-row"><label>Rotate (KB)</label><input data-k="RECORD_ROTATE_KB" type="number"></div>
+          <div class="cfg-row"><label>Ring files (pcap)</label><input data-k="RECORD_RING_FILES" type="number"></div>
+          <div class="cfg-row"><label>Ring files (verdict)</label><input data-k="VERDICT_RING_FILES" type="number"></div>
+          <div class="cfg-row"><label>Max age (h)</label><input data-k="RECORD_MAX_AGE_H" type="number"></div>
+          <div class="cfg-row"><label>Min free (MB)</label><input data-k="RECORD_MIN_FREE_MB" type="number"></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h4>DHCP / DNS</h4>
+        <div class="cfg-grid">
+          <div class="cfg-row sw-row"><label>dnsmasq on</label>
+            <label class="sw"><input type="checkbox" data-k="DNSMASQ"><span></span></label>
+          </div>
+          <div class="cfg-row"><label>DHCP range</label><input data-k="DHCP_RANGE"></div>
+          <div class="cfg-row"><label>DNS upstream</label><input data-k="DNS_UPSTREAM"></div>
+          <div class="cfg-row"><label>DNS mode iface</label><input data-k="DNSMASQ_IFACE"></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h4>Redirect</h4>
+        <div class="cfg-grid">
+          <div class="cfg-row sw-row"><label>Redirect on</label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT"><span></span></label>
+          </div>
+          <div class="cfg-row sw-row"><label>Preserve path</label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT_PRESERVE_PATH"><span></span></label>
+          </div>
+          <div class="cfg-row"><label>REDIRECT_FROM (csv)</label><input data-k="REDIRECT_FROM"></div>
+          <div class="cfg-row"><label>REDIRECT_TO (URL/host)</label><input data-k="REDIRECT_TO"></div>
+          <div class="cfg-row sw-row"><label>DNS spoof file on</label>
+            <label class="sw"><input type="checkbox" data-k="DNS_SPOOF"><span></span></label>
+          </div>
+          <div class="cfg-row"><label>DNS spoof file path</label><input data-k="DNS_SPOOF_HOSTS"></div>
+        </div>
+        <div class="setting-row flex-row" style="gap:10px; flex-wrap:wrap; margin-top:12px; padding-top:12px; border-top:1px solid var(--glass-border);">
+          <input type="text" id="spoof-host" placeholder="quick-add host (newhost.com)" class="flex-grow">
+          <input type="text" id="spoof-to" placeholder="override REDIRECT_TO (optional)" style="min-width:220px;">
+          <button onclick="addSpoof()">+ Append &amp; Save</button>
+        </div>
       </div>
     </div>
-    <div class="section">
-      <h4>Raw config</h4>
+
+    <!-- raw / advanced view ------------------------------------------- -->
+    <div id="cfgRaw" class="section" style="display:none;">
+      <h4>Raw config.txt</h4>
       <p class="dim" style="font-size:13px; margin-bottom:10px;">
-        Save hot-reloads most keys. Changing <code>ENABLE_HID</code> or
-        <code>USB_MODE</code> needs a reboot.
+        Edit every line. Save hot-reloads most keys. <code>ENABLE_HID</code> or
+        a USB-mode change still needs a reboot.
       </p>
       <textarea id="cfg" spellcheck="false" wrap="off"
                 style="width:100%; min-height:420px;"></textarea>
@@ -571,21 +641,17 @@ HTML = r"""<!doctype html>
       <div class="flex-row" style="justify-content:space-between;">
         <h4>shell &middot; <span id="termUser" class="dim" style="font-weight:400;"></span></h4>
         <div class="flex-row" style="gap:8px;">
-          <button onclick="termClear()" class="btn-ghost">Clear</button>
           <button onclick="cliReset()" class="btn-ghost">Reset shell</button>
           <button onclick="cliLogout()" class="btn-ghost">Logout</button>
         </div>
       </div>
-      <pre id="termOut" class="log-pane" style="min-height:300px; max-height:420px;"></pre>
-      <div class="flex-row" style="gap:8px; margin-top:10px;">
-        <span class="dim" style="font-family:'Fira Code',monospace;">root@ghost:/root#</span>
-        <input type="text" id="termIn" class="flex-grow"
-               placeholder="type a command, Enter to run (↑/↓ for history)"
-               style="font-family:'Fira Code','Consolas',monospace;" autocomplete="off">
-      </div>
+      <!-- xterm.js attaches here. Full keyboard: ctrl-c, tab, arrows,
+           history, scrollback, ANSI colors — everything a real terminal
+           has. Bytes stream over SSE / POST, no WebSocket needed. -->
+      <div id="xtermHost" style="height:460px; background:#000; padding:8px; border-radius:6px; border:1px solid var(--glass-border);"></div>
       <div class="dim" style="font-size:11px; margin-top:6px;">
-        timeout 15 s per command &middot; stdout+stderr captured &middot;
-        tip: <code>ls /root/ghostlink/</code>, <code>top -b -n1 | head -20</code>
+        real pty-backed shell &middot; cwd / env / vars persist &middot;
+        try <code>vi /tmp/x</code>, <code>top</code>, <code>cd /root/ghostlink</code>
       </div>
     </div>
   </section>
@@ -1053,6 +1119,34 @@ ul.file-list li:hover .fl-del { opacity: 1; }
 label.sw { display: inline-flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
 label.sw input { accent-color: var(--primary); width: 16px; height: 16px; }
 
+/* ---- Config form grid -------------------------------------------------- */
+.cfg-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px 20px;
+}
+.cfg-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+.cfg-row label:first-child {
+  flex: 0 0 150px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.cfg-row input[type="text"], .cfg-row input[type="password"], .cfg-row input[type="number"], .cfg-row input:not([type]) {
+  flex: 1;
+  min-width: 0;
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+.cfg-row.sw-row label:first-child { flex: 0 0 150px; }
+.cfg-row.sw-row .sw { flex: 0 0 auto; }
+.cfg-row.sw-row .dim { font-family: inherit; }
+
 /* ---- Terminal pane ----------------------------------------------------- */
 #termOut {
   background: #000;
@@ -1238,12 +1332,71 @@ async function runQuery() {
   }).join('');
 }
 
-/* --- config --------------------------------------------------- */
-async function loadCfg() { $('#cfg').value = await api('/api/config'); }
-async function saveCfg() {
-  const r = await api('/api/config', { method:'POST', body: $('#cfg').value });
-  toast(r.ok ? 'saved' : 'save failed', !r.ok);
+/* --- config: form + raw ---------------------------------------- */
+let CFG_RAW = '';     // last known raw text; preserves comments + unknown keys
+
+function cfgParse(txt) {
+  const d = {};
+  (txt || '').split('\n').forEach(ln => {
+    const s = ln.trim();
+    if (!s || s.startsWith('#') || !s.includes('=')) return;
+    const i = s.indexOf('=');
+    const k = s.slice(0, i).trim();
+    let v = s.slice(i + 1);
+    const h = v.indexOf('#');
+    if (h >= 0) v = v.slice(0, h);
+    d[k] = v.trim();
+  });
+  return d;
 }
+function cfgTruthy(v) { return /^(TRUE|YES|ON|1)$/i.test(v || ''); }
+async function cfgReload() {
+  const t = await api('/api/config');
+  CFG_RAW = typeof t === 'string' ? t : '';
+  $('#cfg').value = CFG_RAW;
+  const d = cfgParse(CFG_RAW);
+  $$('[data-k]').forEach(el => {
+    const k = el.dataset.k;
+    if (el.type === 'checkbox') el.checked = cfgTruthy(d[k]);
+    else                         el.value = d[k] != null ? d[k] : '';
+  });
+}
+function cfgCollect() {
+  // start from CFG_RAW (preserves comments + unknown keys), overlay form fields
+  let txt = CFG_RAW || '';
+  const overrides = {};
+  $$('[data-k]').forEach(el => {
+    const k = el.dataset.k;
+    overrides[k] = (el.type === 'checkbox')
+      ? (el.checked ? 'TRUE' : 'FALSE')
+      : el.value;
+  });
+  Object.keys(overrides).forEach(k => {
+    const re = new RegExp('^' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=.*$', 'm');
+    const line = k + '=' + overrides[k];
+    if (re.test(txt)) txt = txt.replace(re, line);
+    else              txt += (txt.endsWith('\n') ? '' : '\n') + line + '\n';
+  });
+  return txt;
+}
+async function cfgSave() {
+  const txt = $('#cfgAdv') && $('#cfgAdv').checked ? $('#cfg').value : cfgCollect();
+  CFG_RAW = txt;
+  $('#cfg').value = txt;
+  const r = await api('/api/config', { method:'POST', body: txt });
+  if (r.ok) { toast('saved'); cfgReload(); }
+  else      { toast('save failed', true); }
+}
+function cfgToggleAdvanced() {
+  const on = $('#cfgAdv').checked;
+  $('#cfgForm').style.display = on ? 'none' : 'block';
+  $('#cfgRaw').style.display  = on ? 'block' : 'none';
+  if (on) $('#cfg').value = cfgCollect();   // show the raw with current form values
+  else    cfgReload();                       // re-sync form from the latest raw
+}
+// backwards-compat shims used by openTab + scriptSave + addSpoof
+async function loadCfg() { await cfgReload(); }
+async function saveCfg() { await cfgSave(); }
 async function addSpoof() {
   const h  = $('#spoof-host').value.trim();
   const to = $('#spoof-to').value.trim();
@@ -1334,8 +1487,8 @@ async function applyStandard() {
 async function cliReset() {
   const r = await api('/api/cli/reset', { method:'POST' });
   if (r.ok) {
-    $('#termOut').innerHTML = '';
-    termAppend('<div class="rc0">[fresh shell]</div>');
+    teardownXterm();
+    await ensureXterm();
   }
 }
 
@@ -1710,10 +1863,31 @@ function bindLiveTyping() {
 }
 
 /* ============================================================
-   Terminal (Web CLI)
+   Terminal (xterm.js over SSE + POST)
    ============================================================ */
-let termHist = [];
-let termHistIdx = -1;
+let xtermLoaded = false;
+let xterm = null;
+let xtermFit = null;
+let sseStream = null;
+
+function loadCss(href) {
+  return new Promise((res, rej) => {
+    if ($$('link[href="' + href + '"]').length) return res();
+    const l = document.createElement('link');
+    l.rel = 'stylesheet'; l.href = href;
+    l.onload = res; l.onerror = rej;
+    document.head.appendChild(l);
+  });
+}
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    if ($$('script[src="' + src + '"]').length) return res();
+    const s = document.createElement('script');
+    s.src = src; s.async = true;
+    s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+}
 
 async function cliProbe() {
   try {
@@ -1721,16 +1895,84 @@ async function cliProbe() {
     const j = await r.json();
     if (j.authed) {
       $('#termLogin').style.display = 'none';
-      $('#termView').style.display = 'block';
-      $('#termUser').textContent = j.user;
+      $('#termView').style.display  = 'block';
+      $('#termUser').textContent    = j.user;
+      await ensureXterm();
     } else {
       $('#termLogin').style.display = 'block';
-      $('#termView').style.display = 'none';
+      $('#termView').style.display  = 'none';
+      teardownXterm();
     }
   } catch(e) {
     $('#termLogin').style.display = 'block';
   }
 }
+
+async function ensureXterm() {
+  if (!xtermLoaded) {
+    await loadCss('/xterm.css');
+    await loadScript('/xterm.js');
+    await loadScript('/xterm-addon-fit.js');
+    xtermLoaded = true;
+  }
+  if (xterm) { xtermFit && xtermFit.fit(); return; }
+  xterm = new Terminal({
+    cursorBlink: true,
+    fontFamily: '"Fira Code","Consolas","Menlo",monospace',
+    fontSize: 13,
+    scrollback: 2000,
+    theme: {
+      background:'#000', foreground:'#c3e3bd', cursor:'#4CAF50',
+      brightBlue:'#58a6ff', brightGreen:'#8ddc9e', red:'#f55',
+    },
+  });
+  try { xtermFit = new FitAddon.FitAddon(); xterm.loadAddon(xtermFit); } catch(e) {}
+  xterm.open($('#xtermHost'));
+  try { xtermFit && xtermFit.fit(); } catch(e) {}
+  // input → POST raw bytes to pty master
+  xterm.onData(async data => {
+    try {
+      await fetch('/api/cli/input', { method:'POST', body: data });
+    } catch(e) {}
+  });
+  // report size to the pty so curses apps lay out right
+  const sendSize = async () => {
+    try {
+      await fetch('/api/cli/resize', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ rows: xterm.rows, cols: xterm.cols })
+      });
+    } catch(e) {}
+  };
+  xterm.onResize(sendSize);
+  // SSE: pty master → xterm
+  openStream();
+  // first fit after mount
+  setTimeout(() => { try { xtermFit && xtermFit.fit(); sendSize(); } catch(e) {} }, 50);
+  // refit on window resize
+  window.addEventListener('resize', () => { try { xtermFit && xtermFit.fit(); } catch(e) {} });
+}
+
+function openStream() {
+  if (sseStream) { try { sseStream.close(); } catch(e) {} sseStream = null; }
+  sseStream = new EventSource('/api/cli/stream');
+  sseStream.onmessage = ev => {
+    try {
+      const bytes = atob(ev.data);
+      if (xterm) xterm.write(bytes);
+    } catch(e) {}
+  };
+  sseStream.onerror = () => {
+    // if the session expired, server returned 401 and SSE drops; probe
+    cliProbe();
+  };
+}
+
+function teardownXterm() {
+  if (sseStream) { try { sseStream.close(); } catch(e) {} sseStream = null; }
+  if (xterm)    { try { xterm.dispose(); } catch(e) {} xterm = null; xtermFit = null; }
+}
+
 async function cliLogin() {
   const user = $('#loginUser').value;
   const pass = $('#loginPass').value;
@@ -1749,50 +1991,14 @@ async function cliLogin() {
   }
 }
 async function cliLogout() {
+  teardownXterm();
   await fetch('/api/auth/logout', { method:'POST' });
   cliProbe();
 }
-function termAppend(html) {
-  const out = $('#termOut');
-  out.insertAdjacentHTML('beforeend', html);
-  out.scrollTop = out.scrollHeight;
-}
-async function cliRun() {
-  const cmd = $('#termIn').value;
-  if (!cmd.trim()) return;
-  termHist.push(cmd); if (termHist.length > 200) termHist.shift();
-  termHistIdx = termHist.length;
-  $('#termIn').value = '';
-  termAppend(`<div><span class="cmd">root@ghost:/root# </span>${esc(cmd)}</div>`);
-  const r = await fetch('/api/cli/exec', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({cmd})
-  });
-  if (r.status === 401) { cliProbe(); termAppend('<div class="err">session expired</div>'); return; }
-  const j = await r.json();
-  if (j.out) termAppend('<div>' + esc(j.out) + '</div>');
-  if (j.err) termAppend('<div class="err">' + esc(j.err) + '</div>');
-  const rcClass = j.rc === 0 ? 'rc0' : 'rc1';
-  termAppend(`<div class="${rcClass}">[exit ${j.rc != null ? j.rc : (j.err||'?')}]</div>`);
-}
-function termClear() { $('#termOut').innerHTML = ''; }
 function bindTerminal() {
-  $('#termIn').addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); cliRun(); return; }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      if (termHistIdx > 0) { termHistIdx--; $('#termIn').value = termHist[termHistIdx] || ''; }
-      return;
-    }
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      if (termHistIdx < termHist.length - 1) { termHistIdx++; $('#termIn').value = termHist[termHistIdx]; }
-      else { termHistIdx = termHist.length; $('#termIn').value = ''; }
-      return;
-    }
-    if (e.key === 'l' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); termClear(); }
+  $('#loginPass').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); cliLogin(); }
   });
-  $('#loginPass').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); cliLogin(); } });
 }
 
 /* --- boot: wire everything + first paint ---------------------------------- */
@@ -1994,6 +2200,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _client_ip(self):
         return self.client_address[0] if self.client_address else "?"
 
+    def _send_file_or_404(self, p: Path, ctype: str):
+        try: body = p.read_bytes()
+        except Exception:
+            return self._send(404, "text/plain", "not found\n")
+        self._send(200, ctype, body)
+
+    def _cli_stream(self, token: str):
+        """SSE loop that reads pty master and writes base64 chunks."""
+        import base64
+        s = pty_open(token)
+        fd = s["fd"]
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            # kick a redraw so xterm shows an initial prompt
+            try: os.write(fd, b"\n")
+            except Exception: pass
+            while True:
+                r, _, _ = select.select([fd], [], [], 15)
+                if r:
+                    try:
+                        chunk = os.read(fd, 4096)
+                        if not chunk: break
+                        b64 = base64.b64encode(chunk).decode()
+                        self.wfile.write(f"data: {b64}\n\n".encode())
+                        self.wfile.flush()
+                    except OSError: break
+                else:
+                    # keep-alive comment every 15s so proxies don't give up
+                    try:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _maybe_redirect(self):
         host = self.headers.get("Host", "")
         cfg = load_cfg()
@@ -2136,6 +2383,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif p == "/api/auth/me":
             u = self._auth_user()
             self._send_json({"authed": bool(u), "user": u or None})
+        elif p == "/xterm.js":
+            self._send_file_or_404(ROOT / "web" / "xterm.js", "application/javascript")
+        elif p == "/xterm.css":
+            self._send_file_or_404(ROOT / "web" / "xterm.css", "text/css")
+        elif p == "/xterm-addon-fit.js":
+            self._send_file_or_404(ROOT / "web" / "xterm-addon-fit.js", "application/javascript")
+        elif p == "/api/cli/stream":
+            # Server-Sent Events: continuously stream pty master fd bytes to
+            # the browser. One event per read, base64-encoded so binary
+            # (escape sequences, color codes) survives transport.
+            if not self._auth_user():
+                return self._send(401, "text/plain", "auth required\n")
+            tok = self._cookie_token() or ""
+            self._cli_stream(tok)
         else:
             self._send(404, "text/plain", "not found\n")
 
@@ -2402,6 +2663,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pty_close(tok)
             pty_open(tok)
             return self._send_json({"ok": True})
+
+        # ---- CLI raw stdin: write arbitrary bytes to the pty master ------
+        # xterm.js sends every keystroke (including special sequences for
+        # arrows / ctrl-c / tab / enter) here. Body is UTF-8 encoded raw
+        # pty input. No prompt wrapping — the shell handles echo.
+        if u.path == "/api/cli/input":
+            if not self._require_auth(): return
+            tok = self._cookie_token() or ""
+            s = pty_open(tok)
+            try:
+                os.write(s["fd"], body)
+                return self._send_json({"ok": True})
+            except OSError as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
+        # ---- CLI pty resize (xterm.js reports new rows/cols on resize) ---
+        if u.path == "/api/cli/resize":
+            if not self._require_auth(): return
+            tok = self._cookie_token() or ""
+            try: data = json.loads(body)
+            except Exception: data = {}
+            rows = int(data.get("rows", 24))
+            cols = int(data.get("cols", 80))
+            s = pty_open(tok)
+            try:
+                fcntl.ioctl(s["fd"], termios.TIOCSWINSZ,
+                            struct.pack("HHHH", rows, cols, 0, 0))
+                return self._send_json({"ok": True})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
 
         # ---- reset config.txt to canonical defaults ----------------------
         if u.path == "/api/config/defaults":
