@@ -1,0 +1,3 @@
+REM Open the Windows Run dialog. Use with: EXTENSION open_run
+GUI r
+DELAY 400

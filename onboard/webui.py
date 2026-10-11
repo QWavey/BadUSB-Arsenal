@@ -39,6 +39,7 @@ CFG_PATH   = ROOT / "config.txt"
 REC_DIR    = ROOT / "records"
 VER_DIR    = ROOT / "verdicts"
 PAY_DIR    = ROOT / "payloads"       # scripts library
+EXT_DIR    = ROOT / "extensions"     # reusable DuckyScript includes
 LAY_DIR    = ROOT / "layouts"        # keyboard layouts
 LOG_PATH   = ROOT / "logs" / "ghostlink.log"
 STATS_PATH = Path("/tmp/ghostlink.stats.json")
@@ -67,16 +68,22 @@ def _session_new(user: str) -> str:
 
 def _session_valid(tok: str) -> str:
     if not tok: return ""
+    expired_now = False
     with SESSION_LOCK:
         v = SESSIONS.get(tok)
         if not v: return ""
         user, exp = v
         if time.time() > exp:
             del SESSIONS[tok]
-            return ""
-        # sliding window: refresh on each use
-        SESSIONS[tok] = (user, time.time() + SESSION_TTL)
-        return user
+            expired_now = True
+        else:
+            # sliding window: refresh on each use
+            SESSIONS[tok] = (user, time.time() + SESSION_TTL)
+    if expired_now:
+        # kill the per-session pty so it doesn't leak forever
+        pty_close(tok)
+        return ""
+    return user
 
 
 def _session_drop(tok: str):
@@ -276,6 +283,13 @@ HID_LAYOUT=us
 HID_PAYLOAD=
 HID_DELAY_MS=1500
 LOG_LEVEL=INFO
+BUTTON_ENABLED=TRUE
+BUTTON_DEV=/dev/input/event0
+BUTTON_PAYLOAD=
+BUTTON_DOUBLE_TAP_PAYLOAD=
+BUTTON_HOLD_PAYLOAD=
+BUTTON_TAP_WINDOW_MS=600
+BUTTON_HOLD_MS=1200
 """
 
 
@@ -286,7 +300,11 @@ def load_cfg():
         s = ln.strip()
         if not s or s.startswith("#") or "=" not in s: continue
         k, v = s.split("=", 1)
-        cfg[k.strip()] = v.split("#", 1)[0].strip()
+        # Strip inline comments only when preceded by whitespace — otherwise a
+        # `#` inside a password or URL fragment silently truncates the value.
+        m = re.search(r"\s#", v)
+        if m: v = v[:m.start()]
+        cfg[k.strip()] = v.strip()
     return cfg
 
 
@@ -466,6 +484,21 @@ HTML = r"""<!doctype html>
       </div>
 
       <div class="section">
+        <h4>Button</h4>
+        <div class="cfg-grid">
+          <div class="cfg-row sw-row"><label>Button enabled</label>
+            <label class="sw"><input type="checkbox" data-k="BUTTON_ENABLED"><span></span></label>
+          </div>
+          <div class="cfg-row"><label>Button device</label><input data-k="BUTTON_DEV" placeholder="/dev/input/event0"></div>
+          <div class="cfg-row"><label>Single-tap payload</label><input data-k="BUTTON_PAYLOAD" placeholder="hello.ducky"></div>
+          <div class="cfg-row"><label>Double-tap payload</label><input data-k="BUTTON_DOUBLE_TAP_PAYLOAD" placeholder="(optional)"></div>
+          <div class="cfg-row"><label>Hold payload</label><input data-k="BUTTON_HOLD_PAYLOAD" placeholder="(optional)"></div>
+          <div class="cfg-row"><label>Tap window (ms)</label><input data-k="BUTTON_TAP_WINDOW_MS" type="number"></div>
+          <div class="cfg-row"><label>Hold threshold (ms)</label><input data-k="BUTTON_HOLD_MS" type="number"></div>
+        </div>
+      </div>
+
+      <div class="section">
         <h4>DHCP / DNS</h4>
         <div class="cfg-grid">
           <div class="cfg-row sw-row"><label>dnsmasq on</label>
@@ -549,6 +582,18 @@ HTML = r"""<!doctype html>
             <button onclick="scriptsNew()">+ New</button>
           </div>
           <ul id="scriptList" class="file-list"><li class="dim">&hellip;</li></ul>
+        </div>
+        <div class="section" style="margin:12px 0 0;">
+          <h4>Extensions <span class="dim" id="extCount"></span></h4>
+          <div class="setting-row flex-row" style="gap:6px; margin-bottom:8px;">
+            <input type="text" id="newExtName" placeholder="new_ext_name" style="min-width:0;" class="flex-grow">
+            <button onclick="extsNew()">+ New</button>
+          </div>
+          <ul id="extList" class="file-list"><li class="dim">&hellip;</li></ul>
+          <p class="dim" style="font-size:12px;margin-top:6px;">
+            Reference from a script with <code>EXTENSION name</code>.
+            Nested EXTENSIONs resolve recursively (depth cap 16).
+          </p>
         </div>
         <div class="section" style="margin:12px 0 0;">
           <h4>Keyboard layout</h4>
@@ -1211,7 +1256,7 @@ function openTab(name) {
   // Config tab: always refetch so changes made via other tabs
   // (quick-spoof, DuckyScript GL_SET, external edits) are visible
   if (name === 'Config')    { loadCfg(); }
-  if (name === 'Scripting') { scriptsRefresh(); layoutsRefresh(); }
+  if (name === 'Scripting') { scriptsRefresh(); extsRefresh(); layoutsRefresh(); }
   if (name === 'LiveType')  { $('#liveInput').focus(); }
   if (name === 'Terminal')  { cliProbe(); setTimeout(() => $('#termIn') && $('#termIn').focus(), 50); }
 }
@@ -1343,8 +1388,10 @@ function cfgParse(txt) {
     const i = s.indexOf('=');
     const k = s.slice(0, i).trim();
     let v = s.slice(i + 1);
-    const h = v.indexOf('#');
-    if (h >= 0) v = v.slice(0, h);
+    // Only strip `#` when preceded by whitespace, so passwords / URLs that
+    // happen to contain '#' aren't silently truncated.
+    const m = v.match(/\s#/);
+    if (m) v = v.slice(0, m.index);
     d[k] = v.trim();
   });
   return d;
@@ -1534,6 +1581,9 @@ const DUCKY_KEYWORDS = [
   {w:'GL_WAIT',          kind:'gl', hint:'N seconds'},
   {w:'GL_SPOOF_ADD',    kind:'gl',  hint:'host — append to REDIRECT_FROM'},
   {w:'GL_REBOOT',       kind:'gl',  hint:'reboot the device'},
+  {w:'WAIT_FOR_BUTTON_PRESS', kind:'cmd', hint:'block until on-board button pressed'},
+  {w:'BUTTON_WAIT',     kind:'cmd', hint:'alias for WAIT_FOR_BUTTON_PRESS'},
+  {w:'EXTENSION',       kind:'cmd', hint:'include an extension: EXTENSION name'},
   // modifiers
   {w:'GUI',    kind:'mod'}, {w:'WINDOWS', kind:'mod'}, {w:'WIN', kind:'mod'},
   {w:'SUPER',  kind:'mod'}, {w:'COMMAND', kind:'mod'}, {w:'CMD', kind:'mod'},
@@ -1573,6 +1623,8 @@ function validateScript() {
     if (/^(REM|REM_BLOCK|END_REM|#)/i.test(s)) return;
     if (/^(STRING|DELAY|DEFAULTDELAY|DEFAULT_DELAY|DEFAULTCHARDELAY|REPEAT|WAIT) /i.test(s)) return;
     if (/^GL_/i.test(s)) return;              // GhostLink extensions
+    if (/^EXTENSION\s+/i.test(s)) return;     // include reference
+    if (/^(WAIT_FOR_BUTTON_PRESS|BUTTON_WAIT)\b/i.test(s)) return;
     const toks = s.split(/\s+/).map(t => t.toUpperCase());
     if (toks.every(t => KW_SET.has(t))) return;
     errs.push(`L${i+1}: unknown "${s.slice(0,40)}"`);
@@ -1594,7 +1646,17 @@ function acOpen() {
   if (!m) { acClose(); return; }
   const word = m[0].toUpperCase();
   acWordStart = pos - m[0].length;
-  const matches = DUCKY_KEYWORDS.filter(k => k.w.startsWith(word)).slice(0, 10);
+  // Rank matches: prefix hits first (score 0), then substring hits (score 1).
+  // Lets "ARROW" surface UPARROW/DOWNARROW/LEFTARROW/RIGHTARROW while still
+  // showing "DELAY" first when the user types "DEL".
+  const ranked = [];
+  DUCKY_KEYWORDS.forEach(k => {
+    const idx = k.w.indexOf(word);
+    if (idx === 0)      ranked.push({ k, s: 0 });
+    else if (idx > 0)   ranked.push({ k, s: 1 });
+  });
+  ranked.sort((a, b) => a.s - b.s || a.k.w.length - b.k.w.length);
+  const matches = ranked.slice(0, 10).map(r => r.k);
   if (!matches.length || word.length < 1) { acClose(); return; }
   acItems = matches; acIndex = 0;
   const pop = $('#acPopup');
@@ -1676,12 +1738,21 @@ async function scriptOpen(name) {
   const t = await api('/api/scripts/' + encodeURIComponent(name));
   $('#scriptArea').value = typeof t === 'string' ? t : '';
   currentScript = name;
+  currentExt = null;
   $('#editorTitle').textContent = name;
   $('#scriptStatus').textContent = 'opened ' + name;
   updateGutter();
   scriptsRefresh();
+  extsRefresh();
 }
 async function scriptSave() {
+  if (currentExt) {
+    const r = await fetch('/api/extensions/' + encodeURIComponent(currentExt), {
+      method:'POST', body: $('#scriptArea').value });
+    if (r.ok) { toast('saved EXTENSION ' + currentExt); $('#scriptStatus').textContent = 'saved'; extsRefresh(); }
+    else { toast('save failed', true); }
+    return;
+  }
   if (!currentScript) return scriptSaveAs();
   const r = await fetch('/api/scripts/' + encodeURIComponent(currentScript), {
     method:'POST', body: $('#scriptArea').value });
@@ -1753,6 +1824,61 @@ function scriptClear() {
   if (!confirm('clear editor?')) return;
   $('#scriptArea').value = '';
   updateGutter();
+}
+
+/* --- extensions --- */
+let currentExt = null;      // if set, editor is in "edit extension" mode
+async function extsRefresh() {
+  const l = await api('/api/extensions');
+  const ul = $('#extList');
+  if (!Array.isArray(l) || !l.length) {
+    ul.innerHTML = '<li class="dim">no extensions</li>';
+    $('#extCount').textContent = '(0)';
+    return;
+  }
+  $('#extCount').textContent = `(${l.length})`;
+  ul.innerHTML = l.map(f =>
+    `<li data-name="${esc(f.name)}" onclick="extOpen('${esc(f.name)}')"
+         class="${currentExt === f.name ? 'active' : ''}">
+       <span class="fl-del" onclick="event.stopPropagation(); extDelete('${esc(f.name)}')">✕</span>
+       EXTENSION ${esc(f.name)}
+     </li>`
+  ).join('');
+}
+async function extOpen(name) {
+  const t = await api('/api/extensions/' + encodeURIComponent(name));
+  $('#scriptArea').value = typeof t === 'string' ? t : '';
+  currentExt = name;
+  currentScript = null;
+  $('#editorTitle').textContent = 'EXTENSION ' + name;
+  $('#scriptStatus').textContent = 'editing extension';
+  updateGutter();
+  extsRefresh();
+  scriptsRefresh();
+}
+async function extsNew() {
+  const name = ($('#newExtName').value || '').trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+    toast('name must be [A-Za-z0-9][A-Za-z0-9._-]*', true); return;
+  }
+  const r = await fetch('/api/extensions/' + encodeURIComponent(name), {
+    method:'POST', body: 'REM ' + name + ' extension\n' });
+  const j = await r.json();
+  if (j.ok) { $('#newExtName').value = ''; extsRefresh(); extOpen(name); }
+  else      { toast('create failed: ' + (j.err || ''), true); }
+}
+async function extDelete(name) {
+  if (!confirm('delete extension ' + name + '?')) return;
+  const r = await fetch('/api/extensions/' + encodeURIComponent(name), { method:'DELETE' });
+  if (r.ok) {
+    if (currentExt === name) {
+      currentExt = null;
+      $('#editorTitle').textContent = '(untitled)';
+      $('#scriptArea').value = '';
+      updateGutter();
+    }
+    extsRefresh();
+  }
 }
 
 /* --- layouts --- */
@@ -2012,6 +2138,7 @@ function bindTerminal() {
   bindEditor();
   updateGutter();
   scriptsRefresh();
+  extsRefresh();
   layoutsRefresh();
   // Live typing
   bindLiveTyping();
@@ -2200,6 +2327,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _client_ip(self):
         return self.client_address[0] if self.client_address else "?"
 
+    def _session_key(self) -> str:
+        """Return the actual session token for the current request. Covers
+        both cookie and Bearer-header auth, falls back to empty str if
+        unauthed. Callers for pty / CLI endpoints must refuse empty keys so
+        multiple unauthed clients can't share one pty."""
+        tok = self._cookie_token()
+        if tok and _session_valid(tok): return tok
+        a = self.headers.get("Authorization", "") or ""
+        if a.lower().startswith("bearer "):
+            b = a[7:].strip()
+            if _session_valid(b): return b
+        return ""
+
     def _send_file_or_404(self, p: Path, ctype: str):
         try: body = p.read_bytes()
         except Exception:
@@ -2380,6 +2520,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for f in sorted(LAY_DIR.iterdir()):
                     if f.suffix == ".json": out.append(f.stem)
             self._send_json(out)
+        elif p == "/api/extensions":
+            out = []
+            EXT_DIR.mkdir(parents=True, exist_ok=True)
+            for f in sorted(EXT_DIR.iterdir()):
+                if not f.is_file() or f.suffix != ".ducky": continue
+                try:
+                    st = f.stat()
+                    out.append({"name": f.stem, "size": st.st_size, "mtime": int(st.st_mtime)})
+                except Exception: pass
+            self._send_json(out)
+        elif p.startswith("/api/extensions/"):
+            name = p[len("/api/extensions/"):]
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name):
+                return self._send(400, "text/plain", "bad name")
+            fp = EXT_DIR / f"{name}.ducky"
+            if not fp.exists():
+                return self._send(404, "text/plain", "not found")
+            try: self._send(200, "text/plain; charset=utf-8", fp.read_text(encoding="utf-8", errors="replace"))
+            except Exception as e: self._send(500, "text/plain", f"read err: {e}")
         elif p == "/api/auth/me":
             u = self._auth_user()
             self._send_json({"authed": bool(u), "user": u or None})
@@ -2395,7 +2554,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # (escape sequences, color codes) survives transport.
             if not self._auth_user():
                 return self._send(401, "text/plain", "auth required\n")
-            tok = self._cookie_token() or ""
+            tok = self._session_key()
+            if not tok:
+                return self._send(401, "text/plain", "no session\n")
             self._cli_stream(tok)
         else:
             self._send(404, "text/plain", "not found\n")
@@ -2503,6 +2664,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             finally:
                 try: tmp.unlink()
                 except Exception: pass
+
+        # ---- extensions library (save) ----------------------------------
+        if u.path.startswith("/api/extensions/"):
+            name = u.path[len("/api/extensions/"):]
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name):
+                return self._send_json({"ok": False, "err": "bad name"}, code=400)
+            if len(body) > 128 * 1024:
+                return self._send_json({"ok": False, "err": "too large"}, code=413)
+            EXT_DIR.mkdir(parents=True, exist_ok=True)
+            fp = EXT_DIR / f"{name}.ducky"
+            tmp = fp.with_suffix(".new")
+            try:
+                tmp.write_bytes(body); tmp.replace(fp)
+                return self._send_json({"ok": True, "size": fp.stat().st_size})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
 
         # ---- scripts library (save) --------------------------------------
         if u.path.startswith("/api/scripts/") and not u.path.endswith("/rename") and not u.path.endswith("/run"):
@@ -2636,7 +2813,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # the end-of-command sentinel appears (or 15 s elapses).
         if u.path == "/api/cli/exec":
             if not self._require_auth(): return
-            tok = self._cookie_token() or (self.headers.get("Authorization","") or "")[7:].strip()
+            tok = self._session_key()
+            if not tok:
+                return self._send_json({"ok": False, "err": "no session"}, code=401)
             try: data = json.loads(body)
             except Exception: data = {}
             cmd = data.get("cmd") or ""
@@ -2670,7 +2849,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # pty input. No prompt wrapping — the shell handles echo.
         if u.path == "/api/cli/input":
             if not self._require_auth(): return
-            tok = self._cookie_token() or ""
+            tok = self._session_key()
+            if not tok:
+                return self._send_json({"ok": False, "err": "no session"}, code=401)
             s = pty_open(tok)
             try:
                 os.write(s["fd"], body)
@@ -2681,7 +2862,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # ---- CLI pty resize (xterm.js reports new rows/cols on resize) ---
         if u.path == "/api/cli/resize":
             if not self._require_auth(): return
-            tok = self._cookie_token() or ""
+            tok = self._session_key()
+            if not tok:
+                return self._send_json({"ok": False, "err": "no session"}, code=401)
             try: data = json.loads(body)
             except Exception: data = {}
             rows = int(data.get("rows", 24))
@@ -2721,6 +2904,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self._send_json({"ok": False, "err": "not found"}, code=404)
             try: fp.unlink(); return self._send_json({"ok": True})
             except Exception as e: return self._send_json({"ok": False, "err": str(e)}, code=500)
+        if u.path.startswith("/api/extensions/"):
+            name = u.path[len("/api/extensions/"):]
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name):
+                return self._send_json({"ok": False, "err": "bad name"}, code=400)
+            fp = EXT_DIR / f"{name}.ducky"
+            if not fp.exists():
+                return self._send_json({"ok": False, "err": "not found"}, code=404)
+            try: fp.unlink(); return self._send_json({"ok": True})
+            except Exception as e: return self._send_json({"ok": False, "err": str(e)}, code=500)
         self._send(404, "text/plain", "not found\n")
 
 
@@ -2731,11 +2923,34 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     cfg = load_cfg()
-    port = int(cfg.get("WEBUI_PORT","80"))
-    bind = cfg.get("WEBUI_BIND","0.0.0.0")
-    s = Server((bind, port), Handler)
+    try: port = int(cfg.get("WEBUI_PORT","80"))
+    except (TypeError, ValueError): port = 80
+    bind = cfg.get("WEBUI_BIND","0.0.0.0") or "0.0.0.0"
+    # Retry bind up to 10x with 1 s gaps — handles the race where a prior
+    # webui.py has JUST exited but the socket isn't released yet, and
+    # yields cleanly if a duplicate webui is actually alive (so we don't
+    # dump a traceback into the shared log).
+    s = None
+    for i in range(10):
+        try:
+            s = Server((bind, port), Handler); break
+        except OSError as e:
+            if e.errno == 98:    # EADDRINUSE
+                sys.stderr.write(f"webui: :{port} busy, retry {i+1}/10\n")
+                time.sleep(1)
+                continue
+            raise
+    if s is None:
+        sys.stderr.write(f"webui: giving up on {bind}:{port}, another instance owns it\n")
+        return
     sys.stderr.write(f"webui listening {bind}:{port}\n")
-    s.serve_forever()
+    try:
+        s.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try: s.server_close()
+        except Exception: pass
 
 
 if __name__ == "__main__":

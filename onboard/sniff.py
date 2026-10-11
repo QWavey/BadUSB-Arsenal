@@ -67,7 +67,12 @@ def load_cfg(p: Path) -> dict:
         if "=" not in s:
             continue
         k, v = s.split("=", 1)
-        cfg[k.strip()] = v.split("#", 1)[0].strip()
+        # strip inline comment only when preceded by whitespace, so values
+        # containing a '#' (e.g. passwords) are preserved
+        import re as _re
+        _m = _re.search(r"\s#", v)
+        if _m: v = v[:_m.start()]
+        cfg[k.strip()] = v.strip()
     return cfg
 
 
@@ -482,7 +487,11 @@ def dump_stats(frame_count: int, match_count: int, start: float, iface: str):
             "warn_free_mb":  WARN_FREE_MB,
             "crit_free_mb":  CRIT_FREE_MB,
         }
-        STATS_PATH.write_text(json.dumps(data))
+        # Atomic write: webui polls this file ~every 2 s and json.loads would
+        # fail on a half-written file. Write to .tmp, rename over the target.
+        tmp = STATS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data))
+        tmp.replace(STATS_PATH)
     except Exception:
         pass
 
