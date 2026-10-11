@@ -220,6 +220,40 @@ def run(path, stop_event=None):
     char_delay_ms  = 2       # tiny inter-key gap so a slow host doesn't miss keys
     last_executed  = None
     in_block_rem   = False
+    include_depth  = 0       # guards against recursive EXTENSION chains
+
+
+    def _expand_extension(name, depth=0):
+        """Return the list of lines for an EXTENSION include, recursively
+        resolving nested EXTENSIONs. Protects against cycles with depth cap."""
+        if depth > 16:
+            sys.stderr.write(f"ducky: EXTENSION depth limit at '{name}'\n")
+            return []
+        import re as _re
+        if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name):
+            sys.stderr.write(f"ducky: bad EXTENSION name '{name}'\n")
+            return []
+        p = ROOT / "extensions" / f"{name}.ducky"
+        if not p.exists():
+            p = ROOT / "extensions" / name            # allow bare .ducky suffix omitted
+            if not p.exists():
+                sys.stderr.write(f"ducky: EXTENSION '{name}' not found\n")
+                return []
+        try:
+            lines = p.read_text().splitlines()
+        except Exception as e:
+            sys.stderr.write(f"ducky: EXTENSION '{name}' read fail: {e}\n")
+            return []
+        # recursively expand nested EXTENSION references
+        out = []
+        for raw in lines:
+            s = raw.strip()
+            if s.upper().startswith("EXTENSION "):
+                sub = s.split(None, 1)[1].strip()
+                out.extend(_expand_extension(sub, depth + 1))
+            else:
+                out.append(raw)
+        return out
 
     def exec_one(line):
         """Execute a single prepared command line. Returns True on repeatable action."""
@@ -227,10 +261,11 @@ def run(path, stop_event=None):
         if not line: return False
         up = line.upper()
 
-        # REM_BLOCK and END_REM handled by caller via in_block_rem
-        if up.startswith("REM "):   return False
-        if up.startswith("REM"):    return False
-        if up.startswith("#"):      return False
+        # REM_BLOCK and END_REM handled by caller via in_block_rem.
+        # Only exact "REM" or "REM " start a line comment — previously any
+        # "REM..." prefix (REMEMBER, REMOVE_FILES, …) got silently eaten.
+        if up == "REM" or up.startswith("REM "): return False
+        if up.startswith("#"): return False
 
         if up.startswith("DEFAULTDELAY "):
             default_delay = _ms(line[13:], 0); return False
@@ -243,6 +278,34 @@ def run(path, stop_event=None):
         if up.startswith("WAIT "):
             # GL_WAIT in whole seconds — nicer than DELAY for long waits
             time.sleep(max(0, _ms(line[5:], 0))); return True
+
+        if up == "WAIT_FOR_BUTTON_PRESS" or up == "BUTTON_WAIT":
+            # Block until the on-board button is pressed (EV_KEY val=1).
+            # Opens its own fd — the button daemon can be reading in parallel.
+            try:
+                import struct as _s
+                dev = "/dev/input/event0"
+                cfg = ROOT / "config.txt"
+                if cfg.exists():
+                    import re as _re
+                    for ln in cfg.read_text().splitlines():
+                        ln = ln.strip()
+                        if ln.startswith("BUTTON_DEV="):
+                            v = ln.split("=",1)[1]
+                            m = _re.search(r"\s#", v)
+                            if m: v = v[:m.start()]
+                            dev = v.strip() or dev
+                fmt = "llHHi"; sz = _s.calcsize(fmt)
+                with open(dev, "rb", buffering=0) as _f:
+                    while True:
+                        if stop_event is not None and stop_event.is_set(): break
+                        data = os.read(_f.fileno(), sz)
+                        if len(data) < sz: continue
+                        _, _, ty, _, val = _s.unpack(fmt, data)
+                        if ty == 1 and val == 1: break
+            except Exception as e:
+                sys.stderr.write(f"ducky: WAIT_FOR_BUTTON_PRESS err {e}\n")
+            return True
 
         # ---- GhostLink extensions ---------------------------------------
         if up.startswith("GL_SET "):
@@ -316,9 +379,14 @@ def run(path, stop_event=None):
             return True
         return False
 
-    for raw in lines:
+    # Walk the lines with explicit indexing so EXTENSION expansions can splice
+    # the included lines in place without recursion into exec_one.
+    work = list(lines)
+    i = 0
+    while i < len(work):
         if stop_event is not None and stop_event.is_set():
             break
+        raw = work[i]; i += 1
         s = raw.strip()
 
         # block comments
@@ -327,6 +395,13 @@ def run(path, stop_event=None):
         if in_block_rem:
             if s.upper() == "END_REM":
                 in_block_rem = False
+            continue
+
+        # EXTENSION reference: splice the resolved body in at current pos
+        if s.upper().startswith("EXTENSION "):
+            name = s.split(None, 1)[1].strip()
+            expanded = _expand_extension(name)
+            work[i:i] = expanded
             continue
 
         if s.upper().startswith("REPEAT "):

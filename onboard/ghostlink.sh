@@ -17,7 +17,9 @@ log() { echo "$(date +'%H:%M:%S') ghostlink $*" | tee -a "$LOG"; }
 
 CFG=$ROOT/config.txt
 getcfg() {
-    grep -E "^$1=" "$CFG" | tail -n1 | sed -E "s/^$1=//; s/#.*$//; s/[[:space:]]+$//"
+    # The second sed only strips comments preceded by whitespace, so
+    # values containing a lone '#' (passwords, URL fragments) survive.
+    grep -E "^$1=" "$CFG" | tail -n1 | sed -E "s/^$1=//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//"
 }
 truthy() { case "$1" in TRUE|true|1|YES|yes|on|ON) return 0 ;; *) return 1 ;; esac; }
 
@@ -142,6 +144,22 @@ fi
 
 log "starting"
 
+# -- single-instance guard ----------------------------------------------------
+# Prevents a double-start from spawning two webuis / two sniffers / two
+# dnsmasqs on the same ports (second webui crashes with EADDRINUSE 98 and
+# dumps a traceback into the log). If a previous ghostlink.sh died without
+# cleaning its pidfile, the kill -0 check lets us claim the slot anyway.
+PIDFILE=/run/ghostlink.pid
+if [ -f "$PIDFILE" ]; then
+    oldpid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$oldpid" ] && [ "$oldpid" != "$$" ] && kill -0 "$oldpid" 2>/dev/null; then
+        log "already running as pid $oldpid, exiting"
+        exit 0
+    fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
 # -- config -------------------------------------------------------------------
 [ -f "$CFG" ] || { log "no config.txt, bailing"; exit 1; }
 
@@ -210,6 +228,16 @@ if truthy "${WEBUI:-TRUE}"; then
     log "webui.py started"
 fi
 
+# -- button daemon ------------------------------------------------------------
+# Watches the on-board button (adc-keys driver). On press, fires the payload
+# named by BUTTON_PAYLOAD / BUTTON_DOUBLE_TAP_PAYLOAD / BUTTON_HOLD_PAYLOAD
+# from config.txt. Separate from the DuckyScript WAIT_FOR_BUTTON_PRESS
+# command (which reads /dev/input/event0 directly from within a payload).
+if truthy "$(getcfg BUTTON_ENABLED)"; then
+    python3 "$ROOT/button.py" >>"$LOG" 2>&1 &
+    log "button.py started"
+fi
+
 # redirect is handled inline by webui.py (Host-header 302 on :80), so the
 # separate redirect302.py service is no longer needed. Still ship it for
 # anyone who wants a secondary :8080 forwarder:
@@ -271,5 +299,9 @@ while :; do
     if truthy "${LOG_FLAG:-TRUE}" && ! proc_running sniff.py; then
         python3 "$ROOT/sniff.py" >>"$LOG" 2>&1 &
         log "sniff respawned"
+    fi
+    if truthy "$(getcfg BUTTON_ENABLED)" && ! proc_running button.py; then
+        python3 "$ROOT/button.py" >>"$LOG" 2>&1 &
+        log "button respawned"
     fi
 done
