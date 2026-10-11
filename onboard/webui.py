@@ -290,6 +290,7 @@ BUTTON_DOUBLE_TAP_PAYLOAD=
 BUTTON_HOLD_PAYLOAD=
 BUTTON_TAP_WINDOW_MS=600
 BUTTON_HOLD_MS=1200
+NET_MODE=PASSIVE
 """
 
 
@@ -344,6 +345,30 @@ HTML = r"""<!doctype html>
       <div class="flex-row" style="gap:10px;">
         <button id="btnRec" onclick="toggleRecord()" class="btn-ghost">&hellip;</button>
         <div id="recBadge" class="status-badge">REC OFF</div>
+      </div>
+    </div>
+
+    <!-- Network mode segmented toggle. "Forwarded" is only available when
+         a LAN cable is actually plugged into eth0 (carrier=1); until then
+         it's rendered but disabled with a hint. -->
+    <div class="section" style="padding:12px 16px;">
+      <div class="flex-row" style="justify-content:space-between; align-items:center; gap:14px; flex-wrap:wrap;">
+        <div class="flex-row" style="gap:0;">
+          <button id="modePassive" onclick="setNetMode('PASSIVE')" class="seg-btn seg-left">
+            Passive traffic
+          </button>
+          <button id="modeForward" onclick="setNetMode('FORWARD')" class="seg-btn seg-right">
+            Forwarded traffic
+          </button>
+        </div>
+        <div class="flex-row" style="gap:12px;">
+          <span class="link-badge" id="lnkUsb">usb0 &hellip;</span>
+          <span class="link-badge" id="lnkEth">eth0 &hellip;</span>
+        </div>
+      </div>
+      <div class="dim" style="font-size:12px; margin-top:8px;" id="modeHint">
+        Passive = sniff only what the host sends via usb0.
+        Forwarded = cross-copy frames between eth0 and usb0 (needs a cable).
       </div>
     </div>
 
@@ -412,7 +437,8 @@ HTML = r"""<!doctype html>
       </p>
       <div class="setting-row flex-row" style="gap:12px; flex-wrap: wrap;">
         <input type="text" id="q-host" placeholder="host  (example.com)" class="flex-grow">
-        <input type="text" id="q-rule" placeholder="rule  (DNS | REDIRECT)" style="min-width:200px;">
+        <input type="text" id="q-rule" placeholder="rule  (DNS | REDIRECT | CRED)" style="min-width:200px;">
+        <button onclick="qCreds()" class="btn-ghost">Show only CRED</button>
         <button onclick="runQuery()">Run</button>
       </div>
       <div id="q-result-rule" class="dim" style="margin-top:14px;">no query run yet</div>
@@ -978,6 +1004,53 @@ tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: rgba(76,175,80,0.05); }
 .t-verdicts td.rule-REDIRECT { color: var(--primary); font-weight: 600; }
 .t-verdicts td.rule-DNS      { color: var(--text-main); }
+.t-verdicts tr.cred, .t-verdicts td.rule-CRED {
+  color: var(--danger) !important;
+  font-weight: 700;
+}
+.t-verdicts tr.cred { background: rgba(244, 67, 54, 0.08); }
+.t-verdicts tr.cred:hover { background: rgba(244, 67, 54, 0.14); }
+
+/* Segmented mode toggle on the Live pane */
+.seg-btn {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  border: 1px solid var(--glass-border);
+  padding: 8px 14px;
+  font-weight: 500;
+  font-size: 13px;
+  border-radius: 0;
+  transition: all 0.15s;
+}
+.seg-btn:hover { color: var(--text-main); transform: none; filter: none; }
+.seg-left  { border-radius: 8px 0 0 8px; border-right: none; }
+.seg-right { border-radius: 0 8px 8px 0; }
+.seg-btn.active {
+  background: var(--primary);
+  color: #fff;
+  border-color: var(--primary);
+}
+.seg-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.link-badge {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(125, 133, 144, 0.12);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-family: 'Fira Code','Consolas',monospace;
+  border: 1px solid transparent;
+}
+.link-badge.up {
+  background: rgba(76, 175, 80, 0.14);
+  color: var(--primary);
+  border-color: rgba(76, 175, 80, 0.4);
+}
+.link-badge.down {
+  background: rgba(125, 133, 144, 0.08);
+}
 td.name a, td a { color: var(--primary); text-decoration: none; }
 td a:hover { text-decoration: underline; }
 td.actions { display: flex; gap: 8px; }
@@ -1296,14 +1369,23 @@ async function tick() {
 
     const vb = $('#verdicts-body');
     if (live.tail && live.tail.length) {
-      vb.innerHTML = live.tail.slice().reverse().map(v => `<tr>
-        <td>${v.f ?? ''}</td>
-        <td>${esc((v.t||'').split('.')[0])}</td>
-        <td>${esc(v.flow || '')}</td>
-        <td>${v.sz ?? ''}</td>
-        <td class="rule-${v.rule||''}">${esc(v.rule || '')}</td>
-        <td>${esc(v.host || v.detail || '')}</td>
-      </tr>`).join('');
+      vb.innerHTML = live.tail.slice().reverse().map(v => {
+        const rule = v.rule || '';
+        const isCred = rule === 'CRED';
+        const detail = v.host || v.detail || v.kind || '';
+        const extra  = v.kind && v.host ? ` [${esc(v.kind)}]` : '';
+        const vdstr  = isCred
+          ? `${esc(v.kind || 'CRED')} ${v.user ? 'user='+esc(v.user)+' ' : ''}${v.value ? 'pw='+esc(v.value) : ''}`
+          : esc(detail) + esc(extra);
+        return `<tr class="${isCred ? 'cred' : ''}">
+          <td>${v.f ?? ''}</td>
+          <td>${esc((v.t||'').split('.')[0])}</td>
+          <td>${esc(v.flow || '')}</td>
+          <td>${v.sz ?? ''}</td>
+          <td class="rule-${rule}">${esc(rule)}</td>
+          <td>${vdstr}</td>
+        </tr>`;
+      }).join('');
     }
 
     const ib = $('#ifaces-body');
@@ -1352,6 +1434,12 @@ async function clearAll() {
 }
 
 /* --- query ---------------------------------------------------- */
+function qCreds() {
+  $('#q-host').value = '';
+  $('#q-rule').value = 'CRED';
+  runQuery();
+}
+
 async function runQuery() {
   const qs = new URLSearchParams();
   if ($('#q-host').value) qs.set('host', $('#q-host').value);
@@ -1366,13 +1454,19 @@ async function runQuery() {
   if (!lines.length) { b.innerHTML = '<tr><td colspan="6" class="dim">no matches</td></tr>'; return; }
   b.innerHTML = lines.slice(0, 500).map(l => {
     let v = {}; try { v = JSON.parse(l); } catch {}
-    return `<tr>
+    const rule = v.rule || '';
+    const isCred = rule === 'CRED';
+    const detail = v.host || v.detail || v.kind || '';
+    const vdstr  = isCred
+      ? `${esc(v.kind || 'CRED')} ${v.user ? 'user='+esc(v.user)+' ' : ''}${v.value ? 'pw='+esc(v.value) : ''}`
+      : esc(detail);
+    return `<tr class="${isCred ? 'cred' : ''}">
       <td>${v.f ?? ''}</td>
       <td>${esc((v.t||'').split('.')[0])}</td>
       <td>${esc(v.flow || '')}</td>
       <td>${v.sz ?? ''}</td>
-      <td class="rule-${v.rule || ''}">${esc(v.rule || '')}</td>
-      <td>${esc(v.host || v.detail || '')}</td>
+      <td class="rule-${rule}">${esc(rule)}</td>
+      <td>${vdstr}</td>
     </tr>`;
   }).join('');
 }
@@ -1502,6 +1596,50 @@ async function refreshSystem() {
 async function reboot() {
   if (!confirm('reboot?')) return;
   await api('/api/reboot', { method:'POST' });
+}
+
+async function refreshNetLink() {
+  // Fetches /api/net/link, paints the badges and enables / disables the
+  // "Forwarded" segment based on eth0 carrier.
+  let d;
+  try { d = await api('/api/net/link'); } catch(e) { return; }
+  if (!d || typeof d !== 'object') return;
+  const eth = d.eth0 || {}, usb = d.usb0 || {};
+  const paint = (el, cur) => {
+    if (!el) return;
+    el.classList.remove('up','down');
+    if (cur.carrier) {
+      el.classList.add('up');
+      el.textContent = `${el.id === 'lnkUsb' ? 'usb0' : 'eth0'} ${cur.speed > 0 ? cur.speed + 'M ' : ''}UP`;
+    } else {
+      el.classList.add('down');
+      el.textContent = `${el.id === 'lnkUsb' ? 'usb0' : 'eth0'} down`;
+    }
+  };
+  paint($('#lnkUsb'), usb);
+  paint($('#lnkEth'), eth);
+  const mode = d.mode || 'PASSIVE';
+  $('#modePassive').classList.toggle('active', mode === 'PASSIVE');
+  $('#modeForward').classList.toggle('active', mode === 'FORWARD');
+  // Forwarded only usable with a cable; keep the button, grey it out
+  $('#modeForward').disabled = !eth.carrier;
+  $('#modeHint').textContent = eth.carrier
+    ? (mode === 'FORWARD'
+        ? (d.forwarder_running
+            ? 'Forwarder is running — eth0 <-> usb0 cross-copy active.'
+            : 'Mode is FORWARD but the forwarder isn’t up yet (watcher polls every 2s).')
+        : 'LAN cable detected on eth0 — click "Forwarded traffic" to start the forwarder.')
+    : 'No LAN cable on eth0 — Forwarded mode is unavailable.';
+}
+
+async function setNetMode(mode) {
+  const r = await api('/api/net/mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  });
+  if (r.ok) { toast(mode); refreshNetLink(); }
+  else      { toast('mode change failed: ' + (r.err||''), true); }
 }
 
 async function toggleRecord() {
@@ -2134,6 +2272,8 @@ function bindTerminal() {
   loadCfg();
   tick();
   setInterval(tick, 2000);
+  refreshNetLink();
+  setInterval(refreshNetLink, 2500);
   // Scripting
   bindEditor();
   updateGutter();
@@ -2520,6 +2660,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for f in sorted(LAY_DIR.iterdir()):
                     if f.suffix == ".json": out.append(f.stem)
             self._send_json(out)
+        elif p == "/api/net/link":
+            # Snapshot of each iface's carrier so the Live UI can decide if
+            # "Forwarded Traffic" is available right now (eth0 cable plugged
+            # in). Reads straight from sysfs, no root helper needed.
+            out = {}
+            for ifn in ("eth0", "usb0"):
+                base = Path(f"/sys/class/net/{ifn}")
+                if not base.exists(): continue
+                def _r(name, default="?"):
+                    try: return (base / name).read_text().strip()
+                    except Exception: return default
+                carrier = _r("carrier", "0")
+                try: carrier = int(carrier)
+                except Exception: carrier = 0
+                try: speed = int(_r("speed", "-1"))
+                except Exception: speed = -1
+                out[ifn] = {
+                    "carrier":   bool(carrier),
+                    "operstate": _r("operstate", "unknown"),
+                    "speed":     speed,
+                    "mac":       _r("address", ""),
+                }
+            cfg = load_cfg()
+            out["mode"] = cfg.get("NET_MODE", "PASSIVE").upper()
+            out["forwarder_running"] = bool(
+                any("forwarder.py" in ln for ln in
+                    subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
+                              .stdout.splitlines())
+            )
+            self._send_json(out)
         elif p == "/api/extensions":
             out = []
             EXT_DIR.mkdir(parents=True, exist_ok=True)
@@ -2664,6 +2834,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
             finally:
                 try: tmp.unlink()
                 except Exception: pass
+
+        # ---- flip network mode (passive / forward) ----------------------
+        if u.path == "/api/net/mode":
+            try: data = json.loads(body)
+            except Exception: data = {}
+            mode = (data.get("mode") or "").upper()
+            if mode not in ("PASSIVE", "FORWARD"):
+                return self._send_json({"ok": False, "err": "mode must be PASSIVE or FORWARD"}, code=400)
+            # update config.txt line atomically
+            txt = CFG_PATH.read_text() if CFG_PATH.exists() else ""
+            if re.search(r"^NET_MODE=.*$", txt, re.MULTILINE):
+                txt = re.sub(r"^NET_MODE=.*$", f"NET_MODE={mode}", txt, flags=re.MULTILINE)
+            else:
+                txt += ("" if txt.endswith("\n") else "\n") + f"NET_MODE={mode}\n"
+            tmp = CFG_PATH.with_suffix(".new")
+            tmp.write_text(txt); tmp.replace(CFG_PATH)
+            # ask the link watcher to react immediately: if FORWARD and
+            # eth0 up, start the forwarder; if PASSIVE, kill it.
+            if mode == "FORWARD":
+                carrier = "0"
+                try: carrier = Path("/sys/class/net/eth0/carrier").read_text().strip()
+                except Exception: pass
+                if carrier == "1":
+                    try:
+                        subprocess.run(["ip", "link", "set", "eth0", "up"], timeout=2)
+                        subprocess.run(["ip", "link", "set", "eth0", "promisc", "on"], timeout=2)
+                        subprocess.Popen(["python3", str(ROOT/"forwarder.py"), "eth0", "usb0"])
+                    except Exception: pass
+            else:
+                # kill forwarder if running
+                try:
+                    r = subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
+                    for ln in r.stdout.splitlines():
+                        if "forwarder.py" in ln and "grep" not in ln:
+                            parts = ln.split()
+                            if parts and parts[0].isdigit():
+                                try: os.kill(int(parts[0]), 15)
+                                except Exception: pass
+                except Exception: pass
+            return self._send_json({"ok": True, "mode": mode})
 
         # ---- extensions library (save) ----------------------------------
         if u.path.startswith("/api/extensions/"):

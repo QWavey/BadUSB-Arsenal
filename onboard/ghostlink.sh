@@ -228,6 +228,50 @@ if truthy "${WEBUI:-TRUE}"; then
     log "webui.py started"
 fi
 
+# -- userspace L2 forwarder (NET_MODE=FORWARD) --------------------------------
+# Kernel bridge isn't supported on the stock Luckfox kernel, so a true inline
+# MITM between usb0 and eth0 goes through a Python daemon that cross-copies
+# AF_PACKET frames. Only runs when the user set NET_MODE=FORWARD AND eth0
+# has carrier (a LAN cable is actually plugged in). The link-watch loop
+# further down keeps this in sync when the cable is unplugged/replugged.
+NET_MODE=$(getcfg NET_MODE)
+NET_MODE=${NET_MODE:-PASSIVE}
+if [ "$NET_MODE" = "FORWARD" ] && [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
+    ip link set eth0 up 2>/dev/null
+    ip link set eth0 promisc on 2>/dev/null
+    python3 "$ROOT/forwarder.py" eth0 usb0 >>"$LOG" 2>&1 &
+    log "forwarder.py started (eth0 <-> usb0)"
+fi
+
+# -- link-state watcher: carrier-sensitive forwarder lifecycle ---------------
+# When the user plugs or unplugs the LAN cable, the forwarder should start /
+# stop automatically. We can't trust `ip monitor link` to exist on busybox,
+# so this is a 2-second poll loop. Cheap.
+(
+    prev_carrier="-"
+    while :; do
+        sleep 2
+        cur_carrier=$(cat /sys/class/net/eth0/carrier 2>/dev/null)
+        [ "$cur_carrier" = "$prev_carrier" ] && continue
+        prev_carrier="$cur_carrier"
+        mode=$(getcfg NET_MODE); mode=${mode:-PASSIVE}
+        if [ "$mode" = "FORWARD" ] && [ "$cur_carrier" = "1" ]; then
+            if ! proc_running forwarder.py; then
+                ip link set eth0 up 2>/dev/null
+                ip link set eth0 promisc on 2>/dev/null
+                python3 "$ROOT/forwarder.py" eth0 usb0 >>"$LOG" 2>&1 &
+                log "forwarder.py started on LAN plug-in"
+            fi
+        else
+            if proc_running forwarder.py; then
+                kill_byname forwarder.py
+                log "forwarder.py stopped (carrier=$cur_carrier mode=$mode)"
+            fi
+        fi
+    done
+) &
+log "link watcher online"
+
 # -- button daemon ------------------------------------------------------------
 # Watches the on-board button (adc-keys driver). On press, fires the payload
 # named by BUTTON_PAYLOAD / BUTTON_DOUBLE_TAP_PAYLOAD / BUTTON_HOLD_PAYLOAD

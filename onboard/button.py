@@ -75,7 +75,31 @@ def _resolve_payload(name):
     return p if p.exists() else None
 
 
+def _ducky_running() -> bool:
+    """Is a ducky.py payload currently running? If so, we skip firing a new
+    payload on button-press — the press is almost certainly meant to unblock
+    a WAIT_FOR_BUTTON_PRESS inside the running script, not to launch a second
+    payload on top of it."""
+    try:
+        r = subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
+        for ln in r.stdout.splitlines():
+            if "ducky.py" in ln and "grep" not in ln and "button.py" not in ln:
+                parts = ln.split()
+                if parts and parts[0].isdigit():
+                    return True
+    except Exception: pass
+    return False
+
+
 def _fire(name):
+    # Only fire if the user actually set a payload name. Previously an empty
+    # name just logged "not found" which was noisy and surprising when the
+    # button was pressed by someone who expected nothing to happen.
+    if not name or not name.strip():
+        return
+    if _ducky_running():
+        _log(f"skipped '{name}' — a payload is already running (WAIT_FOR_BUTTON_PRESS?)")
+        return
     p = _resolve_payload(name)
     if not p:
         _log(f"payload not found '{name}'")

@@ -424,6 +424,97 @@ def parse_dns_qname(buf: bytes, off: int) -> str:
     return ".".join(name)
 
 
+_CRED_RE_CACHE = {}
+
+
+def _re(pat, flags=0):
+    k = (pat, flags)
+    r = _CRED_RE_CACHE.get(k)
+    if r is None:
+        import re as _r
+        r = _r.compile(pat, flags)
+        _CRED_RE_CACHE[k] = r
+    return r
+
+
+def _redact(s: str, keep: int = 2) -> str:
+    """Return "ab****" so logs show the shape of a secret without leaking it."""
+    if not s: return ""
+    if len(s) <= keep: return "*" * len(s)
+    return s[:keep] + "*" * min(6, len(s) - keep)
+
+
+def sniff_creds(payload: bytes, dport: int, sport: int) -> dict:
+    """Look inside a TCP payload for leaked credentials in cleartext.
+
+    Returns {} if nothing found, otherwise a dict with:
+      kind:  HTTP_BASIC | HTTP_FORM | FTP_USER | FTP_PASS | TELNET_LOGIN
+      host:  the Host: header if we parsed one, else ''
+      value: redacted snippet so the verdict is actionable but not a
+             logging landmine
+
+    Keep this cheap — runs on the hot path for every packet with a payload.
+    """
+    if not payload: return {}
+
+    # HTTP: look for the Host + Authorization or form password=.
+    # Trigger only if first line looks HTTP-ish OR if dport/sport is 80/8080.
+    is_http = dport in (80, 8080) or sport in (80, 8080) or payload[:4] in (
+        b"GET ", b"POST", b"PUT ", b"HEAD", b"DELE", b"OPTI", b"PATC") or \
+        payload[:7].startswith(b"HTTP/1.")
+    if is_http and len(payload) >= 16:
+        try:
+            text = payload.decode("latin-1", "replace")
+        except Exception:
+            text = ""
+        host = ""
+        m = _re(r"(?mi)^host:\s*([^\r\n]+)").search(text)
+        if m: host = m.group(1).strip()[:120]
+
+        # HTTP Basic
+        m = _re(r"(?mi)^authorization:\s*basic\s+([A-Za-z0-9+/=]+)").search(text)
+        if m:
+            try:
+                import base64 as _b64
+                dec = _b64.b64decode(m.group(1) + "==", validate=False).decode("latin-1", "replace")
+                user, _, pw = dec.partition(":")
+            except Exception:
+                user, pw = "?", "?"
+            return {"rule": "CRED", "kind": "HTTP_BASIC",
+                    "host": host, "user": user[:40],
+                    "value": _redact(pw)}
+
+        # HTTP form-encoded password / login / credential field
+        m = _re(r"(?i)(?:^|[&?])(password|passwd|pwd|pass|login|user|username|email)=([^&\r\n ]{1,256})").search(text)
+        if m:
+            return {"rule": "CRED", "kind": "HTTP_FORM",
+                    "host": host, "field": m.group(1).lower(),
+                    "value": _redact(m.group(2))}
+
+    # FTP cleartext
+    if dport == 21 or sport == 21:
+        try:
+            text = payload.decode("latin-1", "replace").strip()
+        except Exception:
+            text = ""
+        m = _re(r"(?i)^USER\s+(\S+)").match(text)
+        if m: return {"rule": "CRED", "kind": "FTP_USER", "user": m.group(1)[:60]}
+        m = _re(r"(?i)^PASS\s+(\S+)").match(text)
+        if m: return {"rule": "CRED", "kind": "FTP_PASS", "value": _redact(m.group(1))}
+
+    # Telnet is just raw bytes — look for "login:" / "password:" prompts
+    # followed by typed text. Very noisy, keep bar high.
+    if dport == 23 or sport == 23:
+        try:
+            text = payload.decode("latin-1", "replace")
+        except Exception:
+            text = ""
+        if "password:" in text.lower() or "login:" in text.lower():
+            return {"rule": "CRED", "kind": "TELNET_LOGIN"}
+
+    return {}
+
+
 def classify(buf: bytes, redirect_from_set) -> dict:
     v = {"flow": flow_hash(buf)}
     if len(buf) < 42: return v
@@ -448,6 +539,17 @@ def classify(buf: bytes, redirect_from_set) -> dict:
                         v["verdict"] = "HIT"
                         v["detail"]  = p
                         break
+        return v
+    if proto == 6 and len(buf) >= 14 + ihl + 20:    # TCP
+        tcp_off = 14 + ihl
+        sp = (buf[tcp_off] << 8) | buf[tcp_off + 1]
+        dp = (buf[tcp_off + 2] << 8) | buf[tcp_off + 3]
+        tcp_hdr = ((buf[tcp_off + 12] >> 4) & 0x0F) * 4
+        pay_off = tcp_off + tcp_hdr
+        if pay_off < len(buf):
+            cred = sniff_creds(buf[pay_off:], dp, sp)
+            if cred:
+                v.update(cred)
     return v
 
 
