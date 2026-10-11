@@ -293,16 +293,25 @@ def run(path, stop_event=None):
         # modifier + key(s) line
         mod = 0
         keys = []
+        all_mods = True
         for tok in line.split():
             up_t = tok.upper()
             if up_t in MOD:
                 mod |= MOD[up_t]
             else:
+                all_mods = False
                 m, k = key_of(tok, lay)
                 mod |= m
                 if k: keys.append(k)
         if keys:
             press(fd, mod, keys[0], keys[1] if len(keys) > 1 else 0)
+            if default_delay: time.sleep(default_delay / 1000.0)
+            return True
+        # Modifier-only line (e.g. GUI alone to open Windows Start, or ALT
+        # alone). Previously these were no-ops because `if keys:` guarded
+        # the press. Send a modifier-only press + release.
+        if mod and all_mods:
+            press(fd, mod, 0)
             if default_delay: time.sleep(default_delay / 1000.0)
             return True
         return False
