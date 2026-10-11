@@ -1,4 +1,4 @@
-# GhostLink — passthrough firmware for the Luckfox WebBee
+# GhostLink. passthrough firmware for the Luckfox WebBee
 
 A fast-boot Buildroot-based firmware that turns the Luckfox WebBee (RV1106,
 SPI NAND, USB-C, 10/100 Ethernet, SD slot) into a transparent **man-in-the-wire**
