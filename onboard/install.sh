@@ -15,14 +15,16 @@ DEST=/root/ghostlink
 mkdir -p "$DEST" "$DEST/logs" "$DEST/records" "$DEST/verdicts" \
          "$DEST/layouts" "$DEST/payloads" "$DEST/extensions"
 # don't clobber a user-edited config
-if [ ! -f "$DEST/config.txt" ]; then cp config.txt "$DEST/config.txt"; fi
-for f in sniff.py webui.py ducky.py redirect302.py ghostlink.sh button.py forwarder.py; do
-    # strip CRLF — the project files on git are shipped from Windows and
-    # busybox's `sh` chokes on \r (treats `set -eu\r` as "illegal option -")
+if [ ! -f "$DEST/config.txt" ]; then
+    tr -d '\r' < config.txt > "$DEST/config.txt"
+fi
+# strip CRLF from every .py / .sh / .ducky / .txt we ship — the project
+# files are edited on Windows and busybox's `sh` chokes on \r.
+for f in *.py *.sh; do
+    [ -f "$f" ] || continue
+    [ "$f" = "install.sh" ] && continue   # we re-exec'd ourselves above
     tr -d '\r' < "$f" > "$DEST/$f"
 done
-# hid_enable.sh — manual HID rebind helper, only pushed if present
-[ -f hid_enable.sh ] && tr -d '\r' < hid_enable.sh > "$DEST/hid_enable.sh" || true
 cp layouts/*.json "$DEST/layouts/" 2>/dev/null || true
 # vendored web assets (xterm.js etc.) served from /xterm.js, /xterm.css, ...
 mkdir -p "$DEST/web"
@@ -38,7 +40,10 @@ mkdir -p "$DEST/extensions/hak5"
 cp extensions/hak5/*.txt   "$DEST/extensions/hak5/" 2>/dev/null || true
 cp extensions/hak5/*.ducky "$DEST/extensions/hak5/" 2>/dev/null || true
 chmod +x "$DEST"/*.sh "$DEST"/*.py
-install -m 0755 S99ghost /etc/init.d/S99ghost
+# Strip CRLF from S99ghost too — busybox init refuses "set -eu\r".
+tr -d '\r' < S99ghost > /tmp/S99ghost.lf
+install -m 0755 /tmp/S99ghost.lf /etc/init.d/S99ghost
+rm -f /tmp/S99ghost.lf
 
 # One-time patch to /etc/init.d/S50usbdevice so it sources identity.env from
 # our dir. Idempotent — a sentinel comment stops us from patching twice.

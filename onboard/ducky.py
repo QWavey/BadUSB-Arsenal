@@ -119,19 +119,26 @@ def _cfg_log(msg):
     except Exception: pass
 
 
+_PRESS_FAIL_LOGGED = False
 def press(fd, mod, k1, k2=0, dwell_ms: int = 3):
     """Send a boot-keyboard press then release report. A short dwell between
     the two reports is required — some hosts (notably Windows at 125 Hz USB
     poll) will coalesce back-to-back reports and miss the key, which looked
     on the German layout like the comma "hanging" (the . → , transition
     appeared to drop keys)."""
+    global _PRESS_FAIL_LOGGED
     rep = bytes([mod, 0, k1, k2, 0, 0, 0, 0])
     try:
         os.write(fd, rep)
         if dwell_ms: time.sleep(dwell_ms / 1000.0)
         os.write(fd, b"\x00" * 8)
-    except OSError:
-        pass
+    except OSError as e:
+        # Log the first write-failure per process so a silent "payload
+        # ran but nothing typed" (no /dev/hidg0, HID not enabled, etc.)
+        # shows up in ghostlink.log instead of appearing successful.
+        if not _PRESS_FAIL_LOGGED:
+            _PRESS_FAIL_LOGGED = True
+            _cfg_log(f"press() OSError: {e} — HID likely disabled or /dev/hidg0 missing")
 
 
 def key_of(name, lay):
@@ -469,15 +476,13 @@ class Interp:
             return
 
         # ATTACKMODE / LED_* / LCD_* / EXFIL are advisory on this device
-        if u.startswith(("ATTACKMODE ", "LED_", "LCD_", "EXFIL ", "RESTART_PAYLOAD",
-                         "RESET", "DISABLE_BUTTON", "ENABLE_BUTTON",
-                         "SAVE_HOST_KEYBOARD_LOCK_STATE",
-                         "RESTORE_HOST_KEYBOARD_LOCK_STATE",
-                         "WAIT_FOR_HOST_LOCK_STATE_CHANGE",
-                         "ATTACKMODE")) or u in ("END", "FINISH",
-                                                 "PAYLOAD_FINISHED",
-                                                 "SAVE_HOST_KEYBOARD_LOCK_STATE",
-                                                 "RESTORE_HOST_KEYBOARD_LOCK_STATE"):
+        if u.startswith(("ATTACKMODE ", "LED_", "LCD_", "EXFIL ", "RESTART_PAYLOAD ",
+                         "RESET ", "DISABLE_BUTTON", "ENABLE_BUTTON",
+                         "WAIT_FOR_HOST_LOCK_STATE_CHANGE")) \
+           or u in ("END", "FINISH", "PAYLOAD_FINISHED", "ATTACKMODE", "RESET",
+                    "RESTART_PAYLOAD",
+                    "SAVE_HOST_KEYBOARD_LOCK_STATE",
+                    "RESTORE_HOST_KEYBOARD_LOCK_STATE"):
             _cfg_log(f"advisory: {s[:80]}")
             return
 
@@ -595,7 +600,15 @@ class Interp:
                     guard -= 1
                 continue
 
-            r = self._run_line(raw)
+            try:
+                r = self._run_line(raw)
+            except Exception as e:
+                # Report with the source line number so a syntax error in
+                # a long script says WHERE instead of just dying silently.
+                sys.stderr.write(f"ducky: line {i+1}: {type(e).__name__}: {e}\n")
+                sys.stderr.write(f"       -> {raw.rstrip()[:120]}\n")
+                _cfg_log(f"line {i+1} {type(e).__name__}: {e}")
+                return
             i += 1
             if r is None:
                 # record repeatable commands for REPEAT N

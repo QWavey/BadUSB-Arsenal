@@ -45,6 +45,10 @@ ID_ENV     = ROOT / "identity.env"   # clone-identity override (sourced by S50)
 HONEY_DIR  = ROOT / "honeypot"       # honeypot assets + captured loot
 HONEY_HTML = HONEY_DIR / "index.html"
 HONEY_LOOT = HONEY_DIR / "loot.jsonl"
+TIMELINE   = ROOT / "logs" / "timeline.jsonl"  # Attack Timeline event log
+_HONEY_RATE = {}  # ip -> [timestamps] for honeypot submit rate limit
+_CFG_LOCK   = threading.Lock()  # serialize /api/config read-modify-write
+_TL_LOCK    = threading.Lock()
 LOG_PATH   = ROOT / "logs" / "ghostlink.log"
 STATS_PATH = Path("/tmp/ghostlink.stats.json")
 LEASE_PATH = Path("/tmp/dnsmasq.leases")
@@ -68,6 +72,26 @@ def _session_new(user: str) -> str:
     with SESSION_LOCK:
         SESSIONS[tok] = (user, time.time() + SESSION_TTL)
     return tok
+
+
+def _session_gc_loop():
+    """Background sweep so expired sessions don't live forever when nobody
+    presents the token again. Runs every 5 min; a single scan is O(n) but
+    SESSIONS is bounded by concurrent-users-ever, which is tiny."""
+    while True:
+        try:
+            time.sleep(300)
+            now = time.time()
+            expired = []
+            with SESSION_LOCK:
+                for tok, (u, exp) in list(SESSIONS.items()):
+                    if now > exp:
+                        del SESSIONS[tok]
+                        expired.append(tok)
+            for tok in expired:
+                try: pty_close(tok)
+                except Exception: pass
+        except Exception: pass
 
 
 def _session_valid(tok: str) -> str:
@@ -296,6 +320,7 @@ BUTTON_TAP_WINDOW_MS=600
 BUTTON_HOLD_MS=1200
 NET_MODE=PASSIVE
 LIVESAVE=TRUE
+WEBUI_REQUIRE_AUTH=FALSE
 HONEYPOT=FALSE
 HONEYPOT_IP=172.32.0.254
 HONEYPOT_REDIRECT_AFTER=
@@ -340,7 +365,7 @@ HTML = r"""<!doctype html>
     <button class="tablinks"        data-tab="Scripting">Scripting</button>
     <button class="tablinks"        data-tab="LiveType">Live Type</button>
     <button class="tablinks"        data-tab="Clone">Clone</button>
-    <button class="tablinks"        data-tab="Honeypot">Honeypot</button>
+    <button class="tablinks"        data-tab="Honeypot">Honeypot<span id="hpNavBadge" class="nav-badge" style="display:none;"></span></button>
     <button class="tablinks"        data-tab="Terminal">Terminal</button>
     <button class="tablinks"        data-tab="System">System</button>
   </nav>
@@ -401,6 +426,24 @@ HTML = r"""<!doctype html>
             <th>frame</th><th>t</th><th>flow</th><th>sz</th><th>rule</th><th>host / detail</th>
           </tr></thead>
           <tbody id="verdicts-body"><tr><td colspan="6" class="dim">waiting&hellip;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Attack Timeline — play-by-play of significant events (redirects
+         fired, honeypot captures, button taps). Persists across reboots. -->
+    <div class="section">
+      <div class="flex-row" style="justify-content:space-between; align-items:center;">
+        <h4>Attack Timeline <span class="dim">(play-by-play)</span></h4>
+        <div class="flex-row" style="gap:6px;">
+          <button class="btn-ghost" onclick="tlRefresh()">Refresh</button>
+          <button class="btn-ghost" onclick="tlClear()">Clear</button>
+        </div>
+      </div>
+      <div class="table-wrap" style="max-height:260px; overflow:auto;">
+        <table class="t-verdicts">
+          <thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead>
+          <tbody id="timelineBody"><tr><td colspan="3" class="dim">no events yet</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -868,6 +911,7 @@ HTML = r"""<!doctype html>
         <h4>Captured loot</h4>
         <div class="flex-row" style="gap:8px;">
           <button class="btn-ghost" onclick="hpReloadLoot()">Refresh</button>
+          <a class="btn-ghost" href="/api/honeypot/loot_download" download="loot.jsonl">Download</a>
           <button class="btn-ghost" onclick="hpClearLoot()">Clear</button>
         </div>
       </div>
@@ -932,6 +976,30 @@ HTML = r"""<!doctype html>
       <h4>ghostlink.log <span class="dim">(tail)</span></h4>
       <pre id="log" class="log-pane"></pre>
     </div>
+    <!-- Portable config bundle — tar.gz of config.txt, identity.env,
+         honeypot HTML, payloads, extensions. Export → download, Import
+         restores onto a sibling device so a loadout survives reflashes
+         and migrates to a second WebBee. -->
+    <div class="section">
+      <h4>Portable config bundle</h4>
+      <p class="dim" style="font-size:12px;">
+        Export the device's full loadout — config, identity override,
+        honeypot HTML, payloads and extensions — as one tar.gz. Import
+        the same file on a sibling WebBee (or after a reflash) to
+        restore. Secrets travel with the bundle, so handle it like a key.
+      </p>
+      <div class="flex-row" style="gap:8px;">
+        <a class="btn-primary" href="/api/bundle/export" download>Export bundle</a>
+        <label class="btn-ghost" style="position:relative; overflow:hidden; cursor:pointer;">
+          Import bundle
+          <input id="bundleFile" type="file" accept=".tar.gz,.tgz"
+                 style="position:absolute; inset:0; opacity:0; cursor:pointer;"
+                 onchange="bundleImport(this)">
+        </label>
+        <span id="bundleMsg" class="dim" style="font-size:12px;"></span>
+      </div>
+    </div>
+
     <div class="section">
       <h4>Danger</h4>
       <button class="danger" onclick="reboot()">Reboot Device</button>
@@ -1199,6 +1267,15 @@ tbody tr:hover { background: rgba(76,175,80,0.05); }
 }
 .t-verdicts tr.cred { background: rgba(244, 67, 54, 0.08); }
 .t-verdicts tr.cred:hover { background: rgba(244, 67, 54, 0.14); }
+
+/* Nav badge: shows the live loot-count on the Honeypot tab button so the
+   admin notices captures without opening the tab. */
+.nav-badge {
+  display: inline-block; margin-left: 6px;
+  background: var(--danger); color: #fff;
+  font-size: 10px; font-weight: 700;
+  padding: 1px 6px; border-radius: 10px; vertical-align: middle;
+}
 
 /* Segmented mode toggle on the Live pane */
 .seg-btn {
@@ -1551,7 +1628,10 @@ label.sw input:checked + .slider:before { transform: translateX(22px); }
 JS = r"""
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
-const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// Also escapes ' and ` so values interpolated into single-quoted
+// attributes (e.g. onclick="fn('${esc(x)}')") can't break out and run
+// code — a DHCP client could set its hostname to malicious JS otherwise.
+const esc = s => String(s ?? '').replace(/[&<>"'`]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'}[c]));
 
 function fmtBytes(n) {
   if (n == null) return '-';
@@ -1945,17 +2025,26 @@ async function hostsRefresh() {
     const os = h.os || {};
     const osLabel = os.guess === 'unknown' ? '-' : os.guess;
     const osTitle = (os.hints || []).join(' + ');
-    const vMac = esc(h.mac || '');
-    const vHn  = esc(h.hostname || '');
+    // Pass mac + hostname via data-* attributes (not interpolated into
+    // onclick strings) so a DHCP client that sets a malicious hostname
+    // can't break out of the attribute. esc() + attribute-value escape
+    // of ' and ` are redundant then, but kept for defense in depth.
     return `<tr${h.active ? '' : ' class="dim"'}>
       <td>${esc(h.hostname || '(unknown)')}</td>
       <td>${esc(h.ip)}</td>
-      <td><code>${vMac}</code></td>
+      <td><code>${esc(h.mac || '')}</code></td>
       <td>${esc(h.vendor || '-')}</td>
       <td title="${esc(osTitle)}">${esc(osLabel)}</td>
-      <td><button class="btn-ghost" onclick="cloneHost('${vMac}','${vHn}')">Clone</button></td>
+      <td><button class="btn-ghost js-clone-host" data-mac="${esc(h.mac || '')}" data-hn="${esc(h.hostname || '')}">Clone</button></td>
     </tr>`;
   }).join('');
+  // Bind once per paint — removes any stale listeners from the previous
+  // table and re-attaches to the new DOM.
+  body.querySelectorAll('.js-clone-host').forEach(btn => {
+    btn.addEventListener('click', e => {
+      cloneHost(btn.dataset.mac || '', btn.dataset.hn || '');
+    });
+  });
 }
 
 async function cloneHost(mac, hostname) {
@@ -2089,6 +2178,74 @@ function hpPreview() {
   w.document.open(); w.document.write(html); w.document.close();
 }
 
+async function bundleImport(input) {
+  const f = input.files && input.files[0]; if (!f) return;
+  const msg = $('#bundleMsg');
+  if (!confirm(`Import "${f.name}"? Overwrites config.txt, honeypot HTML, payloads and extensions.`)) {
+    input.value = ''; return;
+  }
+  if (msg) msg.textContent = 'uploading…';
+  try {
+    const data = await f.arrayBuffer();
+    const r = await fetch('/api/bundle/import', {
+      method:'POST', credentials:'same-origin',
+      headers:{'Content-Type':'application/gzip'},
+      body: data,
+    });
+    const j = await r.json();
+    if (j.ok) {
+      if (msg) msg.textContent = `imported ${j.count} entries`;
+      toast('bundle imported — reload to see new config');
+      loadCfg();
+    } else {
+      if (msg) msg.textContent = 'import failed: ' + (j.err||'');
+    }
+  } catch(e) {
+    if (msg) msg.textContent = 'import failed: ' + e;
+  }
+  input.value = '';
+}
+
+async function tlRefresh() {
+  let evs; try { evs = await api('/api/timeline?limit=200'); } catch(e) { return; }
+  const body = $('#timelineBody'); if (!body) return;
+  if (!evs || !evs.length) {
+    body.innerHTML = '<tr><td colspan="3" class="dim">no events yet</td></tr>';
+    return;
+  }
+  const ICONS = {
+    honeypot_cred: '🎯', honeypot_serve: '🪝', redirect: '↪',
+    button_fire:   '●',  hid_press:      '⌨',  net_mode:   '⇄',
+  };
+  body.innerHTML = evs.map(e => {
+    const i = ICONS[e.kind] || '•';
+    const det = Object.entries(e).filter(([k]) => !['t','ts','kind'].includes(k))
+      .map(([k,v]) => `<code>${esc(k)}=${esc(String(v).slice(0,80))}</code>`).join(' ');
+    return `<tr>
+      <td class="dim">${esc(e.ts)}</td>
+      <td><b>${i} ${esc(e.kind)}</b></td>
+      <td>${det}</td>
+    </tr>`;
+  }).join('');
+}
+async function tlClear() {
+  if (!confirm('Clear the Attack Timeline log?')) return;
+  await api('/api/timeline/clear', { method:'POST' });
+  tlRefresh();
+}
+
+async function hpPollBadge() {
+  // Lightweight: just status, no loot payload. Shows the live capture
+  // count on the Honeypot nav button so a new capture is visible without
+  // navigating to the tab.
+  let s;
+  try { s = await api('/api/honeypot/status'); } catch(e) { return; }
+  const b = $('#hpNavBadge'); if (!b) return;
+  const n = s.loot_count || 0;
+  if (n > 0) { b.style.display = 'inline-block'; b.textContent = n > 99 ? '99+' : n; }
+  else       { b.style.display = 'none'; }
+}
+
 async function hpSaveIp() {
   const v = (($('#hpIp') && $('#hpIp').value) || '').trim();
   // Loose check — accept blank (= disable), else a dotted-quad.
@@ -2220,9 +2377,13 @@ async function toggleRecord() {
 }
 
 async function applyStandard() {
+  // Two-step confirm — reset wipes DNS spoofing, HID options, honeypot
+  // rules, button payloads and more. Easy to click away by accident.
   if (!confirm('Overwrite config.txt with the shipped defaults?\n\n'
              + 'This keeps the device password at root/ghostlink — change it after.'))
     return;
+  const typed = prompt('Type RESET to confirm. Everything in config.txt will be overwritten.');
+  if (typed !== 'RESET') { toast('cancelled'); return; }
   const r = await api('/api/config/defaults', { method:'POST' });
   if (r.ok) { toast('defaults applied'); loadCfg(); tick(); }
   else      { toast('apply failed: ' + (r.err||''), true); }
@@ -2831,6 +2992,14 @@ function bindTerminal() {
   loadCfg();
   tick();
   setInterval(tick, 2000);
+  // Poll the honeypot loot count independently of opening the tab, so a
+  // new capture lights up the nav badge within ~5 s.
+  setInterval(hpPollBadge, 5000);
+  hpPollBadge();
+  // Attack Timeline — refresh every 3 s while on the Live tab.
+  setInterval(() => {
+    const live = $('#tab-Live'); if (live && live.style.display !== 'none') tlRefresh();
+  }, 3000);
   refreshNetLink();
   setInterval(refreshNetLink, 2500);
   // live-save for switches
@@ -3004,6 +3173,63 @@ def _check_internet(timeout=1.5):
         except Exception: pass
 
 
+def _timeline(kind, **fields):
+    """Append one event to the Attack Timeline (persistent across reboots
+    unless cleared). This is the device's play-by-play — what redirects
+    fired, what the honeypot caught, what button taps did, what HID keys
+    were typed. The Live tab renders it as a scrubbable thread. One line
+    per event, max ~500 bytes."""
+    rec = {"t": int(time.time()), "ts": time.strftime("%H:%M:%S"), "kind": kind}
+    rec.update(fields)
+    try:
+        with _TL_LOCK:
+            TIMELINE.parent.mkdir(parents=True, exist_ok=True)
+            # Hard cap: roll over at 2 MB
+            if TIMELINE.exists() and TIMELINE.stat().st_size > 2 * 1024 * 1024:
+                tail = TIMELINE.read_bytes()[-512*1024:]
+                TIMELINE.write_bytes(tail)
+            with open(TIMELINE, "a") as f:
+                f.write(json.dumps(rec)[:1024] + "\n")
+    except Exception: pass
+
+
+def _ip_as_int(s):
+    try:
+        parts = [int(x) for x in s.strip().split(".")]
+        if len(parts) != 4 or any(p < 0 or p > 255 for p in parts): return None
+        return (parts[0]<<24) | (parts[1]<<16) | (parts[2]<<8) | parts[3]
+    except Exception:
+        return None
+
+
+def _ip_collides(ip, cfg):
+    """Return True if `ip` collides with the primary device IP on the
+    DNSMASQ_IFACE OR falls inside the DHCP range. Both would be bad as a
+    honeypot secondary — the first masquerades the admin UI, the second
+    races with lease assignment."""
+    v = _ip_as_int(ip)
+    if v is None: return True   # malformed → treat as collision
+    iface = cfg.get("DNSMASQ_IFACE","usb0") or "usb0"
+    # 1) primary IP on the iface
+    try:
+        r = subprocess.run(["ip","-4","-o","addr","show","dev",iface],
+                           capture_output=True, text=True, timeout=2)
+        for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)/", r.stdout):
+            if _ip_as_int(m.group(1)) == v:
+                return True
+    except Exception: pass
+    # 2) DHCP range (DHCP_RANGE=lo,hi,mask,ttl)
+    dr = cfg.get("DHCP_RANGE","") or ""
+    try:
+        parts = dr.split(",")
+        if len(parts) >= 2:
+            lo = _ip_as_int(parts[0]); hi = _ip_as_int(parts[1])
+            if lo is not None and hi is not None and lo <= v <= hi:
+                return True
+    except Exception: pass
+    return False
+
+
 def _honeypot_apply_ip(cfg=None):
     """Add the honeypot's secondary IP to usb0 when HONEYPOT=TRUE, remove
     it when HONEYPOT=FALSE. Idempotent — EEXIST / ENOENT are both fine.
@@ -3050,8 +3276,12 @@ def _honeypot_rules(cfg):
         if not s or s.startswith("#"): continue
         # Drop leading "ON "
         if s.upper().startswith("ON "): s = s[3:].lstrip()
-        # Form A: SIGN_IN  REDIRECT_TO  https://x   (also accepts "=")
-        m = re.match(r"^SIGN_IN\s*=?\s*REDIRECT(?:_TO)?\s+(\S+)\s*$", s, re.IGNORECASE)
+        # Form A: SIGN_IN  REDIRECT[_TO] [to]  https://x   (also accepts "=")
+        # The optional "to" keyword matches the user's own example wording
+        # (`ON SIGN_IN = REDIRECT to google.com`), which earlier was silently
+        # dropped because the plain "to" ate the URL slot.
+        m = re.match(r"^SIGN_IN\s*=?\s*REDIRECT(?:_TO)?\s+(?:to\s+)?(\S+)\s*$",
+                     s, re.IGNORECASE)
         if m:
             out.append({"trigger": "SIGN_IN", "to": m.group(1)})
             continue
@@ -3225,6 +3455,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send_json({"ok": False, "err": "auth required"}, code=401)
         return False
 
+    def _require_admin(self):
+        """Admin-POST gate. If config has `WEBUI_REQUIRE_AUTH=TRUE`, the
+        request must carry a valid session. Default FALSE preserves the
+        pre-auth behavior for /api/config / /api/clone / /api/honeypot
+        etc. — flipping it on turns the device into a locked-down
+        appliance without touching every endpoint."""
+        try: cfg = load_cfg()
+        except Exception: cfg = {}
+        if cfg.get("WEBUI_REQUIRE_AUTH","FALSE").upper() != "TRUE":
+            return True
+        return self._require_auth()
+
     def _client_ip(self):
         return self.client_address[0] if self.client_address else "?"
 
@@ -3352,6 +3594,8 @@ document.addEventListener('submit', function(e){
             with open(LOG_PATH, "a") as f:
                 f.write(f"{time.strftime('%H:%M:%S')} webui HONEYPOT serve Host={host} path={self.path}\n")
         except Exception: pass
+        _timeline("honeypot_serve", host=host, ip=self._client_ip(),
+                  on_hp_ip=hit_hp_ip, path=self.path[:80])
         return True
 
     def _maybe_redirect(self):
@@ -3396,6 +3640,7 @@ document.addEventListener('submit', function(e){
             with open(LOG_PATH, "a") as f:
                 f.write(f"{time.strftime('%H:%M:%S')} webui 302 Host={host} path={self.path} -> {loc}\n")
         except Exception: pass
+        _timeline("redirect", host=host, ip=self._client_ip(), to=loc[:200])
         return True
 
     def do_GET(self):
@@ -3584,6 +3829,55 @@ document.addEventListener('submit', function(e){
                 "ip_bound":       ip_bound,
                 "url":            f"http://{hp_ip}/" if hp_ip else "",
             })
+        elif p == "/api/bundle/export":
+            # Portable device bundle — a .tar.gz of config.txt + payloads/
+            # + extensions/ + honeypot HTML + identity.env. Hand off to a
+            # second WebBee by uploading to /api/bundle/import. Secrets
+            # survive (WEBUI_PASS, trap rules, cloned identity).
+            import io, tarfile
+            buf = io.BytesIO()
+            try:
+                with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                    def add(path, arcname):
+                        if path.exists():
+                            tar.add(str(path), arcname=arcname)
+                    add(CFG_PATH,   "config.txt")
+                    add(ID_ENV,     "identity.env")
+                    add(HONEY_HTML, "honeypot/index.html")
+                    add(PAY_DIR,    "payloads")
+                    add(EXT_DIR,    "extensions")
+            except Exception as e:
+                return self._send(500, "text/plain", f"export err: {e}")
+            data = buf.getvalue()
+            fname = f"ghostlink-bundle-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+            self._send(200, "application/gzip", data,
+                       extra={"Content-Disposition": f'attachment; filename="{fname}"'})
+        elif p == "/api/timeline":
+            # Return the tail of the Attack Timeline. Caller may pass
+            # ?limit=200 (default) and ?since=<unix_t> to tail. One line
+            # per event, newest first.
+            qs = parse_qs(u.query)
+            try: limit = min(2000, int(qs.get("limit", ["200"])[0]))
+            except (TypeError, ValueError): limit = 200
+            try: since = int(qs.get("since", ["0"])[0])
+            except (TypeError, ValueError): since = 0
+            out = []
+            if TIMELINE.exists():
+                try:
+                    data = TIMELINE.read_text(encoding="utf-8", errors="replace")
+                    for ln in reversed(data.splitlines()):
+                        try: ev = json.loads(ln)
+                        except Exception: continue
+                        if since and ev.get("t", 0) <= since: break
+                        out.append(ev)
+                        if len(out) >= limit: break
+                except Exception: pass
+            self._send_json(out)
+        elif p == "/api/honeypot/loot_download":
+            if not HONEY_LOOT.exists():
+                return self._send(404, "text/plain", "no loot\n")
+            self._send(200, "application/octet-stream", HONEY_LOOT.read_bytes(),
+                       extra={"Content-Disposition": 'attachment; filename="loot.jsonl"'})
         elif p == "/api/honeypot/loot":
             out = []
             if HONEY_LOOT.exists():
@@ -3686,6 +3980,7 @@ document.addEventListener('submit', function(e){
             return self._send(413, "text/plain", "payload too large\n")
         body = self.rfile.read(n) if n else b""
         if u.path == "/api/config":
+            if not self._require_admin(): return
             # Only reload dnsmasq if a DHCP/DNS/REDIRECT key actually
             # changed. Flipping ENABLE_HID or BUTTON_PAYLOAD does NOT need
             # a reload, and the 0.3-0.8 s dnsmasq restart gap was long
@@ -3698,10 +3993,29 @@ document.addEventListener('submit', function(e){
                         "REDIRECT_TO", "DNS_SPOOF", "DNS_SPOOF_HOSTS",
                         "HONEYPOT_RULES")
             HP_KEYS  = ("HONEYPOT", "HONEYPOT_IP", "DNSMASQ_IFACE")
-            old = load_cfg()
-            tmp = CFG_PATH.with_suffix(".new")
-            tmp.write_bytes(body); tmp.replace(CFG_PATH)
-            new = load_cfg()
+            # Serialize config writes — a parallel bindLiveSave + cfgSave
+            # otherwise lost one of the two edits. One holder at a time
+            # keeps the read-modify-write atomic.
+            with _CFG_LOCK:
+                old = load_cfg()
+                # Snapshot raw bytes so a validation failure can roll back
+                # the whole file, comments and all.
+                prev_raw = CFG_PATH.read_bytes() if CFG_PATH.exists() else b""
+                tmp = CFG_PATH.with_suffix(".new")
+                tmp.write_bytes(body); tmp.replace(CFG_PATH)
+                new = load_cfg()
+                # Guard HONEYPOT_IP: refuse if it collides with the device's
+                # primary usb0 IP (would masquerade the admin UI) or sits
+                # inside the DHCP lease range (would collide with a client's
+                # assigned IP once leases roll).
+                hp_ip = (new.get("HONEYPOT_IP","") or "").strip()
+                if hp_ip and _ip_collides(hp_ip, new):
+                    tmp = CFG_PATH.with_suffix(".new")
+                    tmp.write_bytes(prev_raw); tmp.replace(CFG_PATH)
+                    return self._send_json({
+                        "ok": False,
+                        "err": f"HONEYPOT_IP {hp_ip} collides with primary IP or DHCP range — pick a free IP (e.g. 172.32.0.254)",
+                    }, code=400)
             need_reload = any(old.get(k, "") != new.get(k, "") for k in NET_KEYS)
             if need_reload:
                 try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
@@ -3729,6 +4043,7 @@ document.addEventListener('submit', function(e){
             # SSH-watchdog procedure, which is the only approved path.
             return self._send_json({"ok": True})
         if u.path == "/api/clear":
+            if not self._require_admin(): return
             removed = 0
             for d, pat in ((REC_DIR,"*.pcap"), (VER_DIR,"*.jsonl")):
                 if not d.exists(): continue
@@ -3764,6 +4079,7 @@ document.addEventListener('submit', function(e){
             ok = subprocess.call(["python3", str(ROOT/"ducky.py"), str(target)]) == 0
             return self._send_json({"ok": ok}, code=200 if ok else 500)
         if u.path == "/api/reboot":
+            if not self._require_admin(): return
             self._send_json({"ok": True})
             threading.Thread(target=lambda: (time.sleep(1), os.system("reboot"))).start()
             return
@@ -3794,6 +4110,7 @@ document.addEventListener('submit', function(e){
         # list. Build a plausible USB identity from it: Microsoft/Apple/etc
         # VID/PID presets based on the OUI vendor, hostname → serial.
         if u.path == "/api/clone/host_apply":
+            if not self._require_admin(): return
             try: data = json.loads(body)
             except Exception: data = {}
             mac = (data.get("mac") or "").strip()
@@ -3825,9 +4142,14 @@ document.addEventListener('submit', function(e){
                 return s.strip()[:n]
             ser = _clean(mac.replace(":", "").replace("-", "").upper()[-6:] or hostname, 32)
             prod_out = _clean(hostname, 64) or prod
+            # Even the metadata comment goes through _clean so a hostname
+            # containing \n + a crafted "USB_VID=..." line can't inject
+            # shell variables that S50usbdevice sources as root.
+            mac_c  = _clean(mac, 32)
+            host_c = _clean(hostname, 64)
             lines = [
                 "# GhostLink identity override — generated by Clone-host.",
-                f"# Cloned from mac={mac} hostname={hostname} vendor={vendor or 'unknown'}",
+                f"# Cloned from mac={mac_c} hostname={host_c} vendor={vendor or 'unknown'}",
                 f'USB_VID="{vid}"',
                 f'USB_PID="{pid}"',
                 f'USB_MFR="{mfr}"',
@@ -3849,8 +4171,25 @@ document.addEventListener('submit', function(e){
 
         # ---- Honeypot: upload a custom index.html -----------------------
         if u.path == "/api/honeypot/index":
+            if not self._require_admin(): return
             if len(body) > 256 * 1024:
                 return self._send_json({"ok": False, "err": "html too large"}, code=413)
+            # Empty body = user asked for "reset to bundled default" (we
+            # unlink and fall through to DEFAULT_HONEYPOT_HTML on serve).
+            if not body.strip():
+                try:
+                    if HONEY_HTML.exists(): HONEY_HTML.unlink()
+                    return self._send_json({"ok": True, "size": 0, "mode": "reset"})
+                except Exception as e:
+                    return self._send_json({"ok": False, "err": str(e)}, code=500)
+            # Soft sanity-check: must at least look like HTML or an HTML
+            # fragment. Not strict parsing — we just reject obviously
+            # mis-typed binary paste.
+            if not re.search(rb"(?i)<\s*(html|body|form|div|p|script|!doctype)\b", body[:1024]):
+                return self._send_json({
+                    "ok": False,
+                    "err": "doesn't look like HTML (no <html>/<form>/<div> in the first 1 KB)",
+                }, code=400)
             HONEY_DIR.mkdir(parents=True, exist_ok=True)
             try:
                 tmp = HONEY_HTML.with_suffix(".new")
@@ -3866,6 +4205,22 @@ document.addEventListener('submit', function(e){
         # (or back to the real site).
         if u.path == "/_honeypot_submit":
             cfg = load_cfg()
+            # Rate-limit per client IP: at most 10 submits / 10 s and a hard
+            # cap of 10 000 loot records on disk. Prevents a hostile victim
+            # (or a bot that found the honeypot) from filling flash.
+            ip = self._client_ip()
+            now = time.time()
+            buf = _HONEY_RATE.setdefault(ip, [])
+            buf[:] = [t for t in buf if t > now - 10]
+            if len(buf) >= 10:
+                return self._send_json({"ok": False, "err": "rate limit"}, code=429)
+            buf.append(now)
+            try:
+                if HONEY_LOOT.exists() and HONEY_LOOT.stat().st_size > 4 * 1024 * 1024:
+                    # 4 MB cap — roll over, keep the last 1 MB tail
+                    data = HONEY_LOOT.read_bytes()[-1024*1024:]
+                    HONEY_LOOT.write_bytes(data)
+            except Exception: pass
             # Parse either JSON (preferred, our form-shim) or urlencoded form
             fields = {}
             ct = (self.headers.get("Content-Type") or "").lower()
@@ -3908,6 +4263,8 @@ document.addEventListener('submit', function(e){
                 with open(LOG_PATH, "a") as f:
                     f.write(f"{time.strftime('%H:%M:%S')} honeypot CRED host={rec['host']} ip={rec['ip']} fields={list(rec['data'].keys())}\n")
             except Exception: pass
+            _timeline("honeypot_cred", host=rec["host"], ip=rec["ip"],
+                      fields=list(rec["data"].keys()))
             # Where to send the victim: explicit redirect wins, else parsed
             # rule DSL ON SIGN_IN REDIRECT_TO <url>, else back to host.
             to = cfg.get("HONEYPOT_REDIRECT_AFTER", "").strip()
@@ -3916,11 +4273,70 @@ document.addEventListener('submit', function(e){
                     if rule.get("trigger") == "SIGN_IN" and rule.get("to"):
                         to = rule["to"]; break
             if not to:
-                to = f"https://{rec['host']}/" if rec["host"] else "/"
+                # Avoid bouncing a victim back to the honeypot IP itself —
+                # that creates a short browser loop. Fall through to a
+                # neutral page in that case.
+                host = (rec["host"] or "").strip()
+                hp_ip = (cfg.get("HONEYPOT_IP","") or "").strip()
+                if host and host != hp_ip and host != "172.32.0.93":
+                    to = f"https://{host}/"
+                else:
+                    to = "https://www.google.com/"
             return self._send_json({"ok": True, "to": to})
 
         # ---- Honeypot: delete captured loot (clear log) -----------------
+        if u.path == "/api/bundle/import":
+            if not self._require_admin(): return
+            # Accept a .tar.gz produced by /api/bundle/export. Extract
+            # safely under /root/ghostlink after rejecting any entry whose
+            # name contains ".." or an absolute path (tar traversal).
+            import io, tarfile
+            if len(body) > 16 * 1024 * 1024:
+                return self._send_json({"ok": False, "err": "bundle too large (>16MB)"}, code=413)
+            if len(body) < 32:
+                return self._send_json({"ok": False, "err": "empty / not a tarball"}, code=400)
+            imported = []
+            try:
+                tar = tarfile.open(fileobj=io.BytesIO(body), mode="r:gz")
+            except Exception as e:
+                return self._send_json({"ok": False, "err": f"not a gzip tarball: {e}"}, code=400)
+            try:
+                for m in tar.getmembers():
+                    nm = (m.name or "").replace("\\", "/")
+                    if nm.startswith("/") or ".." in nm.split("/"):
+                        continue
+                    if m.issym() or m.islnk():
+                        continue
+                    if m.isdir():
+                        (ROOT / nm).mkdir(parents=True, exist_ok=True)
+                        continue
+                    if not m.isreg(): continue
+                    f = tar.extractfile(m)
+                    if not f: continue
+                    data = f.read(2 * 1024 * 1024)
+                    dest = ROOT / nm
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.with_suffix(dest.suffix + ".new")
+                    tmp.write_bytes(data); tmp.replace(dest)
+                    imported.append(nm)
+                return self._send_json({"ok": True, "imported": imported[:50],
+                                        "count": len(imported)})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+            finally:
+                try: tar.close()
+                except Exception: pass
+
+        if u.path == "/api/timeline/clear":
+            if not self._require_admin(): return
+            try:
+                if TIMELINE.exists(): TIMELINE.unlink()
+                return self._send_json({"ok": True})
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
+
         if u.path == "/api/honeypot/loot_clear":
+            if not self._require_admin(): return
             try:
                 if HONEY_LOOT.exists(): HONEY_LOOT.unlink()
                 return self._send_json({"ok": True})
@@ -3928,6 +4344,7 @@ document.addEventListener('submit', function(e){
                 return self._send_json({"ok": False, "err": str(e)}, code=500)
 
         if u.path == "/api/clone/identity":
+            if not self._require_admin(): return
             try: data = json.loads(body)
             except Exception: data = {}
             # Validate: VID/PID must be hex-ish or empty; strings sanitized
@@ -3966,6 +4383,7 @@ document.addEventListener('submit', function(e){
 
         # ---- flip network mode (passive / forward) ----------------------
         if u.path == "/api/net/mode":
+            if not self._require_admin(): return
             try: data = json.loads(body)
             except Exception: data = {}
             mode = (data.get("mode") or "").upper()
@@ -4006,6 +4424,7 @@ document.addEventListener('submit', function(e){
 
         # ---- extensions library (save) ----------------------------------
         if u.path.startswith("/api/extensions/"):
+            if not self._require_admin(): return
             name = u.path[len("/api/extensions/"):]
             if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", name):
                 return self._send_json({"ok": False, "err": "bad name"}, code=400)
@@ -4022,6 +4441,7 @@ document.addEventListener('submit', function(e){
 
         # ---- scripts library (save) --------------------------------------
         if u.path.startswith("/api/scripts/") and not u.path.endswith("/rename") and not u.path.endswith("/run"):
+            if not self._require_admin(): return
             name = u.path[len("/api/scripts/"):]
             if not SCRIPT_NAME_RE.match(name):
                 return self._send_json({"ok": False, "err": "bad script name"}, code=400)
@@ -4218,6 +4638,7 @@ document.addEventListener('submit', function(e){
 
         # ---- reset config.txt to canonical defaults ----------------------
         if u.path == "/api/config/defaults":
+            if not self._require_admin(): return
             try:
                 tmp = CFG_PATH.with_suffix(".new")
                 tmp.write_text(DEFAULT_CONFIG, encoding="utf-8")
@@ -4293,6 +4714,8 @@ def main():
     # webui restart without the admin having to toggle in the UI.
     try: _honeypot_apply_ip(cfg)
     except Exception: pass
+    # Reap expired SESSIONS entries so a long-running webui doesn't leak.
+    threading.Thread(target=_session_gc_loop, daemon=True).start()
     try:
         s.serve_forever()
     except KeyboardInterrupt:

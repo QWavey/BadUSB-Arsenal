@@ -59,7 +59,32 @@ def _bind(ifname: str):
     return s
 
 
+PIDFILE = Path("/run/ghostlink-forwarder.pid")
+
+
+def _claim_pidfile():
+    """Single-instance guard — a double-start would create a packet storm
+    (each instance echoes the other's output across usb0 <-> eth0)."""
+    try:
+        if PIDFILE.exists():
+            try: old = int(PIDFILE.read_text().strip())
+            except Exception: old = 0
+            if old and old != os.getpid():
+                try:
+                    os.kill(old, 0)
+                    _log(f"already running as pid {old}, exiting")
+                    return False
+                except OSError:
+                    pass  # stale pidfile
+        PIDFILE.write_text(str(os.getpid()))
+        return True
+    except Exception:
+        return True  # don't block startup if /run isn't writable
+
+
 def main():
+    if not _claim_pidfile():
+        return
     a, b = (sys.argv[1] if len(sys.argv) > 1 else "eth0"), \
            (sys.argv[2] if len(sys.argv) > 2 else "usb0")
     for ifn in (a, b):
@@ -74,15 +99,25 @@ def main():
     mac_a = _get_mac(a); mac_b = _get_mac(b)
     _log(f"up: {a} <-> {b}  (macs {mac_a.hex()} / {mac_b.hex()})")
 
+    err_streak = 0
     try:
         while True:
             r, _, _ = select.select([sa, sb], [], [], 1.0)
             for s in r:
                 try:
                     buf = s.recv(65535)
-                except OSError:
+                except OSError as e:
+                    err_streak += 1
+                    if err_streak > 100:
+                        _log(f"recv error streak hit {err_streak} ({e}); exiting")
+                        return
                     continue
+                if len(buf) == 0:
+                    # iface went down — bail rather than spin.
+                    _log("recv returned 0 bytes; iface down, exiting")
+                    return
                 if len(buf) < 14: continue
+                err_streak = 0
                 src = buf[6:12]
                 # Drop frames we emitted ourselves (prevent self-loop echo).
                 if s is sa:
@@ -96,7 +131,14 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        sa.close(); sb.close()
+        try: sa.close()
+        except Exception: pass
+        try: sb.close()
+        except Exception: pass
+        try:
+            if PIDFILE.exists() and PIDFILE.read_text().strip() == str(os.getpid()):
+                PIDFILE.unlink()
+        except Exception: pass
         _log("forwarder exiting")
 
 
