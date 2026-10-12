@@ -678,7 +678,13 @@ HTML = r"""<!doctype html>
         </div>
         <div class="editor-wrapper" id="editorWrapper">
           <div class="editor-gutter" id="editorGutter">1</div>
-          <textarea id="scriptArea" spellcheck="false" placeholder="REM write DuckyScript here&#10;DELAY 500&#10;GUI r&#10;STRING notepad&#10;ENTER&#10;STRING hello" autocomplete="off" autocorrect="off"></textarea>
+          <!-- Syntax highlight layer: pre renders tokenized HTML, textarea
+               above it has transparent text so the user types "through"
+               the color. Scroll syncs via JS. -->
+          <div class="editor-stack">
+            <pre id="editorHl" class="editor-hl" aria-hidden="true"></pre>
+            <textarea id="scriptArea" spellcheck="false" placeholder="REM write DuckyScript here&#10;DELAY 500&#10;GUI r&#10;STRING notepad&#10;ENTER&#10;STRING hello" autocomplete="off" autocorrect="off"></textarea>
+          </div>
           <div class="autocomplete-popup" id="acPopup"></div>
         </div>
         <div class="editor-foot flex-row">
@@ -1459,6 +1465,58 @@ button.btn-ghost:hover { border-color: var(--primary); color: var(--primary); tr
   overflow: auto;
 }
 .editor-wrapper textarea:focus { border: none; outline: none; }
+
+/* ---- Syntax-highlight overlay ---------------------------------------
+ * The `<pre>` sits beneath the textarea at the same font/metrics; the
+ * textarea on top is given a transparent color + transparent caret-safe
+ * background so the user sees the colored pre underneath. Scroll syncs
+ * so a long script highlights in place without re-rendering every char.
+ */
+.editor-stack {
+  position: relative; flex-grow: 1; display: block;
+}
+.editor-stack .editor-hl,
+.editor-stack textarea {
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 13px; line-height: 20px;
+  padding: 12px 14px; margin: 0;
+  white-space: pre; tab-size: 2;
+  box-sizing: border-box;
+}
+.editor-stack .editor-hl {
+  position: absolute; inset: 0;
+  color: var(--text-main);
+  background: transparent;
+  overflow: auto; pointer-events: none;
+  z-index: 1;
+}
+.editor-stack textarea {
+  position: relative; z-index: 2;
+  background: transparent !important;
+  color: transparent !important;
+  caret-color: var(--primary);
+  width: 100%; height: 100%; min-height: 440px;
+  border: none; outline: none; resize: vertical;
+}
+.editor-stack textarea::selection { background: rgba(76,175,80,0.25); color: transparent; }
+/* token colors — close to the ESP-S3-Key-BadUSB palette */
+.tok-cmd  { color: #c586c0; font-weight: 600; }   /* core commands */
+.tok-mod  { color: #4ec9b0; }                      /* modifiers */
+.tok-key  { color: #569cd6; }                      /* named keys */
+.tok-gl   { color: #dcdcaa; font-weight: 600; }    /* GhostLink extensions */
+.tok-adv  { color: #d19a66; font-style: italic; }  /* advisory (hw not present) */
+.tok-rem  { color: #6a9955; font-style: italic; }  /* comments */
+.tok-str  { color: #ce9178; }                      /* STRING literal body */
+.tok-num  { color: #b5cea8; }                      /* integers / delays */
+.tok-var  { color: #9cdcfe; }                      /* $VAR references */
+.tok-err  { background: rgba(244,67,54,0.15); text-decoration: underline wavy #f44336; }
+
+/* gutter: show line numbers + an inline error dot per bad line */
+.editor-gutter .gl { display: block; height: 20px; line-height: 20px; }
+.editor-gutter .gl.err { color: var(--danger); font-weight: 700; }
+.editor-gutter .gl.err::before { content: "●"; margin-right: 2px; }
+.editor-foot .issue-line { color: var(--danger); cursor: pointer; margin-left: 8px; }
+.editor-foot .issue-line:hover { text-decoration: underline; }
 .editor-foot {
   padding: 8px 14px;
   background: var(--bg-section);
@@ -2459,38 +2517,215 @@ const DUCKY_KEYWORDS = [
   {w:'MENU',kind:'key'},{w:'APP',kind:'key'},
 ];
 for (let i = 1; i <= 12; i++) DUCKY_KEYWORDS.push({w:`F${i}`, kind:'key'});
+
+// ---- ESP-S3-Key-BadUSB parity commands ---------------------------------
+// Fully handled by ducky.py
+const DS_FULL = [
+  ['STRING_BASH','cmd','type + press ENTER, bash-safe timing'],
+  ['STRING_POWERSHELL','cmd','type + press ENTER, PS-safe timing'],
+  ['STRINGLN','cmd','STRING + ENTER'],
+  ['KEYCODE','cmd','KEYCODE <mod> <k1> [k2] — raw HID bytes'],
+  ['INJECT_MOD','cmd','INJECT_MOD <mod> <key>'],
+  ['HOLD','cmd','press without release (sticky)'],
+  ['RELEASE','cmd','release all held keys'],
+  ['STOPHOLD','cmd','alias for RELEASE'],
+  ['CONSUME','cmd','press+release one keystroke'],
+  ['IMPORT','cmd','include another .ducky inline'],
+  ['RUN_PAYLOAD','cmd','chain-run another payload'],
+  ['SET_BOOT_SCRIPT','cmd','set payload to run at boot'],
+  ['SET_BUTTON_PIN','cmd','set BUTTON_DEV'],
+  ['WAIT','cmd','wait N seconds'],
+  ['REBOOT','cmd','reboot the device'],
+  ['SHUTDOWN','cmd','poweroff'],
+  ['FACTORY_RESET','cmd','reset config and reboot'],
+  ['FACTORYRESET','cmd','alias of FACTORY_RESET'],
+  ['JOIN_INTERNET','cmd','NET_MODE=FORWARD'],
+  ['LEAVE_INTERNET','cmd','NET_MODE=PASSIVE'],
+  ['GET_TIME','cmd','set $_TIME'],
+  ['GET_DAY','cmd','set $_DAY'],
+  ['IF_OS','cmd','IF_OS <linux|windows|macos|android|ios>'],
+  ['IF_ONLINE','cmd','set $_ONLINE based on reachability'],
+  ['IF_OFFLINE','cmd','alias of IF_ONLINE'],
+  ['RANDOM_LOWERCASE_LETTER','cmd','type a random a-z'],
+  ['RANDOM_UPPERCASE_LETTER','cmd','type a random A-Z'],
+  ['RANDOM_LETTER','cmd','type a random letter'],
+  ['RANDOM_NUMBER','cmd','type a random 0-9'],
+  ['RANDOM_SPECIAL','cmd','type a random special char'],
+  ['RANDOM_CHAR','cmd','type a random character'],
+  ['FUNCTION','cmd','FUNCTION name — begin'],
+  ['END_FUNCTION','cmd','end FUNCTION'],
+  ['RETURN','cmd','return from FUNCTION'],
+  ['FOR','cmd','FOR $i IN <range>'],
+  ['ENDFOR','cmd','end FOR'],
+  ['END_FOR','cmd','end FOR'],
+  ['ELIF','cmd','else-if branch'],
+  ['DEFINE','cmd','DEFINE NAME value'],
+  ['SET','cmd','SET $var = value'],
+  ['DEFAULT_DELAY','cmd','alias of DEFAULTDELAY'],
+  ['DEFAULT_CHAR_DELAY','cmd','alias of DEFAULTCHARDELAY'],
+];
+// Advisory (hardware the WebBee lacks: no WiFi, no BT, no RGB LEDs, no
+// MSC/SD mount). These parse but log + emit to Attack Timeline.
+const DS_ADVISORY = [
+  'WIFI_ON','WIFI_OFF','WIFI_CONNECTED','WIFI_DISCONNECTED','WIFI_JOINING',
+  'BLUETOOTH_ON','BLUETOOTH_OFF','BLUETOOTH_DISCOVERY',
+  'LED','LED_ON','LED_OFF','LED_R','LED_G','LED_B','LED_Y','LED_W','LED_O',
+  'LED_P','LED_V','LED_C','LED_M','LED_A','LED_IR','LED_UV','LED_STOP','LED_BLINK',
+  'BLINK_LED_','BLINK_STOP','RGB',
+  'SD','WAIT_FOR_SD','SD_REMOVAL_TRIGGER',
+  'STORAGE','HIDE_PAYLOAD','REVERT_TO_THUMBDRIVE','SOFT_BRICK',
+  'HID_ATTACH','HID_DETACH',
+  'USB_ATTACHED','USB_DETACHED','USB_MOUNTED','USB_UNMOUNTED',
+  'USB_CONNECTED','USB_DISCONNECTED',
+  'UPLOAD_FILE','DOWNLOAD_FILE','COPY_FILE','CUT_FILE','PASTE_FILE','USE_FILE','CD',
+  'SAVE_CREDENTIALS','HTTP_REQUEST','HTTPS_REQUEST','PING',
+  'WAIT_FOR_EOF','WAIT_FOR_EVENT','WAIT_FOR_SCROLL_CHANGE',
+  'RUN_AT_TIME','RUN_AT_DAY','RUN_WHEN_WIFI','RUN_WHEN_BLUETOOTH','RUN_WHEN_BT_FOUND',
+  'BT_FOUND','BLUETOOTH_OFF_WHEN_WIFI','BLUETOOTH_ON_WHEN_WIFI',
+  'WIFI_OFF_WHEN_WIFI','WIFI_ON_WHEN_WIFI',
+  'VID_','PID_','MAN_','PRODUCT_',
+  'BEHAVE_BROKEN','BEHAVEBROKEN','BEGIN_ROWER','END_ROWER',
+  'RUN_ON_REBOOT','END_RUN_ON_REBOOT',
+  'DETECT_OS','DAY_TRIGGER','TIME_TRIGGER','WIFI_TRIGGER',
+  'IF_PRESENT','IF_NOT_PRESENT','IF_NOTPRESENT','IF_BT_PRESENT',
+  'IF_CLIENT_CONNECTED','IF_CLIENT_DISCONNECTED',
+  'IF_CLIENT_CONNECTED_WIFI','IF_CLIENT_DISCONNECTED_WIFI',
+  'IF_CLIENT_CONNECTED_BLUETOOTH','IF_CLIENT_DISCONNECTED_BLUETOOTH',
+  'IF_CONNECTED_TO_WIFI','SELFDESTRUCT','SELF_DESTRUCT',
+];
+DS_FULL.forEach(([w,kind,hint]) => DUCKY_KEYWORDS.push({w,kind,hint}));
+DS_ADVISORY.forEach(w => DUCKY_KEYWORDS.push({w,kind:'adv',hint:'ESP-S3 cmd — advisory on WebBee (no WiFi/BT/LED/SD)'}));
 const KW_SET = new Set(DUCKY_KEYWORDS.map(k => k.w));
+const KW_KIND = {}; DUCKY_KEYWORDS.forEach(k => KW_KIND[k.w] = k.kind);
 
 let currentScript = null;        // name of script currently open
 
 /* --- gutter + validation --- */
+// --- DuckyScript tokenizer + per-line validator -----------------------
+// Produces (htmlOutput, [badLineNumbers]) in one pass so the gutter dot
+// and the highlight overlay stay in sync.
+function dsTokenizeLine(raw, lineNo) {
+  // Returns { html, isErr }
+  const s = raw;
+  const t = s.trim();
+  if (!t) return { html: '', isErr: false };
+  // comments
+  if (/^(REM|REM_BLOCK|END_REM)\b/i.test(t) || t.startsWith('#')) {
+    return { html: `<span class="tok-rem">${esc(s)}</span>`, isErr: false };
+  }
+  // Pull leading whitespace so we preserve indentation visually.
+  const lead = s.match(/^\s*/)[0];
+  const body = s.slice(lead.length);
+  const first = (body.split(/\s+/)[0] || '').toUpperCase();
+  const rest  = body.slice(first.length);
+
+  // STRING / STRINGLN / STRING_BASH / STRING_POWERSHELL — literal body
+  if (/^STRING(LN|_BASH|_POWERSHELL)?$/.test(first) && rest.length > 1) {
+    return {
+      html: lead + `<span class="tok-cmd">${esc(first)}</span>`
+                 + `<span class="tok-str">${esc(rest)}</span>`,
+      isErr: false,
+    };
+  }
+
+  // GhostLink extensions
+  if (/^GL_/.test(first)) {
+    return { html: lead + `<span class="tok-gl">${esc(first)}</span>` + highlightRest(rest),
+             isErr: false };
+  }
+  // EXTENSION / IMPORT / RUN_PAYLOAD <name> — name after the keyword
+  if (/^(EXTENSION|IMPORT|RUN_PAYLOAD|SET_BOOT_SCRIPT)$/.test(first)) {
+    return { html: lead + `<span class="tok-cmd">${esc(first)}</span>` + highlightRest(rest),
+             isErr: false };
+  }
+
+  // Normal line: tokenize word-by-word, color by kind.
+  const parts = body.split(/(\s+)/); // keep spaces as separators
+  const out = [];
+  let seenCmd = false;
+  let hasKnownToken = false;
+  let hasUnknown   = false;
+  for (const tok of parts) {
+    if (!tok) continue;
+    if (/^\s+$/.test(tok)) { out.push(tok); continue; }
+    const up = tok.toUpperCase();
+    // $VAR
+    if (/^\$[A-Za-z_][A-Za-z0-9_]*/.test(tok)) {
+      out.push(`<span class="tok-var">${esc(tok)}</span>`); hasKnownToken = true; continue;
+    }
+    // integer literal
+    if (/^-?\d+$/.test(tok)) {
+      out.push(`<span class="tok-num">${esc(tok)}</span>`); hasKnownToken = true; continue;
+    }
+    // keyword?
+    if (KW_SET.has(up)) {
+      const k = KW_KIND[up] || 'cmd';
+      out.push(`<span class="tok-${k}">${esc(tok)}</span>`);
+      hasKnownToken = true; seenCmd = seenCmd || (k === 'cmd' || k === 'gl' || k === 'adv');
+      continue;
+    }
+    // advisory-prefix (BLINK_LED_RED etc.)
+    if (/^(BLINK_LED_|LED_|WIFI_|BLUETOOTH_|BT_|BLE_|SD_|STORAGE_|VID_|PID_|MAN_|PRODUCT_|IF_CLIENT_)/.test(up)) {
+      out.push(`<span class="tok-adv">${esc(tok)}</span>`);
+      hasKnownToken = true; seenCmd = true; continue;
+    }
+    // VAR assignment: $x = <rhs> — rhs can be anything, don't flag.
+    if (seenCmd || /^VAR$|^SET$|^DEFINE$/.test(first)) {
+      out.push(esc(tok)); hasKnownToken = true; continue;
+    }
+    out.push(`<span class="tok-err">${esc(tok)}</span>`);
+    hasUnknown = true;
+  }
+  // Line is an error if the FIRST non-space token wasn't a known command
+  // AND no known token at all parsed. Modifier-only chords (`CTRL ALT T`)
+  // register as known via KW_SET.
+  const bodyUp = body.trim().toUpperCase();
+  const firstTokOk = KW_SET.has(first) ||
+                     /^STRING(LN|_BASH|_POWERSHELL)?$/.test(first) ||
+                     /^GL_/.test(first) ||
+                     /^\$[A-Za-z_]/.test(body.trim()) ||
+                     /^(IF|WHILE|ELSE|END_IF|END_WHILE|END_EXTENSION|EXTENSION|VAR|DEFINE|SET|FOR|ENDFOR|END_FOR|FUNCTION|END_FUNCTION|RETURN|ELIF)\b/.test(bodyUp);
+  const isErr = !firstTokOk && hasUnknown;
+  return { html: lead + out.join(''), isErr };
+}
+function highlightRest(rest) {
+  // simple fallback for args: color numbers and $vars.
+  return rest.replace(/(\$[A-Za-z_][A-Za-z0-9_]*|\b-?\d+\b)/g, m => {
+    if (m.startsWith('$')) return `<span class="tok-var">${esc(m)}</span>`;
+    return `<span class="tok-num">${esc(m)}</span>`;
+  });
+}
+
 function updateGutter() {
   const ta = $('#scriptArea');
-  const n = (ta.value.match(/\n/g) || []).length + 1;
-  const lines = Array.from({length: n}, (_, i) => i + 1).join('\n');
-  $('#editorGutter').textContent = lines;
+  const text = ta.value;
+  const rawLines = text.split('\n');
+  const n = rawLines.length;
+  // Tokenize all lines once; produce highlight HTML + error-line set.
+  const hlOut = [];
+  const badLines = [];
+  for (let i = 0; i < n; i++) {
+    const r = dsTokenizeLine(rawLines[i], i + 1);
+    hlOut.push(r.html || '​');  // zero-width space for empty line height
+    if (r.isErr) badLines.push(i + 1);
+  }
+  // Trailing newline so pre + textarea line counts match
+  $('#editorHl').innerHTML = hlOut.join('\n');
+  // Gutter: line numbers + a red marker on error lines
+  const badSet = new Set(badLines);
+  $('#editorGutter').innerHTML = Array.from({length: n}, (_, i) =>
+    `<span class="gl${badSet.has(i+1) ? ' err' : ''}">${i+1}</span>`).join('');
   $('#editorLines').textContent = n + ' lines';
-  validateScript();
-}
-function validateScript() {
-  const text = $('#scriptArea').value;
-  const errs = [];
-  text.split('\n').forEach((raw, i) => {
-    const s = raw.trim();
-    if (!s) return;
-    if (/^(REM|REM_BLOCK|END_REM|#)/i.test(s)) return;
-    if (/^(STRING|DELAY|DEFAULTDELAY|DEFAULT_DELAY|DEFAULTCHARDELAY|REPEAT|WAIT) /i.test(s)) return;
-    if (/^GL_/i.test(s)) return;              // GhostLink extensions
-    if (/^EXTENSION\s+/i.test(s)) return;     // include reference
-    if (/^(WAIT_FOR_BUTTON_PRESS|BUTTON_WAIT)\b/i.test(s)) return;
-    const toks = s.split(/\s+/).map(t => t.toUpperCase());
-    if (toks.every(t => KW_SET.has(t))) return;
-    errs.push(`L${i+1}: unknown "${s.slice(0,40)}"`);
-  });
+  // Footer summary + clickable jump to the first bad line
   const el = $('#editorIssues');
-  if (!errs.length) { el.textContent = 'no issues'; el.className = 'dim'; }
-  else { el.textContent = errs.length + ' issue' + (errs.length>1?'s':'') + ': ' + errs[0]; el.className = 'err'; }
+  if (!badLines.length) { el.textContent = 'no issues'; el.className = 'dim'; }
+  else {
+    const first = badLines[0];
+    el.innerHTML = `<span class="err">${badLines.length} issue${badLines.length>1?'s':''}</span>`
+      + badLines.slice(0, 6).map(ln => `<a class="issue-line" data-ln="${ln}">L${ln}</a>`).join('');
+  }
 }
+function validateScript() { updateGutter(); }
 
 /* --- autocomplete popup --- */
 function acClose() { $('#acPopup').style.display = 'none'; acItems = []; acIndex = 0; }
@@ -2548,7 +2783,26 @@ function acAccept(idx) {
 function bindEditor() {
   const ta = $('#scriptArea');
   ta.addEventListener('input', () => { updateGutter(); acOpen(); });
-  ta.addEventListener('scroll', () => { $('#editorGutter').scrollTop = ta.scrollTop; });
+  ta.addEventListener('scroll', () => {
+    $('#editorGutter').scrollTop = ta.scrollTop;
+    const hl = $('#editorHl'); if (hl) { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
+  });
+  // Click an "L17" issue chip in the footer → jump the caret to that line
+  // and focus the editor. Nicer than scrolling to find the dot in the gutter.
+  const foot = $('#editorIssues');
+  if (foot) foot.addEventListener('click', e => {
+    const a = e.target.closest('.issue-line'); if (!a) return;
+    const ln = parseInt(a.dataset.ln, 10); if (!ln) return;
+    const lines = ta.value.split('\n');
+    let pos = 0;
+    for (let i = 0; i < ln - 1 && i < lines.length; i++) pos += lines[i].length + 1;
+    ta.focus();
+    ta.selectionStart = ta.selectionEnd = pos;
+    // scroll it roughly into view
+    const row = ln - 1;
+    ta.scrollTop = Math.max(0, row * 20 - ta.clientHeight / 2);
+    $('#editorHl').scrollTop = ta.scrollTop;
+  });
   ta.addEventListener('keydown', e => {
     const pop = $('#acPopup');
     const open = pop.style.display !== 'none';

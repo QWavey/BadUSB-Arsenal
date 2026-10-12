@@ -1,83 +1,71 @@
-# GhostLink DuckyScript — supported syntax
+# DuckyScript on GhostLink
 
-GhostLink's `ducky.py` runs a usable subset of DuckyScript 3.0.
+GhostLink's DuckyScript is a subset of DS 3.0 plus everything from
+[QWavey/ESP-S3-Key-BadUSB][esp] that could be mapped to the WebBee's
+hardware. Commands fall into three groups:
+
+1. **Fully supported** — fire for real.
+2. **GhostLink extensions** (`GL_*`) — write-through to the device.
+3. **Advisory** — the WebBee hardware doesn't support them, so the script
+   parses, logs, and emits a timeline event, but no I/O happens.
+
+[esp]: https://github.com/QWavey/ESP-S3-Key-BadUSB
+
+## The hardware the WebBee has (and doesn't)
+
+| Thing                | WebBee has it? | DuckyScript surface                                |
+|----------------------|---------------|----------------------------------------------------|
+| HID keyboard         | ✓ (hidg0)     | STRING, keycodes, modifiers, HOLD/RELEASE          |
+| Ethernet (eth0)      | ✓             | JOIN_INTERNET / LEAVE_INTERNET → NET_MODE          |
+| USB gadget OTG       | ✓             | identity override via Clone tab                    |
+| On-board button      | ✓ (evdev)     | WAIT_FOR_BUTTON_PRESS, BUTTON_DEF                  |
+| WiFi radio           | ✗             | WIFI_* commands are advisory                       |
+| Bluetooth            | ✗             | BT_*, BLUETOOTH_* commands are advisory            |
+| RGB LED array        | ✗             | LED_*, RGB, BLINK_LED_* advisory                   |
+| SD-card as MSC       | ✗ (slot only) | SD_*, STORAGE_*, UPLOAD_FILE, DOWNLOAD_FILE adv.   |
+| Thumbdrive gadget    | ✗             | HIDE_PAYLOAD, REVERT_TO_THUMBDRIVE advisory        |
 
 ## Fully supported
 
-### DS1 primitives
-- `REM ...` / `# ...` / `REM_BLOCK` ... `END_REM`
-- `STRING <text>`, `STRINGLN <text>` (adds Enter), `$var` interpolation inside STRING
-- `DELAY <ms>`, `DEFAULTDELAY <ms>`, `DEFAULTCHARDELAY <ms>`, `WAIT <seconds>`
-- Named keys: `ENTER` `RETURN` `ESC` `ESCAPE` `TAB` `SPACE` `BACKSPACE`
-  `DELETE`/`DEL` `UP`/`UPARROW` `DOWN`/`DOWNARROW` `LEFT`/`LEFTARROW`
-  `RIGHT`/`RIGHTARROW` `HOME` `END` `PAGEUP` `PAGEDOWN` `INSERT`
-  `PRINTSCREEN` `CAPSLOCK` `NUMLOCK` `SCROLLLOCK` `PAUSE`/`BREAK`
-  `MENU`/`APP` `F1`..`F12`
-- Modifiers: `CTRL`/`CONTROL`, `ALT`, `SHIFT`, `GUI`/`WINDOWS`/`WIN`/`SUPER`/`COMMAND`/`CMD`
-- Modifier-only lines (e.g. a bare `GUI` taps the Start key)
-- `REPEAT N` (repeats the previous executed line N times)
+The classics (DS 1/2): `STRING`, `STRINGLN`, `STRING_BASH`,
+`STRING_POWERSHELL`, `DELAY`, `WAIT`, `DEFAULTDELAY`, `DEFAULTCHARDELAY`,
+`REPEAT`, modifier+key chords (`CTRL ALT T`), named keys (`ENTER`,
+`TAB`, `UPARROW`…, `F1`-`F12`), `KEYCODE`, `INJECT_MOD`.
 
-### DS3 preprocessor
-- `EXTENSION NAME` ... `END_EXTENSION` — define a reusable block in-script
-- `DEFINE #CONST value` — compile-time literal substitution
-- `EXTENSION name` — include a file from `/root/ghostlink/extensions/` or
-  `/root/ghostlink/extensions/hak5/` (looks up `.ducky` then `.txt`)
+Hold-release: `HOLD <keys...>`, `RELEASE` / `STOPHOLD`.
 
-### DS3 runtime
-- `VAR $NAME = <expr>` — declare + assign
-- `$NAME = <expr>` — reassign
-- `IF (<expr>)` / `ELSE` / `END_IF`
-- `WHILE (<expr>)` / `END_WHILE`
-- Bare `NAME` or `NAME()` on its own line — call an EXTENSION block
-- Operators: `+ - * / %` `== != < > <= >=` `&& || !` parens
+Flow control: `IF (...)`, `WHILE (...)`, `END_IF`, `END_WHILE`, `VAR`,
+`DEFINE`, `SET`, `$VAR` substitution.
 
-### Built-in variables
-- `$_CAPSLOCK_ON`, `$_NUMLOCK_ON`, `$_SCROLLLOCK_ON` — read live from the
-  host via HID LED output reports (background reader on `/dev/hidg0`)
-- `$_RANDOM_INT`, `$_RANDOM_SHORT`, `$_RANDOM_BYTE`, `$_RANDOM_NUMBER`
-- `$_RANDOM_LOWERCASE_LETTER`, `$_RANDOM_UPPERCASE_LETTER`, `$_RANDOM_LETTER`
+Scripts: `IMPORT <file>` (inline include), `RUN_PAYLOAD <name>` (chain),
+`EXTENSION name` + `END_EXTENSION`, `SET_BOOT_SCRIPT <name>`.
 
-### GhostLink extensions
-- `GL_SET KEY=VALUE` — atomic rewrite of one config.txt line
-- `GL_RELOAD` / `GL_RELOAD_DNSMASQ` — kick dnsmasq to pick up new rules
-- `GL_RUN name.sh` — fire a sibling payload
-- `GL_LOG "text"` — append to `ghostlink.log`
-- `GL_WAIT N` — sleep N seconds
-- `GL_SPOOF_ADD host` — add host to `REDIRECT_FROM` + enable + reload
-- `GL_REBOOT` — sync + reboot
-- `WAIT_FOR_BUTTON_PRESS` / `BUTTON_WAIT` — block until on-board button
+Random: `RANDOM_LOWERCASE_LETTER`, `RANDOM_UPPERCASE_LETTER`,
+`RANDOM_LETTER`, `RANDOM_NUMBER`, `RANDOM_SPECIAL`, `RANDOM_CHAR`.
 
-## Advisory-only (parsed, logged, not executed)
+Time: `GET_TIME` → `$_TIME`, `GET_DAY` → `$_DAY`.
 
-These commands come from Hak5 Rubber-Ducky firmware that can live-rebind
-its USB gadget. On the Luckfox WebBee that's the brick path
-([docs/HID.md](HID.md)), so we accept and log them but don't actually
-switch gadget configurations:
+System: `REBOOT`, `SHUTDOWN`, `FACTORY_RESET`, `JOIN_INTERNET`,
+`LEAVE_INTERNET`, `IF_ONLINE` / `IF_OFFLINE` → `$_ONLINE`.
 
-- `ATTACKMODE ...`
-- `LED_*`, `LCD_*`
-- `EXFIL ...`
-- `SAVE_HOST_KEYBOARD_LOCK_STATE`, `RESTORE_HOST_KEYBOARD_LOCK_STATE`
-- `PAYLOAD_FINISHED`, `END`, `FINISH`, `RESTART_PAYLOAD`, `RESET`
-- `DISABLE_BUTTON`, `ENABLE_BUTTON`
+Button: `WAIT_FOR_BUTTON_PRESS` / `BUTTON_WAIT`, `SET_BUTTON_PIN
+<evdev-path>`.
 
-## Hak5 extension library — status
+## GhostLink extensions
 
-| extension | status |
-|---|---|
-| `button_deploy` | ✓ runs (ATTACKMODE no-op + WAIT_FOR_BUTTON_PRESS works) |
-| `detect_ready` | ✓ runs (uses VAR/WHILE/CAPSLOCK; $_CAPSLOCK_ON reflects real HID state) |
-| `passive_detect_ready` | ✓ runs (same substrate as detect_ready) |
-| `hello_os` | ⚠ degrades (OS stays "UNKNOWN"; os_detect's heuristics not fully ported) |
-| `os_detect` | ⚠ parses; some branches never fire because gadget rebind is unavailable |
-| `passive_windows_detect` | ⚠ parses; limited to what HID LED state can reveal |
-| `self_destruct` | ⚠ advisory — ATTACKMODE OFF + file delete not applicable to GhostLink |
-| `exfil_auto_eof_detect` | ⚠ advisory (no EXFIL endpoint on this gadget) |
-| `linux_hid_exfil` | ⚠ advisory |
-| `windows_hid_exfil` | ⚠ advisory |
-| `protected_storage_mode` | ⚠ advisory (no live ATTACKMODE switch) |
-| `translate` | ✓ runs if plain substitution; falls back when gadget-dependent |
+| cmd                     | purpose                                         |
+|-------------------------|-------------------------------------------------|
+| `GL_SET KEY=VAL`        | overlay-write a `config.txt` line               |
+| `GL_RELOAD_DNSMASQ`     | kick dnsmasq to pick up new rules               |
+| `GL_RUN <name>`         | run a sibling .sh payload                       |
+| `GL_LOG <text>`         | append to ghostlink.log                         |
+| `GL_WAIT <seconds>`     | sleep                                           |
+| `GL_SPOOF_ADD <host>`   | append to `REDIRECT_FROM`                       |
+| `GL_REBOOT`             | reboot the device                               |
 
-In practice: write new payloads using the subset above, and treat the
-Hak5 library as inspiration. `button_deploy` and `detect_ready` port
-directly.
+## Advisory
+
+The script tokenizer colors advisory commands in orange italics, logs
+the intent to `ghostlink.log`, and emits an `ducky_advisory` event to
+the Attack Timeline so what the script "wanted" to do is visible even
+when the hardware can't fulfill it. See the hardware table above.

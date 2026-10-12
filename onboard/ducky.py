@@ -149,6 +149,25 @@ def key_of(name, lay):
     return (0, 0)
 
 
+def _tl_emit(kind, **fields):
+    """Append an Attack Timeline event from ducky.py. Writes to the same
+    jsonl file webui.py uses (/root/ghostlink/logs/timeline.jsonl) so
+    both producers converge into one feed."""
+    try:
+        tl = ROOT / "logs" / "timeline.jsonl"
+        tl.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"t": int(time.time()), "ts": time.strftime("%H:%M:%S"), "kind": kind}
+        rec.update(fields)
+        # same 2MB cap behavior as webui's _timeline
+        if tl.exists() and tl.stat().st_size > 2 * 1024 * 1024:
+            try: tl.write_bytes(tl.read_bytes()[-512*1024:])
+            except Exception: pass
+        import json as _json
+        with open(tl, "a") as f:
+            f.write(_json.dumps(rec)[:1024] + "\n")
+    except Exception: pass
+
+
 def _ms(txt, default=0):
     try: return int(str(txt).strip())
     except (TypeError, ValueError): return default
@@ -486,6 +505,229 @@ class Interp:
             _cfg_log(f"advisory: {s[:80]}")
             return
 
+        # ====================================================================
+        # ESP-S3-Key-BadUSB parity — commands from QWavey/ESP-S3-Key-BadUSB's
+        # DuckyInterpreter.cpp. The ones that need hardware we don't have
+        # (WiFi/BT radio, SD slot, MSC/thumbdrive mode, LED array) are
+        # logged as advisory + emitted to the Attack Timeline so the user
+        # can see the script's intent. The rest fire for real.
+        # ====================================================================
+
+        # ---- Strings with per-flavor timing nudges --------------------------
+        if u.startswith("STRING_BASH "):
+            # Bash tends to accept full speed; keep the default.
+            self._type_string(line[12:]); self._press(0, NAMED["ENTER"]); return
+        if u.startswith("STRING_POWERSHELL "):
+            # PowerShell's history-highlighter can swallow fast input — bump
+            # the dwell for just this one line, then restore.
+            saved = self.press_dwell_ms
+            self.press_dwell_ms = max(6, saved)
+            self._type_string(line[18:]); self._press(0, NAMED["ENTER"])
+            self.press_dwell_ms = saved
+            return
+
+        # ---- Raw HID: KEYCODE <mod> <k1> [k2] -------------------------------
+        if u.startswith("KEYCODE "):
+            toks = s.split()[1:]
+            try: parts = [int(t, 0) & 0xFF for t in toks]
+            except ValueError: _cfg_log(f"KEYCODE bad int: {s[:60]}"); return
+            if len(parts) == 1:   self._press(0, parts[0])
+            elif len(parts) == 2: self._press(parts[0], parts[1])
+            else:                 self._press(parts[0], parts[1], parts[2])
+            return
+
+        # ---- INJECT_MOD <mod> <key> — explicit modifier+key -----------------
+        if u.startswith("INJECT_MOD "):
+            toks = s.split()[1:]
+            mod_bits = 0; keys_bits = []
+            for t in toks:
+                if t.upper() in MOD: mod_bits |= MOD[t.upper()]
+                else:
+                    _, k = key_of(t, self.lay)
+                    if k: keys_bits.append(k)
+            if keys_bits: self._press(mod_bits, keys_bits[0])
+            elif mod_bits: self._press_mod_only(mod_bits)
+            return
+
+        # ---- HOLD / RELEASE / STOPHOLD --------------------------------------
+        if u.startswith("HOLD ") and not u.startswith("HOLD_TILL"):
+            # Press without release. _held tracks the sticky modifier bits
+            # and keycodes so RELEASE can send a matching 0-report.
+            if not hasattr(self, "_held"):
+                self._held = {"mod": 0, "keys": []}
+            toks = s.split()[1:]
+            for t in toks:
+                up_t = t.upper()
+                if up_t in MOD: self._held["mod"] |= MOD[up_t]
+                else:
+                    _, k = key_of(t, self.lay)
+                    if k and len(self._held["keys"]) < 6:
+                        self._held["keys"].append(k)
+            rep = bytes([self._held["mod"], 0] + self._held["keys"]
+                        + [0] * (6 - len(self._held["keys"])))
+            try: os.write(self.fd, rep)
+            except OSError: pass
+            return
+        if u in ("RELEASE", "STOPHOLD") or u.startswith("RELEASE "):
+            try: os.write(self.fd, b"\x00" * 8)
+            except OSError: pass
+            self._held = {"mod": 0, "keys": []}
+            return
+
+        # ---- CONSUME <key> — press+release once -----------------------------
+        if u == "CONSUME" or u.startswith("CONSUME "):
+            if u == "CONSUME": return
+            toks = s.split()[1:]
+            for t in toks:
+                m2, k = key_of(t, self.lay)
+                if k: self._press(m2, k)
+            return
+
+        # ---- Boot script control --------------------------------------------
+        if u.startswith("SET_BOOT_SCRIPT "):
+            name = s[len("SET_BOOT_SCRIPT "):].strip()
+            boot = ROOT / "boot_payload"
+            try: boot.write_text(name + "\n"); _cfg_log(f"SET_BOOT_SCRIPT {name}")
+            except Exception as e: _cfg_log(f"SET_BOOT_SCRIPT fail {e}")
+            return
+        if u.startswith("SET_BUTTON_PIN "):
+            # Map to our BUTTON_DEV instead of a GPIO pin (WebBee uses evdev).
+            v = s[len("SET_BUTTON_PIN "):].strip()
+            gl_set(f"BUTTON_DEV={v}")
+            return
+
+        # ---- RUN_PAYLOAD <name> — chain-run a sibling script ----------------
+        if u.startswith("RUN_PAYLOAD "):
+            name = s[len("RUN_PAYLOAD "):].strip()
+            p = ROOT / "payloads" / name
+            if p.exists() and p.is_file():
+                import subprocess as _sp
+                _sp.Popen(["python3", str(ROOT/"ducky.py"), str(p)])
+            else:
+                _cfg_log(f"RUN_PAYLOAD not found: {name}")
+            return
+
+        # ---- IMPORT <file> — include another script inline ------------------
+        if u.startswith("IMPORT "):
+            name = s[len("IMPORT "):].strip()
+            for base in (ROOT/"extensions", ROOT/"payloads"):
+                p = base / name
+                if p.is_file():
+                    try:
+                        inner = p.read_text().splitlines()
+                        self.exec_body(inner)
+                    except Exception as e: _cfg_log(f"IMPORT err: {e}")
+                    return
+            _cfg_log(f"IMPORT not found: {name}")
+            return
+
+        # ---- Random generators — type a random character --------------------
+        if u == "RANDOM_LOWERCASE_LETTER":
+            import random as _r
+            self._type_string(_r.choice("abcdefghijklmnopqrstuvwxyz")); return
+        if u == "RANDOM_UPPERCASE_LETTER":
+            import random as _r
+            self._type_string(_r.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ")); return
+        if u == "RANDOM_LETTER":
+            import random as _r
+            self._type_string(_r.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")); return
+        if u == "RANDOM_NUMBER":
+            import random as _r
+            self._type_string(_r.choice("0123456789")); return
+        if u == "RANDOM_SPECIAL":
+            import random as _r
+            self._type_string(_r.choice("!@#$%^&*()-_=+[]{};:,.<>?/")); return
+        if u == "RANDOM_CHAR":
+            import random as _r
+            self._type_string(_r.choice(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*")); return
+
+        # ---- Time / Day → vars $_TIME / $_DAY -------------------------------
+        if u == "GET_TIME":
+            self.vars["_TIME"] = time.strftime("%H:%M:%S"); return
+        if u == "GET_DAY":
+            self.vars["_DAY"]  = time.strftime("%A"); return
+
+        # ---- Internet / mode toggles ----------------------------------------
+        if u == "JOIN_INTERNET":
+            gl_set("NET_MODE=FORWARD"); _cfg_log("JOIN_INTERNET -> NET_MODE=FORWARD"); return
+        if u == "LEAVE_INTERNET":
+            gl_set("NET_MODE=PASSIVE"); _cfg_log("LEAVE_INTERNET -> NET_MODE=PASSIVE"); return
+
+        # ---- IF_ONLINE / IF_OFFLINE -----------------------------------------
+        if u in ("IF_ONLINE", "IF_OFFLINE"):
+            # Flag the condition. The IF/END_IF collector in exec_body
+            # evaluates $_ONLINE if the user writes it; here we just set it.
+            import socket as _s
+            try:
+                s2 = _s.socket(_s.AF_INET, _s.SOCK_STREAM); s2.settimeout(1.5)
+                s2.connect(("1.1.1.1", 53)); s2.close()
+                self.vars["_ONLINE"] = "1"
+            except Exception:
+                self.vars["_ONLINE"] = "0"
+            return
+
+        # ---- IF_OS <linux|windows|macos|android|ios> → sets $_OS_MATCH ------
+        if u.startswith("IF_OS "):
+            want = s[6:].strip().strip('"').lower()
+            # WebBee itself runs linux; this is only useful when the admin
+            # has set $_OS externally. We expose both.
+            cur = (self.vars.get("_OS") or "linux").lower()
+            self.vars["_OS_MATCH"] = "1" if cur == want else "0"
+            return
+
+        # ---- System actions -------------------------------------------------
+        if u == "REBOOT":
+            _cfg_log("REBOOT requested"); os.system("sync; reboot &"); return
+        if u == "SHUTDOWN":
+            _cfg_log("SHUTDOWN requested"); os.system("sync; poweroff &"); return
+        if u in ("FACTORYRESET", "FACTORY_RESET"):
+            _cfg_log("FACTORY_RESET requested (restoring default config.txt)")
+            try: (ROOT/"config.txt").unlink()
+            except Exception: pass
+            os.system("sync; reboot &"); return
+        if u.startswith(("SELFDESTRUCT", "SELF_DESTRUCT")):
+            _cfg_log("SELF_DESTRUCT advisory — not actually bricking the device")
+            return
+
+        # ---- Advisory family: WIFI_*, BT_*, LED_*, SD_*, STORAGE_*, HID_* ---
+        # All logged + emitted to Attack Timeline for intent-tracking.
+        ADVISORY_PREFIXES = (
+            "WIFI_", "BLUETOOTH_", "BT_", "BLE_", "SD_", "STORAGE_", "LCD_",
+            "RGB ", "LED ", "BLINK_LED_", "BLINK_STOP",
+            "HID_ATTACH", "HID_DETACH", "USB_ATTACHED", "USB_DETACHED",
+            "USB_MOUNTED", "USB_UNMOUNTED", "USB_CONNECTED", "USB_DISCONNECTED",
+            "UPLOAD_FILE ", "DOWNLOAD_FILE ", "COPY_FILE ", "CUT_FILE ",
+            "PASTE_FILE", "USE_FILE ", "CD ",
+            "SAVE_CREDENTIALS",
+            "HTTP_REQUEST", "HTTPS_REQUEST",
+            "PING ", "WAIT_FOR_SD", "WAIT_FOR_EOF", "WAIT_FOR_EVENT",
+            "RUN_AT_TIME", "RUN_AT_DAY", "RUN_WHEN_WIFI", "RUN_WHEN_BLUETOOTH",
+            "BT_FOUND", "RUN_WHEN_BT_FOUND",
+            "WIFI_OFF_WHEN_WIFI", "WIFI_ON_WHEN_WIFI",
+            "BLUETOOTH_OFF_WHEN_WIFI", "BLUETOOTH_ON_WHEN_WIFI",
+            "BLUETOOTH_DISCOVERY",
+            "VID_", "PID_", "MAN_", "PRODUCT_",
+            "HIDE_PAYLOAD", "REVERT_TO_THUMBDRIVE", "SOFT_BRICK",
+            "BEHAVE_BROKEN", "BEHAVEBROKEN",
+            "BEGIN_ROWER", "END_ROWER", "RUN_ON_REBOOT", "END_RUN_ON_REBOOT",
+            "DETECT_OS", "DAY_TRIGGER", "TIME_TRIGGER", "WIFI_TRIGGER",
+            "SD_REMOVAL_TRIGGER",
+            "IF_PRESENT ", "IF_NOTPRESENT ", "IF_NOT_PRESENT ",
+            "IF_BT_PRESENT", "IF_CLIENT_",
+            "WAIT_FOR_SCROLL_CHANGE",
+        )
+        if u.startswith(ADVISORY_PREFIXES) or u in (
+            "WIFI_OFF", "WIFI_ON", "WIFI_CONNECTED", "WIFI_DISCONNECTED",
+            "WIFI_JOINING", "BLUETOOTH_OFF", "BLUETOOTH_ON",
+            "CLIENT_CONNECTED", "CLIENT_DISCONNECTED",
+            "STORAGE",
+        ):
+            _cfg_log(f"advisory (ESP-S3): {s[:80]}")
+            try: _tl_emit("ducky_advisory", cmd=u.split()[0] if u.split() else u, line=s[:120])
+            except Exception: pass
+            return
+
         # delays
         if u.startswith("DELAY "):
             time.sleep(max(0, _ms(self._eval(line[6:]), 0)) / 1000.0); return
@@ -706,7 +948,9 @@ class Interp:
         _ensure_led_reader(self.fd)
 
         body = self._preprocess()
+        _tl_emit("ducky_start", path=str(getattr(self, "path", "?")).split("/")[-1][:60])
         self.exec_body(body)
+        _tl_emit("ducky_done",  path=str(getattr(self, "path", "?")).split("/")[-1][:60])
         os.close(self.fd); return 0
 
 
