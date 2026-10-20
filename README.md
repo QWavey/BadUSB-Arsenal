@@ -1,4 +1,4 @@
-# GhostLink. passthrough firmware for the Luckfox WebBee
+# GhostLink: passthrough firmware for the Luckfox WebBee
 
 A fast-boot Buildroot-based firmware that turns the Luckfox WebBee (RV1106,
 SPI NAND, USB-C, 10/100 Ethernet, SD slot) into a transparent **man-in-the-wire**
@@ -8,32 +8,32 @@ reacting to what it sees in real time.
 Design-cousins (and prior art it borrows from): Hak5 **LAN Turtle** (USB-ethernet
 MITM), **Packet Squirrel** (dual-port passthrough + rec), **Shark Jack**
 (payload.sh + switch modes), **Bash Bunny** (BadUSB personality). The WebBee is
-cheaper, has more RAM, and runs stock Buildroot — but the stock image is a
-blank slate. GhostLink is what that blank slate wants to be.
+cheaper, has more RAM, and runs stock Buildroot, but the stock image is a
+blank slate. GhostLink is the firmware built on that slate.
 
-## What's actually new
+## What's new
 
-Everyone else makes you pick: *record everything* (opaque pcap) **or**
-*react to flows* (narrow fixed payloads). GhostLink refuses the trade-off:
+Other tools make you choose between *recording everything* (opaque pcap) and
+*reacting to flows* (narrow fixed payloads). GhostLink does both:
 
 - The kernel bridge forwards packets at wire rate (zero CPU on the hot path).
 - A shadow fiber reads an AF_PACKET mirror on its own core and co-writes
   **two** files per rotation window:
-  - `Records/rec_NNNNNN.pcap`  — the raw stream, Wireshark-compatible.
-  - `Records/rec_NNNNNN.jsonl` — one JSON line per frame, with
+  - `Records/rec_NNNNNN.pcap`: the raw stream, Wireshark-compatible.
+  - `Records/rec_NNNNNN.jsonl`: one JSON line per frame, with
     `{frame#, ts, flow_hash, size, rule?, verdict?, detail?}`.
 - The sidecar JSONL stream makes the pcap **queryable in milliseconds** from
   the Web UI (`GET /api/query?rule=REDIRECT&host=google.com`) instead of being a
   byte-pile you grep later. The pcap stays untouched; the verdicts are the
   index.
-- `config.txt` is a *compiler input*, not a settings file. `REDIRECT=TRUE`
-  with `REDIRECT_FROM=google.com` compiles to nftables + a DNS worker on boot in
+- `config.txt` works as a compiler input: `REDIRECT=TRUE` with
+  `REDIRECT_FROM=google.com` compiles to nftables + a DNS worker on boot in
   under 50ms, and **hot-reloads** on save without reboot.
 
 Prior-art check: Hak5 devices stream pcaps and run isolated per-switch
 payloads, but none co-write a per-frame verdict channel; and their configs are
-static per-boot. Suricata / Zeek produce rich logs but need a real server, not
-a 1.2GHz Cortex-A7 behind a USB-C port.
+static per-boot. Suricata / Zeek produce rich logs but need a real server rather
+than a 1.2GHz Cortex-A7 behind a USB-C port.
 
 ## Hardware
 
@@ -60,7 +60,7 @@ a 1.2GHz Cortex-A7 behind a USB-C port.
 /Firmware/               OTA bundle + signing pubkey
 ```
 
-## config.txt — 35 keys
+## config.txt: 35 keys
 
 See `docs/CONFIG.md`. Quick peek:
 
@@ -119,7 +119,7 @@ make pack
 
 ## Flashing
 
-Stock Luckfox WebBee flash procedure applies — see `docs/HARDWARE.md`.
+The stock Luckfox WebBee flash procedure applies. See `docs/HARDWARE.md`.
 Overlay the compiled `ghostlink` into `rootfs/usr/sbin/`, drop
 `S99ghost` into `rootfs/etc/init.d/`, rebuild `rootfs.img` with the Luckfox
 SDK, flash the usual way with SocToolKit or `upgrade_tool uf update.img`.
@@ -160,10 +160,10 @@ the same JSON format as [hak5/usbrubberducky-payloads](https://github.com/hak5/u
 
 Trigger a payload three ways:
 
-- `HID_TRIGGER=BOOT`     — fires `HID_PAYLOAD` after `HID_DELAY_MS`.
-- `HID_TRIGGER=BUTTON`   — tap the button.
-- `HID_TRIGGER=WEBUI`    — click the Fire button in the WebUI, or
-                           `POST /api/hid` with the payload path.
+- `HID_TRIGGER=BOOT`     fires `HID_PAYLOAD` after `HID_DELAY_MS`.
+- `HID_TRIGGER=BUTTON`   tap the button.
+- `HID_TRIGGER=WEBUI`    click the Fire button in the WebUI, or
+                         `POST /api/hid` with the payload path.
 
 ## DeadNet (opt-in)
 
@@ -184,8 +184,8 @@ networks you own. Don't deploy it against anyone else's traffic.
 
 ## Credits
 
-- Hak5 — the whole lineage of pocket pentest tooling (Turtle, Squirrel, Shark
+- Hak5: the whole lineage of pocket pentest tooling (Turtle, Squirrel, Shark
   Jack, Bash Bunny), format conventions (payload.sh, LED command, layout JSON).
-- [flashnuke/deadnet](https://github.com/flashnuke/deadnet) — the IPv4+v6
+- [flashnuke/deadnet](https://github.com/flashnuke/deadnet): the IPv4+v6
   havoc technique; GhostLink's `deadnet.c` is a straight port in native C.
-- Luckfox — the WebBee hardware and buildroot SDK.
+- Luckfox: the WebBee hardware and buildroot SDK.
