@@ -11,7 +11,7 @@ Watch-form-factor port of [QWavey/ESP-S3-Key-BadUSB](https://github.com/QWavey/E
 
 ## Features (same as the Key + watch UI)
 
-- Web dashboard at `http://192.168.4.1/` (AP: `ESP-Watch-BadUSB`, PSK: `badusb123`)
+- Web dashboard at `http://192.168.4.1/` (AP: `ESP-Watch-BadUSB`, PSK: default — see `Config.h`, **change on first run**)
 - DuckyScript 3.0 interpreter
 - USB HID keyboard + MSC composite
 - Optional BLE (off by default — toggle in Settings)
