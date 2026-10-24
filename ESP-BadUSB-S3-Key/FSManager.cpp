@@ -9,15 +9,17 @@
 bool initSDCard() {
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
 
-  // Improved SD card initialization with retry logic
+  // Improved SD card initialization with retry logic.
+  // Track mount success inside the loop instead of unconditionally re-calling
+  // SD.begin() outside it — that second call is idempotent on SPI SD (returns
+  // true because _card is still set) but does an unnecessary re-probe of the
+  // SPI bus on every boot on the happy path.
+  bool mounted = false;
   for (int i = 0; i < 3; i++) {
-    if (SD.begin(SD_CS_PIN)) {
-      break;
-    }
+    if (SD.begin(SD_CS_PIN)) { mounted = true; break; }
     delay(100);
   }
-
-  if (!SD.begin(SD_CS_PIN)) {
+  if (!mounted) {
     Serial.println("Card Mount Failed");
     return false;
   }
