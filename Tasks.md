@@ -1,0 +1,66 @@
+# Tasks
+
+## GitHub issues (synced 2026-10-24)
+
+Source: open issues of QWavey/ESP-Watch-BadUSB. Issue #2 is an audit issue; each of its bullets is listed as its own item and marked `#2` with the duplicate issue number where the same defect has a separate issue.
+
+- [ ] #1 Board port PR and LICENSE question — (issue body only) — SKIP — feature request and question to the maintainer, no defect described
+- [ ] #2 [security] Only access control is the default AP passphrase — ESP-Watch-BadUSB/Config.h:44; README.md:14 — FIX — pending (see #3)
+- [ ] #2 [security] /api/wifi-secrets returns AP and upstream Wi-Fi passphrases — ESP-Watch-BadUSB/WebServerManager.cpp:376-378 — FIX — pending (see #4)
+- [ ] #2 [security] Saved Wi-Fi passwords stored in plaintext and served by file endpoints — ESP-Watch-BadUSB/WiFiManager.cpp:341-343; ESP-Watch-BadUSB/WebServerHandlers.cpp:99-115, 266-272 — FIX — pending (see #5)
+- [ ] #2 [security] Script load, save, delete and check endpoints skip traversal check — ESP-Watch-BadUSB/WebServerManager.cpp:550-601; ESP-Watch-BadUSB/FSManager.cpp:235-321 — FIX — pending (see #6)
+- [ ] #2 [security] AP falls back to an open network when passphrase setup fails — ESP-Watch-BadUSB/WiFiManager.cpp:41-44 — FIX — pending (see #7)
+- [ ] #2 [security] Passphrase change and factory reset lack the passphrase check — ESP-Watch-BadUSB/WebServerManager.cpp:633-656, 1124-1163 — FIX — pending (see #8)
+- [ ] #2 [security, low] Passphrase printed to serial and command history kept — ESP-Watch-BadUSB/ESP-Watch-BadUSB.ino:979-981; ESP-Watch-BadUSB/ComShell.cpp:69; ESP-Watch-BadUSB/LogManager.cpp:126-131 — FIX — pending (see #9)
+- [ ] #2 [security, low] Build depends on unpinned library and core — README.md:26, 38 — FIX — pending (see #10)
+- [ ] #2 [security, low] User-controlled names concatenated into JSON and HTTP headers — ESP-Watch-BadUSB/WebServerHandlers.cpp:114, 133, 140, 152, 277 — FIX — pending (see #11)
+- [ ] #2 [security, critical] Firmware package accepted without signature check — ESP-Watch-BadUSB/WebServerManager.cpp:47; ESP-Watch-BadUSB/UpdateManager.cpp:62-75, 140-164, 185-188, 209, 219, 229 — FIX — pending (see #12)
+- [ ] #2 [bug, high] Copy or cut-and-paste into the same folder destroys the file — ESP-Watch-BadUSB/FSManager.cpp: pasteFile(), cutFile(), copySDFile(), moveSDFile() — FIX — pending (see #13)
+- [ ] #2 [bug, high] Delete request for the root path wipes the SD card — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleDeleteFile(); ESP-Watch-BadUSB/FSManager.cpp: deleteDirectory() — FIX — pending (see #14)
+- [ ] #2 [bug, medium] Remove-then-rename loses the original file when rename fails — ESP-Watch-BadUSB/FSManager.cpp: saveScript(); ESP-Watch-BadUSB/UpdateManager.cpp: extractFile(); ESP-Watch-BadUSB/WiFiManager.cpp: deleteWiFiCredential() — FIX — pending (see #15)
+- [ ] #2 [bug, medium] Truncated download is reported as success — ESP-Watch-BadUSB/FSManager.cpp: downloadFileFromURL() — FIX — pending (see #16)
+- [ ] #2 [bug, medium] Wi-Fi passwords with quotes or backslashes are mangled — ESP-Watch-BadUSB/WiFiManager.cpp: saveWiFiCredentials(), getSavedWiFiCredentials(), processAutoConnect() — FIX — pending (see #17)
+- [ ] #2 [bug, medium] Failed AP start falls back to an open network — ESP-Watch-BadUSB/WiFiManager.cpp: setupAP() — FIX — pending (see #18)
+- [ ] #2 [bug, medium] Update can be armed and applied while a script runs — ESP-Watch-BadUSB/UpdateManager.cpp: handleUpdatePackagePost(), processPendingUpdate() — FIX — pending (see #19)
+- [ ] #2 [bug, medium] Aborted package upload is not cleaned up — ESP-Watch-BadUSB/UpdateManager.cpp: handleUpdatePackageUpload() — FIX — pending (see #20)
+- [ ] #2 [bug, low] Upload abort deletes from the wrong folder — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleFileUpload(), UPLOAD_FILE_ABORTED — FIX — pending (see #21)
+- [ ] #2 [bug, low] History is fully rewritten on every command once full — ESP-Watch-BadUSB/LogManager.cpp: addToHistory() — SKIP — performance and SD wear only; no wrong result, security hole or data loss described
+- [ ] #2 [improvement, high] Absolute paths bypass the traversal check on file endpoints — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleFileDownload, handleFileInfo, handleDeleteFile, handleChangeDirectory, handleUseFile; ESP-Watch-BadUSB/FSManager.cpp: saveScript(), deleteScript(), loadScript() — FIX — pending (see #23)
+- [ ] #2 [improvement, high] Wi-Fi AP silently falls back to an open network — ESP-Watch-BadUSB/WiFiManager.cpp: setupAP() lines 41-44 — FIX — pending (see #24)
+- [ ] #2 [improvement, high] File writes land in place and report success after short transfers — ESP-Watch-BadUSB/FSManager.cpp: downloadFileFromURL(), copySDFile() — FIX — pending (see #25)
+- [ ] #2 [improvement, high] Update flow: README partition contradicts the OTA step — README.md:32; ESP-Watch-BadUSB/UpdateManager.cpp: processPendingUpdate() — FIX — pending (see #26)
+- [ ] #2 [improvement, medium] Aborted uploads clean the wrong directory and leave partial files — ESP-Watch-BadUSB/WebServerHandlers.cpp:35-40, 81-89 — FIX — pending (see #27)
+- [ ] #2 [improvement, medium] Duplicate check for saved Wi-Fi networks never matches — ESP-Watch-BadUSB/WiFiManager.cpp:334-335 — FIX — pending (see #28)
+- [ ] #2 [improvement, medium] Saved Wi-Fi passwords with quotes or backslashes come back corrupted — ESP-Watch-BadUSB/WiFiManager.cpp:342, 365-366, 503-505 — FIX — pending (see #29)
+- [ ] #2 [improvement, medium] JSON responses are built by string concatenation with unescaped names — ESP-Watch-BadUSB/WebServerHandlers.cpp:133-289 — FIX — pending (see #30)
+- [ ] #2 [improvement, medium] Keystroke path repeats modifier logic and re-parses the keymap per character — ESP-Watch-BadUSB/USBManager.cpp: fastPressKey(), fastPressKeyCombination(), fastTypeString(), pressKeyOnly(), parseKeyCode() — HELD — attack behaviour, needs authorization context
+- [ ] #2 [improvement, low] No automated tests cover the parsers and validators — repository root — SKIP — test infrastructure request, no defect described
+- [ ] #3 Only access control is a publicly documented default passphrase — ESP-Watch-BadUSB/Config.h:44; README.md:14 — FIX — pending
+- [ ] #4 Endpoint returns AP and upstream WiFi passphrases to any client — ESP-Watch-BadUSB/WebServerManager.cpp:376-378 — FIX — pending
+- [ ] #5 Saved WiFi passwords stored in plaintext and served by file endpoints — ESP-Watch-BadUSB/WiFiManager.cpp:341-343; ESP-Watch-BadUSB/WebServerHandlers.cpp:99-115, 266-272; ESP-Watch-BadUSB/WebServerManager.cpp:50, 52 — FIX — pending
+- [ ] #6 Script load, save, delete and check endpoints skip the traversal check — ESP-Watch-BadUSB/WebServerManager.cpp:550-553, 564-578, 584-588, 597-601; ESP-Watch-BadUSB/FSManager.cpp:235-238, 255-262, 318-321 — FIX — pending
+- [ ] #7 Access point falls back to an open network when passphrase setup fails — ESP-Watch-BadUSB/WiFiManager.cpp:41-44 — FIX — pending
+- [ ] #8 Passphrase change and factory reset lack the check used by other endpoints — ESP-Watch-BadUSB/WebServerManager.cpp:633-656, 1124-1163 — FIX — pending
+- [ ] #9 Passphrase printed to serial and command history kept regardless of logging setting — ESP-Watch-BadUSB/ESP-Watch-BadUSB.ino:979-981; ESP-Watch-BadUSB/ComShell.cpp:69; ESP-Watch-BadUSB/LogManager.cpp:126-131 — FIX — pending
+- [ ] #10 Build depends on an unpinned external library and core version — README.md:26, 38 — FIX — pending
+- [ ] #11 User-controlled names concatenated into JSON and HTTP headers — ESP-Watch-BadUSB/WebServerHandlers.cpp:114, 133, 140, 152, 277 — FIX — pending
+- [ ] #12 Firmware package accepted from any client without signature check — ESP-Watch-BadUSB/WebServerManager.cpp:47; ESP-Watch-BadUSB/UpdateManager.cpp:62-75, 140-164, 185-188, 209, 219, 229 — FIX — pending
+- [ ] #13 Copy or cut-and-paste into the same folder destroys the file — ESP-Watch-BadUSB/FSManager.cpp: pasteFile(), cutFile(), copySDFile(), moveSDFile() — FIX — pending
+- [ ] #14 Delete request for the root path wipes the SD card — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleDeleteFile(); ESP-Watch-BadUSB/FSManager.cpp: deleteDirectory() — FIX — pending
+- [ ] #15 Remove-then-rename loses the original file when rename fails — ESP-Watch-BadUSB/FSManager.cpp: saveScript(); ESP-Watch-BadUSB/UpdateManager.cpp: extractFile(); ESP-Watch-BadUSB/WiFiManager.cpp: deleteWiFiCredential() — FIX — pending
+- [ ] #16 Truncated download is reported as success — ESP-Watch-BadUSB/FSManager.cpp: downloadFileFromURL() — FIX — pending
+- [ ] #17 Wi-Fi passwords with quotes or backslashes are mangled — ESP-Watch-BadUSB/WiFiManager.cpp: saveWiFiCredentials(), getSavedWiFiCredentials(), processAutoConnect() — FIX — pending
+- [ ] #18 Failed AP start falls back to an open network — ESP-Watch-BadUSB/WiFiManager.cpp: setupAP() — FIX — pending
+- [ ] #19 Update can be armed and applied while a script runs — ESP-Watch-BadUSB/UpdateManager.cpp: handleUpdatePackagePost(), processPendingUpdate() — FIX — pending
+- [ ] #20 Aborted package upload is not cleaned up — ESP-Watch-BadUSB/UpdateManager.cpp: handleUpdatePackageUpload() — FIX — pending
+- [ ] #21 Upload abort deletes from the wrong folder — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleFileUpload(), UPLOAD_FILE_ABORTED branch — FIX — pending
+- [ ] #22 History is fully rewritten on every command once full — ESP-Watch-BadUSB/LogManager.cpp: addToHistory() — SKIP — performance and SD wear only; no wrong result, security hole or data loss described
+- [ ] #23 Absolute paths bypass the traversal check on file endpoints — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleFileDownload (line 99), handleFileInfo (line 367), handleDeleteFile (line 295), handleChangeDirectory (lines 129-137), handleUseFile (lines 148-156); ESP-Watch-BadUSB/FSManager.cpp: saveScript(), deleteScript(), loadScript() — FIX — pending
+- [ ] #24 Wi-Fi AP silently falls back to an open network — ESP-Watch-BadUSB/WiFiManager.cpp: setupAP, softAP fallback (lines 41-44) — FIX — pending
+- [ ] #25 File writes land in place and report success after short transfers — ESP-Watch-BadUSB/FSManager.cpp: downloadFileFromURL(), copySDFile() — FIX — pending
+- [ ] #26 Update flow: README partition contradicts the OTA step, apply can half-finish — README.md:32; ESP-Watch-BadUSB/UpdateManager.cpp: processPendingUpdate() — FIX — pending
+- [ ] #27 Aborted uploads clean the wrong directory and leave partial files — ESP-Watch-BadUSB/WebServerHandlers.cpp: handleFileUpload, lines 35-40 and 81-89 — FIX — pending
+- [ ] #28 Duplicate check for saved Wi-Fi networks never matches — ESP-Watch-BadUSB/WiFiManager.cpp: saveWiFiCredentials (lines 334-335) — FIX — pending
+- [ ] #29 Saved Wi-Fi passwords with quotes or backslashes come back corrupted — ESP-Watch-BadUSB/WiFiManager.cpp: lines 342, 365-366, 503-505 — FIX — pending
+- [ ] #30 JSON responses are built by string concatenation with unescaped names — ESP-Watch-BadUSB/WebServerHandlers.cpp: lines 133, 152, 172, 186, 208, 277, 280 — FIX — pending
+- [ ] #31 Keystroke path repeats modifier logic and re-parses the keymap per character — ESP-Watch-BadUSB/USBManager.cpp: fastPressKey(), fastPressKeyCombination(), fastTypeString(), pressKeyOnly(), parseKeyCode() — HELD — attack behaviour, needs authorization context
