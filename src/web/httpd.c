@@ -10,7 +10,7 @@
  *   - /api/flows       - live flow table
  *   - /api/verdicts    - stream of recent verdicts (SSE)
  *   - /api/records     - list rotated pcap files
- *   - /api/query       - search verdict stream (host=, rule=, from=, to=)
+ *   - /api/query       - search verdict stream (host=, rule=)
  *   - /api/hid         - POST {"payload": "..."} to fire a ducky payload
  *   - /api/reboot      - POST reboot the device
  *   - Basic auth via WEBUI_USER/WEBUI_PASS or Bearer API_TOKEN
@@ -265,9 +265,15 @@ static void r_query(int c, const char *qs) {
         if (!strcmp(tok, "rule")) { strncpy(rule, eq+1, sizeof(rule)-1); rule[sizeof(rule)-1]=0; }
     }
 
-    char hdr[128];
-    snprintf(hdr, sizeof(hdr), "[");
-    send_hdr(c, 200, "OK", "application/json", 0, "Transfer-Encoding: chunked\r\n");
+    /* Chunked reply: no Content-Length, the chunk sizes frame the body. */
+    static const char chunked_hdr[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Server: GhostLink\r\n"
+        "Content-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Cache-Control: no-store\r\n"
+        "\r\n";
+    write(c, chunked_hdr, sizeof(chunked_hdr) - 1);
     /* write chunked JSON array */
     write(c, "1\r\n[\r\n", 6);
     int emitted = 0;
@@ -286,11 +292,15 @@ static void r_query(int c, const char *qs) {
                 if (host[0] && !strstr(line, host)) continue;
                 if (rule[0] && !strstr(line, rule)) continue;
                 size_t L = strlen(line);
+                while (L && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+                if (!L) continue;
+                /* comma before every element except the first: valid JSON */
+                char out[1100];
+                int ol = snprintf(out, sizeof(out), "%s%s\n", emitted ? "," : "", line);
                 char chunk[32];
-                int ch = snprintf(chunk, sizeof(chunk), "%zx\r\n", L + 1);
+                int ch = snprintf(chunk, sizeof(chunk), "%x\r\n", (unsigned)ol);
                 write(c, chunk, (size_t)ch);
-                write(c, line, L);
-                write(c, ",", 1);
+                write(c, out, (size_t)ol);
                 write(c, "\r\n", 2);
                 emitted++;
             }
