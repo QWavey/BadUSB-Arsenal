@@ -24,6 +24,7 @@ void handleUpdatePackageUpload() {
     updateApplying = false;
     updateProgress = 0;
     updateStatus = "Receiving package...";
+    if (g_pkgUploadFile) g_pkgUploadFile.close();   // a previous upload may have left its handle open
     if (SD.exists(ESPKG_TMP_PATH)) SD.remove(ESPKG_TMP_PATH);
     g_pkgUploadFile = SD.open(ESPKG_TMP_PATH, FILE_WRITE);
     // v4.4: if SD is full/write-protected the open silently fails and every
@@ -39,13 +40,56 @@ void handleUpdatePackageUpload() {
     if (g_pkgUploadFile) g_pkgUploadFile.close();
     // Only mark "received" if the temp file was actually opened & written.
     if (SD.exists(ESPKG_TMP_PATH)) updateStatus = "Package received";
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    // The client dropped mid-upload. Close the handle and remove the partial
+    // package, so a later POST cannot arm a truncated file.
+    if (g_pkgUploadFile) g_pkgUploadFile.close();
+    if (SD.exists(ESPKG_TMP_PATH)) SD.remove(ESPKG_TMP_PATH);
+    updateStatus = "Upload aborted";
+    updateProgress = 0;
   }
+}
+
+// Checks that the package on SD is long enough for everything its manifest
+// declares: header, manifest, every website file and the firmware. A truncated
+// upload is refused here, before anything is armed or written.
+static bool manifestFitsPackage(size_t pkgSize, String& err) {
+  File pkg = SD.open(ESPKG_TMP_PATH, FILE_READ);
+  if (!pkg) { err = "cannot reopen package"; return false; }
+  uint8_t hdr[10];
+  if (pkg.read(hdr, 10) != 10) { pkg.close(); err = "package truncated"; return false; }
+  uint32_t manLen = (uint32_t)hdr[6] | ((uint32_t)hdr[7] << 8) |
+                    ((uint32_t)hdr[8] << 16) | ((uint32_t)hdr[9] << 24);
+  char* manBuf = (char*)malloc(manLen + 1);
+  if (!manBuf) { pkg.close(); err = "out of memory"; return false; }
+  if (pkg.read((uint8_t*)manBuf, manLen) != (int)manLen) {
+    free(manBuf); pkg.close(); err = "package truncated"; return false;
+  }
+  pkg.close();
+  manBuf[manLen] = 0;
+  DynamicJsonDocument man(8192);
+  DeserializationError jerr = deserializeJson(man, manBuf);
+  free(manBuf);
+  if (jerr) { err = "bad manifest JSON"; return false; }
+
+  uint64_t need = 10ULL + manLen;
+  for (JsonObject f : man["sd"].as<JsonArray>()) need += (uint32_t)(f["size"] | 0);
+  need += (uint32_t)(man["fw"]["size"] | 0);
+  if (need > pkgSize) { err = "package truncated: manifest declares more data than was received"; return false; }
+  return true;
 }
 
 // ---- POST finalizer: arm the apply (runs from loop) ------------------------
 void handleUpdatePackagePost() {
   if (!sdCardPresent || !SD.exists(ESPKG_TMP_PATH)) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"no package received\"}");
+    return;
+  }
+  // The upload START checks these too, but a script can start between the
+  // upload and this POST, and arming the apply then would replace SD files
+  // under the running script.
+  if (scriptRunning || updateApplying) {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"a script is running or an update is in progress - stop it first\"}");
     return;
   }
   // Sanity-check the uploaded blob BEFORE arming the apply: verify magic and
@@ -71,6 +115,12 @@ void handleUpdatePackagePost() {
   if (manLen == 0 || manLen > 8192 || pkgSize < (size_t)(10 + manLen)) {
     SD.remove(ESPKG_TMP_PATH);
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"package truncated or manifest length invalid\"}");
+    return;
+  }
+  String covErr;
+  if (!manifestFitsPackage(pkgSize, covErr)) {
+    SD.remove(ESPKG_TMP_PATH);
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"" + covErr + "\"}");
     return;
   }
 
@@ -118,9 +168,8 @@ static bool extractFile(File& src, const String& path, uint32_t len,
     // corrupting the extract with a concurrent mutating handler.
   }
   dst.close();
-  // atomically swap into place
-  if (SD.exists(path)) SD.remove(path);
-  if (!SD.rename(tmp, path)) { SD.remove(tmp); return false; }
+  // swap into place; the old file stays until the new one is in place
+  if (!replaceFileOnSD(tmp, path)) { SD.remove(tmp); return false; }
   return true;
 }
 
@@ -128,6 +177,11 @@ static bool extractFile(File& src, const String& path, uint32_t len,
 void processPendingUpdate() {
   if (!updatePackageReady) return;
   updatePackageReady = false;
+  // Re-check: a script may have started since the POST armed the update.
+  if (scriptRunning || updateApplying) {
+    updateStatus = "Rejected: script is running - stop it first";
+    return;
+  }
   updateApplying = true;
   updateProgress = 0;
   updateStatus = "Opening package...";
@@ -181,16 +235,21 @@ void processPendingUpdate() {
     // manifest. Without this, a crafted .espkg with `"path":"/reboot_script.txt"`
     // overwrites files that the boot flow auto-executes -> persistent
     // arbitrary code exec from anyone who can POST /api/update-package.
-    // Also block absolute-path escapes.
-    bool badPath = (path.indexOf("..") >= 0) ||
-                   (path == "/reboot_script.txt") ||
-                   (path == "/temp_resume.txt")   ||
-                   (path == "/update.espkg");
+    // Also block absolute-path escapes. The path is canonicalized first, so
+    // "./", "//" and case changes cannot slip past the list below, and the
+    // Wi-Fi credential files are blocked too (a manifest could overwrite them).
+    String canon;
+    bool badPath = !canonicalSdPath(path, canon) ||
+                   isSecretSdPath(canon) ||
+                   canon.equalsIgnoreCase("/reboot_script.txt") ||
+                   canon.equalsIgnoreCase("/temp_resume.txt")   ||
+                   canon.equalsIgnoreCase("/update.espkg");
     if (badPath) {
       updateStatus = "Error: rejected unsafe manifest path " + path;
       Serial.println("[UPDATE] " + updateStatus);
       setLEDMode(4); pkg.close(); updateApplying = false; return;
     }
+    path = canon;
     updateStatus = "Writing " + path;
     // v4.11: DON'T call server.handleClient() here - reentrancy risk.
     // Any concurrent /api/live-type / /api/save / /api/factory-reset that
