@@ -53,15 +53,24 @@ fi
 log "ghostlink-sh starting"
 
 # ---------- 2. parse config.txt into env ----------
-# grep lines of form KEY=VAL, export each. Strip inline # comments.
+# KEY=VAL per line. A '#' starts a comment only at the start of the value or
+# after whitespace (the same rule as onboard/ghostlink.sh and the C parser), so
+# passwords containing '#' survive. Keys must match [A-Za-z0-9_]. The value is
+# passed through a variable and never spliced into the eval text.
 while IFS='=' read -r k v; do
     case "$k" in \#*|'') continue ;; esac
-    v="${v%%#*}"
-    v="${v%"${v##*[![:space:]]}"}"
     k="${k%"${k##*[![:space:]]}"}"
     k="${k#"${k%%[![:space:]]*}"}"
     [ -n "$k" ] || continue
-    eval "GCFG_$k='$v'"
+    case "$k" in *[!A-Za-z0-9_]*) continue ;; esac
+    case "$v" in
+        \#*) v= ;;
+        *[[:space:]]\#*) v="${v%%[[:space:]]#*}" ;;
+    esac
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    __v="$v"
+    eval "GCFG_$k=\$__v"
 done < "$CFG"
 
 truthy() { case "$1" in TRUE|true|1|YES|yes|on|ON) return 0 ;; *) return 1 ;; esac; }
