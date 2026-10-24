@@ -101,7 +101,8 @@ hardware watchdog with userspace ping; a stuck ghostlink reboots in
 ### Isolate clients, API token, Factory reset
 
 `PANIC_HOLD_S` + `PANIC_SCRUB` — hold button for the configured seconds and
-`/Records` is cryptographically scrubbed before reboot. Opt-out explicitly.
+`/Records` is cryptographically scrubbed before reboot. Off by default: set
+`PANIC_SCRUB=TRUE` to opt in.
 
 `FACTORY_RESET_TAPS` — tap the button that many times inside 3s to wipe
 config.txt and reboot clean.

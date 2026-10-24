@@ -98,8 +98,8 @@ void cfg_set_default(ghost_cfg_t *c) {
 
     c->ssh = 1;
     c->ssh_port = 22;
-    c->ssh_password_auth = 1;
-    c->ssh_root = 1;
+    c->ssh_password_auth = 0;
+    c->ssh_root = 0;
 
     c->mdns = 1;
     cp(c->mdns_name, sizeof(c->mdns_name), "ghostlink.local");
@@ -140,7 +140,7 @@ void cfg_set_default(ghost_cfg_t *c) {
     c->watchdog_timeout_s = 30;
 
     c->panic_hold_s = 10;
-    c->panic_scrub  = 1;
+    c->panic_scrub  = 0;
 
     cp(c->ota_pubkey, sizeof(c->ota_pubkey), "/Firmware/ota.pub.pem");
 

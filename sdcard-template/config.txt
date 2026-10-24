@@ -111,8 +111,8 @@ PAYLOAD_TAP_WINDOW_MS=800            # how fast taps count as a sequence
 # ----- 12. SSH / remote --------------------------------------------------------
 SSH=TRUE
 SSH_PORT=22
-SSH_PASSWORD_AUTH=TRUE
-SSH_ROOT=TRUE
+SSH_PASSWORD_AUTH=FALSE
+SSH_ROOT=FALSE
 
 
 # ----- 13. mDNS discovery ------------------------------------------------------
@@ -199,7 +199,7 @@ WATCHDOG_TIMEOUT_S=30
 # If button is held for PANIC_HOLD_S the SD /Records folder is cryptographically
 # scrubbed and the device reboots clean. Use with care.
 PANIC_HOLD_S=10
-PANIC_SCRUB=TRUE
+PANIC_SCRUB=FALSE
 
 
 # ----- 27. Firmware OTA ------------------------------------------------------
