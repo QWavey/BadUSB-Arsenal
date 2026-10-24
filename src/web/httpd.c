@@ -431,11 +431,11 @@ static void *req_thread(void *arg) {
 }
 
 static void *accept_loop(void *arg) {
-    (void)arg;
+    int lfd = (int)(intptr_t)arg;   /* this start's socket, not the global */
     while (g_run) {
         struct sockaddr_in a;
         socklen_t al = sizeof(a);
-        int c = accept(g_listen, (struct sockaddr *)&a, &al);
+        int c = accept(lfd, (struct sockaddr *)&a, &al);
         if (c < 0) { if (errno == EINTR) continue; break; }
         pthread_t t;
         pthread_create(&t, NULL, req_thread, (void *)(intptr_t)c);
@@ -466,13 +466,19 @@ int httpd_start(void) {
     }
     listen(g_listen, 16);
     g_run = 1;
-    pthread_create(&g_t, NULL, accept_loop, NULL);
+    pthread_create(&g_t, NULL, accept_loop, (void *)(intptr_t)g_listen);
     LOGI("web", "listening on %s:%d", g_cfg.webui_bind, g_cfg.webui_port);
     return 0;
 }
 
 int httpd_stop(void) {
     g_run = 0;
-    if (g_listen >= 0) { close(g_listen); g_listen = -1; }
+    if (g_listen >= 0) {
+        /* shutdown() wakes the accept() in accept_loop; close() alone does not. */
+        shutdown(g_listen, SHUT_RDWR);
+        close(g_listen);
+        g_listen = -1;
+        pthread_join(g_t, NULL);
+    }
     return 0;
 }
