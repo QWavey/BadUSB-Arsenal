@@ -1195,6 +1195,12 @@ static bool cfg_key_is(const char *line, const char *key, const char **valp) {
 static uint16_t clamp_u16(uint16_t v, uint16_t lo, uint16_t hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+/* Saturate a parsed CONFIG value to 16 bits.  The clamp runs afterwards, so an
+ * oversized value has to stay large: 65537 becomes 65535 (then the upper clamp),
+ * not 1 (which the lower clamp would accept). */
+static uint16_t cfg_u16(uint32_t v) { return v > 0xFFFFu ? 0xFFFFu : (uint16_t)v; }
+/* VID/PID are full 16-bit identifiers, so an out-of-range value is ignored. */
+static void cfg_set_u16_exact(uint16_t *dst, uint32_t v) { if (v <= 0xFFFFu) *dst = (uint16_t)v; }
 static uint32_t cfg_parse_val(const char *s) {
     uint32_t v = 0;
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
@@ -1212,39 +1218,49 @@ static uint32_t cfg_parse_val(const char *s) {
     return v;
 }
 
+/* Apply one CONFIG.TXT line.  `p` is NUL-terminated and holds no line break. */
+static void cfg_apply_line(char *p) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p || *p == '#') return;
+    const char *v;
+    if      (cfg_key_is(p, "hold_ms",           &v)) char_settle_ms        = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "gap_ms",            &v)) cfg_key_gap_ms        = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "mod_settle_ms",     &v)) cfg_mod_settle_ms     = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "warmup_slow_keys",  &v)) cfg_warmup_slow_keys  = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "warmup_slow_extra", &v)) cfg_warmup_slow_extra = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "warmup_ramp_keys",  &v)) cfg_warmup_ramp_keys  = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "warmup_ramp_extra", &v)) cfg_warmup_ramp_extra = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "jitter_max",        &v)) jitter_max            = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "jitter",            &v)) jitter_enabled        = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "autocal",           &v)) cfg_autocal           = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "dryrun",            &v)) cfg_dryrun            = cfg_u16(cfg_parse_val(v));
+    else if (cfg_key_is(p, "vid",               &v)) cfg_set_u16_exact(&current_vid, cfg_parse_val(v));
+    else if (cfg_key_is(p, "pid",               &v)) cfg_set_u16_exact(&current_pid, cfg_parse_val(v));
+}
+
 /* Read optional CONFIG.TXT (key=value lines, '#' comments) and override the
- * runtime-tunable settings.  Absent file / unknown keys leave the defaults. */
+ * runtime-tunable settings.  Absent file / unknown keys leave the defaults.
+ * The file is read in 64-byte chunks and rebuilt into whole lines, so every
+ * line is parsed however large the file is.  A line longer than 63 bytes keeps
+ * only its first 63 bytes; every documented key sits well inside that. */
 static void load_config(void) {
-    static char buf[512];   /* CONFIG.TXT is a short key=value file; keep SRAM headroom */
-    if (pf_open("CONFIG.TXT") != FR_OK) return;
+    static char    line[64];
+    static uint8_t chunk[64];
+    uint8_t len = 0;
     UINT br = 0;
-    if (pf_read(buf, sizeof(buf) - 1, &br) != FR_OK || br == 0) return;
-    buf[br] = 0;
-    uint16_t i = 0;
-    while (i < br) {
-        uint16_t j = i;
-        while (j < br && buf[j] != '\n' && buf[j] != '\r') j++;
-        buf[j] = 0;
-        char *p = &buf[i];
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p && *p != '#') {
-            const char *v;
-            if      (cfg_key_is(p, "hold_ms",           &v)) char_settle_ms        = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "gap_ms",            &v)) cfg_key_gap_ms        = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "mod_settle_ms",     &v)) cfg_mod_settle_ms     = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "warmup_slow_keys",  &v)) cfg_warmup_slow_keys  = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "warmup_slow_extra", &v)) cfg_warmup_slow_extra = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "warmup_ramp_keys",  &v)) cfg_warmup_ramp_keys  = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "warmup_ramp_extra", &v)) cfg_warmup_ramp_extra = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "jitter_max",        &v)) jitter_max            = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "jitter",            &v)) jitter_enabled        = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "autocal",           &v)) cfg_autocal           = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "dryrun",            &v)) cfg_dryrun            = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "vid",               &v)) current_vid           = (uint16_t)cfg_parse_val(v);
-            else if (cfg_key_is(p, "pid",               &v)) current_pid           = (uint16_t)cfg_parse_val(v);
+    if (pf_open("CONFIG.TXT") != FR_OK) return;
+    for (;;) {
+        if (pf_read(chunk, sizeof(chunk), &br) != FR_OK || br == 0) break;
+        for (UINT k = 0; k < br; k++) {
+            char c = (char)chunk[k];
+            if (c == '\n' || c == '\r') {
+                if (len) { line[len] = 0; cfg_apply_line(line); len = 0; }
+            } else if (len < sizeof(line) - 1) {
+                line[len++] = c;
+            }
         }
-        i = j + 1;
     }
+    if (len) { line[len] = 0; cfg_apply_line(line); }
 
     /* Clamp to safe ranges so a CONFIG.TXT typo can't brick the device: hold_ms=0
      * would drop every keystroke (0 ms hold), and jitter_max=50000 would hold each
