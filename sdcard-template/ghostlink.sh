@@ -217,7 +217,6 @@ code,pre{background:#141a20;padding:6px 10px;border-radius:4px;display:block;whi
 <h3>Links</h3>
 <ul>
   <li><a href="/cgi-bin/status">/cgi-bin/status</a></li>
-  <li><a href="/cgi-bin/config">/cgi-bin/config</a></li>
   <li><a href="/cgi-bin/records">/cgi-bin/records</a></li>
 </ul>
 </body></html>
@@ -242,12 +241,6 @@ echo
 echo "== gadget UDC bound =="
 cat /sys/kernel/config/usb_gadget/ghostlink/UDC 2>/dev/null
 EOF
-    cat > $RUN/www/cgi-bin/config <<EOF
-#!/bin/sh
-echo "Content-Type: text/plain"
-echo
-cat $CFG
-EOF
     cat > $RUN/www/cgi-bin/records <<EOF
 #!/bin/sh
 echo "Content-Type: text/plain"
@@ -255,8 +248,13 @@ echo
 ls -lh $SD/Records 2>/dev/null
 EOF
     chmod +x $RUN/www/cgi-bin/*
-    httpd -p "${GCFG_WEBUI_PORT:-80}" -h $RUN/www -f &
-    log "webui on :${GCFG_WEBUI_PORT:-80}"
+    # Serve only on the usb0 gateway address when it is configured, otherwise on
+    # loopback. Never 0.0.0.0: this PoC has no authentication.
+    BIND=127.0.0.1
+    GW="${GCFG_GATEWAY_IP:-172.16.24.1}"
+    if ip -4 addr show dev usb0 2>/dev/null | grep -q "inet $GW/"; then BIND=$GW; fi
+    httpd -p "$BIND:${GCFG_WEBUI_PORT:-80}" -h $RUN/www -f &
+    log "webui on $BIND:${GCFG_WEBUI_PORT:-80}"
 fi
 
 # ---------- 9. HID smoke (optional) ----------
