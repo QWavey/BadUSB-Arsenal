@@ -1,7 +1,9 @@
 # config.txt reference
 
 All keys are UPPER_CASE. Booleans: `TRUE`/`FALSE` only. Blank value = default.
-Lines starting with `#` are comments. Inline `# ...` comments are stripped.
+Lines starting with `#` are comments. A `#` starts an inline comment only at the
+start of a value or after whitespace, so `WEBUI_PASS=pa#ss` keeps its `#`.
+A value longer than its field is cut and the boot log warns.
 Unknown keys land in the boot log as a loud warning (so typos surface).
 
 Hot-reload: writing a new `config.txt` (via WebUI or `touch`) bumps

@@ -25,7 +25,7 @@ truthy() { case "$1" in TRUE|true|1|YES|yes|on|ON) return 0 ;; *) return 1 ;; es
 
 write_dnsmasq_conf() {
     IFACE=${1:-usb0}
-    DR=${2:-172.32.0.100,172.32.0.120,255.255.0.0,12h}
+    DR=${2:-172.16.24.10,172.16.24.60,255.255.255.0,12h}
     DNS=${3:-1.1.1.1,9.9.9.9}
     RED=${4:-FALSE}
     RED_FROM=${5:-}

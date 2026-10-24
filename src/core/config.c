@@ -26,12 +26,15 @@ static int bool_of(const char *v) {
             !strcasecmp(v, "ON")   || !strcmp(v, "1"));
 }
 
-static void cp(char *dst, size_t cap, const char *src) {
-    if (!src) { dst[0] = 0; return; }
+/* Copies src into dst. Returns 1 when src did not fit and was cut. */
+static int cp(char *dst, size_t cap, const char *src) {
+    if (!src) { dst[0] = 0; return 0; }
     size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
+    int truncated = (n >= cap);
+    if (truncated) n = cap - 1;
     memcpy(dst, src, n);
     dst[n] = 0;
+    return truncated;
 }
 
 void cfg_set_default(ghost_cfg_t *c) {
@@ -171,7 +174,10 @@ static char *ltrim(char *s) {
 int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     if (!key) return -1;
     /* Giant switch: one line per schema key. Boring on purpose. */
-#define S(k, field)  if (!strcasecmp(key, k)) { cp(c->field, sizeof(c->field), val); return 0; }
+#define S(k, field)  if (!strcasecmp(key, k)) { \
+    if (cp(c->field, sizeof(c->field), val)) \
+        LOGW("cfg", "%s cut to %zu chars (value too long)", k, sizeof(c->field) - 1); \
+    return 0; }
 #define B(k, field)  if (!strcasecmp(key, k)) { c->field = bool_of(val); return 0; }
 #define I(k, field)  if (!strcasecmp(key, k)) { c->field = (int)strtol(val, NULL, 0); return 0; }
 #define H(k, field)  if (!strcasecmp(key, k)) { c->field = (uint16_t)strtoul(val, NULL, 0); return 0; }
@@ -347,6 +353,16 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     return -1; /* unknown key */
 }
 
+/* A '#' starts a comment only at the start of a value or after whitespace, so
+ * passwords and URL fragments may contain '#'. This is the same rule as
+ * onboard/ghostlink.sh, onboard/button.py and sdcard-template/ghostlink.sh. */
+static void strip_comment(char *v) {
+    if (*v == '#') { *v = 0; return; }
+    for (char *p = v; p[0] && p[1]; p++) {
+        if ((p[0] == ' ' || p[0] == '\t') && p[1] == '#') { p[0] = 0; return; }
+    }
+}
+
 int cfg_load(const char *path) {
     cfg_set_default(&g_cfg);
 
@@ -373,9 +389,7 @@ int cfg_load(const char *path) {
         char *key = p;
         char *val = eq + 1;
 
-        /* strip inline comments on val */
-        char *hash = strchr(val, '#');
-        if (hash) *hash = 0;
+        strip_comment(val);
 
         rtrim(key);
         rtrim(val);
