@@ -1,5 +1,8 @@
 // GhostLink WebUI — single-file SPA, no deps.
 const $ = s => document.querySelector(s);
+// Escape config- or filesystem-derived text before it goes into innerHTML.
+const esc = v => (v == null ? '' : String(v)).replace(/[&<>"']/g,
+  c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 
 async function api(path, opts = {}) {
   const r = await fetch(path, opts);
@@ -11,9 +14,9 @@ async function refreshStatus() {
   const s = await api('/api/status');
   if (typeof s === 'string') { $('#status').textContent = s; return; }
   $('#status').innerHTML = `
-    <div><b>${s.name}</b> &nbsp;·&nbsp; host <code>${s.hostname}</code> &nbsp;·&nbsp; cfg-gen ${s.cfg_gen}</div>
+    <div><b>${esc(s.name)}</b> &nbsp;·&nbsp; host <code>${esc(s.hostname)}</code> &nbsp;·&nbsp; cfg-gen ${s.cfg_gen}</div>
     <div style="margin-top:10px">
-      netmode: <b>${s.netmode}</b> · usb: <b>${s.usb_mode}</b>
+      netmode: <b>${esc(s.netmode)}</b> · usb: <b>${esc(s.usb_mode)}</b>
       · passthrough: ${s.passthrough ? '✔' : '✘'}
       · recording: ${s.recording ? '✔' : '✘'}
       · verdict stream: ${s.verdict_stream ? '✔' : '✘'}
@@ -33,7 +36,7 @@ async function refreshRecords() {
   const rows = l.sort((a, b) => b.mtime - a.mtime).map(f => {
     const dt = new Date(f.mtime * 1000).toISOString().replace('T', ' ').slice(0, 19);
     const mb = (f.size / 1048576).toFixed(2);
-    return `<tr><td><code>${f.name}</code></td><td>${mb} MB</td><td>${dt}</td></tr>`;
+    return `<tr><td><code>${esc(f.name)}</code></td><td>${mb} MB</td><td>${dt}</td></tr>`;
   }).join('');
   $('#recordlist').innerHTML = `<table style="width:100%"><tr>
     <th style="text-align:left">file</th><th>size</th><th>last change</th></tr>${rows}</table>`;

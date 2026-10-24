@@ -166,7 +166,24 @@ static void send_401(int c) {
 
 /* ---------- route handlers ---------- */
 
+/* Escapes src for a JSON string literal. Only whole escapes are written, so
+ * the result is valid JSON even when it is cut to fit cap. */
+static void json_esc(char *dst, size_t cap, const char *src) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && o + 7 < cap; p++) {
+        if (*p == '"' || *p == '\\') { dst[o++] = '\\'; dst[o++] = (char)*p; }
+        else if (*p < 0x20) o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", (unsigned)*p);
+        else dst[o++] = (char)*p;
+    }
+    dst[o] = 0;
+}
+
 static void r_status(int c) {
+    char name[384], host[384], netmode[128], usb[128];
+    json_esc(name, sizeof(name), g_cfg.device_name);
+    json_esc(host, sizeof(host), g_cfg.hostname);
+    json_esc(netmode, sizeof(netmode), g_cfg.netmode);
+    json_esc(usb, sizeof(usb), g_cfg.usb_mode);
     char body[2048];
     int n = snprintf(body, sizeof(body),
         "{\"name\":\"%s\",\"hostname\":\"%s\","
@@ -174,9 +191,9 @@ static void r_status(int c) {
         "\"recording\":%s,\"verdict_stream\":%s,"
         "\"deadnet\":%s,\"redirect\":%s,\"honeypot\":%s,\"hid\":%s,"
         "\"cfg_gen\":%llu}",
-        g_cfg.device_name, g_cfg.hostname, g_cfg.netmode,
+        name, host, netmode,
         g_cfg.passthrough_lan ? "true":"false",
-        g_cfg.usb_mode,
+        usb,
         g_cfg.log_to_sd ? "true":"false",
         g_cfg.verdict_stream ? "true":"false",
         g_cfg.deadnet ? "true":"false",
