@@ -151,12 +151,12 @@ static uint16_t storage_leds_enabled    = 1;   /* $_STORAGE_LEDS_ENABLED     0x8
 static uint16_t injecting_leds_enabled  = 1;   /* $_INJECTING_LEDS_ENABLED   0x8842 */
 static uint16_t last_random_value       = 0;   /* backs $_RANDOM_*_KEYCODE read-outs */
 
-uint16_t        current_vid        = 0x05AC;
-uint16_t        current_pid        = 0x021E;
+uint16_t        current_vid        = USB_VID;
+uint16_t        current_pid        = USB_PID;
 uint8_t         current_attackmode = 1;   /* DEFAULT = HID; ATTACKMODE opcodes override (STORAGE/composite honoured) */
 static uint16_t saved_attackmode   = 1;
-static uint16_t saved_vid          = 0x05AC;
-static uint16_t saved_pid          = 0x021E;
+static uint16_t saved_vid          = USB_VID;
+static uint16_t saved_pid          = USB_PID;
 
 static uint16_t call_stack[32];
 static uint8_t  call_stack_ptr   = 0;
@@ -945,10 +945,10 @@ static void apply_attackmode(void) {
         usb_config_descriptor_size = usb_config_descriptor_hid_size;
     }
 
-    /* Disambiguate the PID for composite/storage when using the default Hak5
+    /* Disambiguate the PID for composite/storage when using the default
      * VID/PID, so Windows keeps separate driver state per mode. */
     uint16_t pid = current_pid;
-    if (current_vid == 0x05AC && current_pid == 0x021E) {
+    if (current_vid == USB_VID && current_pid == USB_PID) {
         if      (current_attackmode == 3) pid ^= 0x4242;
         else if (current_attackmode == 2) pid ^= 0x1337;
     }

@@ -114,19 +114,19 @@ const uint8_t usb_str_lang_descriptor[] = {
     0x09, 0x04 /* English (US) */
 };
 
+/* Project-neutral strings: no third-party vendor or product names. The arrays
+ * are zero-filled past the initialised bytes. */
 uint8_t usb_str_manufacturer_descriptor[66] = {
-    2 + 4 * 2,
+    2 + 10 * 2,
     0x03,
-    'H', 0, 'a', 0, 'k', 0, '5', 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    'R', 0, 'u', 0, 'b', 0, 'b', 0, 'e', 0, 'r', 0, 'l', 0, 'e', 0, 's', 0, 's', 0
 };
 
 uint8_t usb_str_product_descriptor[66] = {
-    2 + 18 * 2,
+    2 + 17 * 2,
     0x03,
-    'U', 0, 'S', 0, 'B', 0, ' ', 0, 'R', 0, 'u', 0, 'b', 0, 'b', 0, 'e', 0,
-    'r', 0, ' ', 0, 'D', 0, 'u', 0, 'c', 0, 'k', 0, 'y', 0, ' ', 0, '5', 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    'R', 0, 'u', 0, 'b', 0, 'b', 0, 'e', 0, 'r', 0, 'l', 0, 'e', 0, 's', 0, 's', 0, ' ', 0,
+    'D', 0, 'e', 0, 'v', 0, 'i', 0, 'c', 0, 'e', 0
 };
 
 /* Modified at runtime to bypass OS caching */

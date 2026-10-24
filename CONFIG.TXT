@@ -21,9 +21,9 @@
 # jitter             = 0      # 1 = enable
 # jitter_max         = 0      # max random ms
 
-# --- USB identity (hex ok, e.g. 0x05AC) ---
-# vid                = 0x05AC
-# pid                = 0x021E
+# --- USB identity (hex ok, e.g. 0x03EB; the defaults are the README values) ---
+# vid                = 0x03EB
+# pid                = 0x2402
 
 # --- Self-calibrating timing (invention) ---
 # autocal            = 0      # 1 = measure host latency via the CapsLock LED echo

@@ -105,9 +105,9 @@ static const uint8_t inquiry_data[36] = {
     0x02, /* Response data format */
     31,   /* Additional length */
     0x00, 0x00, 0x00,
-    'H','a','k','5',' ',' ',' ',' ',
-    'R','u','b','b','e','r','D','u',
-    'c','k','y',' ',' ',' ',' ',' ',
+    'R','u','b','b','e','r','l','s',
+    'M','a','s','s',' ','S','t','o',
+    'r','a','g','e',' ',' ',' ',' ',
     '1','.','0','0'
 };
 
