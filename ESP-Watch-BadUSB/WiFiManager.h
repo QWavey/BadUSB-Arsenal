@@ -21,6 +21,7 @@ String getDay(String region);
 String makeHttpRequest(String url);
 void saveWiFiCredentials(String ssid, String pass);
 void processAutoConnect();
+bool getSavedWiFiPassword(const String& ssid, String& pass);
 String getSavedWiFiCredentials();
 std::vector<String> getSavedSSIDs();
 void deleteWiFiCredential(String ssid);

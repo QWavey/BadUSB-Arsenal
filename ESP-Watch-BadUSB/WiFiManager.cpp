@@ -1,6 +1,9 @@
 #include "WiFiManager.h"
 #include "LogManager.h"
 #include "BTManager.h"
+#include "FSManager.h"           // replaceFileOnSD, jsonEscapeStr
+#include "WatchUI.h"             // watchUiFlash: shows an AP start failure on the watch
+#include <string.h>              // strlen
 #include <HTTPClient.h>
 #include <DNSServer.h>
 #include <esp_wifi.h>   // v4.12: esp_wifi_set_mac for Randomize-MAC on STA join
@@ -38,10 +41,25 @@ void setupAP() {
   // never cleaned up, then next connect crashes on WiFiServer::available()).
   // Also raise the beacon interval slightly and use a fixed channel so the
   // ROM's AP task doesn't roam.
+  // Fail closed: never fall back to an open network. A passphrase outside the
+  // WPA2 range, or one softAP rejects, leaves the AP off and sets lastError
+  // (shown in the dashboard stats) instead of opening the network.
+  if (ap_password.length() < 8 || ap_password.length() > 63) {
+    Serial.println("[WiFi] AP NOT started: passphrase must be 8-63 characters");
+    lastError = "AP not started: passphrase must be 8-63 characters";
+    errorCount++;
+    watchUiFlash("AP not started: passphrase must be 8-63 chars");
+    WiFi.softAPdisconnect(true);
+    return;
+  }
   if (!WiFi.softAP(ap_ssid.c_str(), ap_password.c_str(), /*channel=*/1,
                    /*ssid_hidden=*/0, /*max_connection=*/4)) {
-    Serial.println("[WiFi] Failed to setup AP with password — trying open AP");
-    WiFi.softAP(ap_ssid.c_str(), NULL, 1, 0, 4);
+    Serial.println("[WiFi] AP NOT started: softAP rejected the passphrase - AP stays off");
+    lastError = "AP not started: softAP rejected the passphrase";
+    errorCount++;
+    watchUiFlash("AP not started: check passphrase");
+    WiFi.softAPdisconnect(true);
+    return;
   }
   // Watch port bug hunt: default modem sleep on the AP path parks the radio
   // between beacons — TCP RTTs balloon and pages "load forever" in the
@@ -327,19 +345,108 @@ String makeHttpRequest(String url) {
 // ============================================================
 // WiFi Credential Management & Auto-Connect
 // ============================================================
+// On-disk format, one network per line:
+//   v2 SSID="<ssid>" PASSWORD="<password>"
+// Inside the quotes, backslash and double quote are written with a backslash
+// in front, and CR and LF as \r and \n, so any SSID or password round-trips.
+// Lines without the "v2 " marker are the old format (no escaping) and are read
+// as before, so existing cards keep working.
+struct SavedWiFi { String ssid; String pass; };
+
+static String wifiFieldEscape(const String& in) {
+    String out;
+    out.reserve(in.length() + 4);
+    for (size_t i = 0; i < in.length(); ++i) {
+        char c = in[i];
+        if (c == '\\')      out += "\\\\";
+        else if (c == '"')  out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else                out += c;
+    }
+    return out;
+}
+
+// Reads the quoted value that follows `key` (for example SSID=") at or after
+// index `from`. escaped selects the v2 rules that undo wifiFieldEscape().
+// On success `next` is the index just past the closing quote.
+static bool readQuotedField(const String& line, const char* key, size_t from,
+                            bool escaped, String& value, size_t& next) {
+    int start = line.indexOf(key, (unsigned int)from);
+    if (start < 0) return false;
+    size_t i = (size_t)start + strlen(key);
+    value = "";
+    while (i < line.length()) {
+        char c = line[i];
+        if (escaped && c == '\\' && i + 1 < line.length()) {
+            char n = line[i + 1];
+            if (n == 'n')      value += '\n';
+            else if (n == 'r') value += '\r';
+            else               value += n;   // \\ and \" (and anything else) stand for themselves
+            i += 2;
+            continue;
+        }
+        if (c == '"') { next = i + 1; return true; }
+        value += c;
+        ++i;
+    }
+    return false;   // no closing quote
+}
+
+static bool parseSavedWiFiLine(String line, SavedWiFi& out) {
+    line.trim();
+    if (line.length() == 0) return false;
+    bool escaped = line.startsWith("v2 ");
+    size_t afterSsid = 0;
+    if (!readQuotedField(line, "SSID=\"", 0, escaped, out.ssid, afterSsid)) return false;
+    // PASSWORD is searched only after the SSID's closing quote, so an SSID that
+    // ends in PASSWORD= cannot be mistaken for the password field.
+    size_t afterPass = 0;
+    if (!readQuotedField(line, "PASSWORD=\"", afterSsid, escaped, out.pass, afterPass)) out.pass = "";
+    return true;
+}
+
+// Parses /wifi_creds.txt once into a list. Every reader goes through here, so
+// the file format is handled in one place.
+static std::vector<SavedWiFi> readSavedWiFi() {
+    std::vector<SavedWiFi> list;
+    if (!sdCardPresent || !SD.exists("/wifi_creds.txt")) return list;
+    File f = SD.open("/wifi_creds.txt");
+    if (!f) return list;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        SavedWiFi e;
+        if (parseSavedWiFiLine(line, e)) list.push_back(e);
+    }
+    f.close();
+    return list;
+}
+
+// Looks up the stored password for a saved network. The password itself is
+// only used server-side to join; it is never sent to a client.
+bool getSavedWiFiPassword(const String& ssid, String& pass) {
+    for (const SavedWiFi& e : readSavedWiFi()) {
+        if (e.ssid == ssid) { pass = e.pass; return true; }
+    }
+    return false;
+}
+
 void saveWiFiCredentials(String ssid, String pass) {
     if (!sdCardPresent) return;
     
-    // Check if already exists to avoid duplicates
-    String existing = getSavedWiFiCredentials();
-    if (existing.indexOf("SSID=\"" + ssid + "\"") != -1) {
-        Serial.println("[WiFi] Credentials for " + ssid + " already saved.");
-        return;
+    // Duplicate check against the parsed list. The old check searched JSON text
+    // for the file-format string, which never matched, so a network was added
+    // again on every save.
+    for (const SavedWiFi& e : readSavedWiFi()) {
+        if (e.ssid == ssid) {
+            Serial.println("[WiFi] Credentials for " + ssid + " already saved.");
+            return;
+        }
     }
 
     File f = SD.open("/wifi_creds.txt", FILE_APPEND);
     if (f) {
-        f.println("SSID=\"" + ssid + "\" PASSWORD=\"" + pass + "\"");
+        f.println("v2 SSID=\"" + wifiFieldEscape(ssid) + "\" PASSWORD=\"" + wifiFieldEscape(pass) + "\"");
         f.close();
         Serial.println("[WiFi] Credentials saved for: " + ssid);
     } else {
@@ -347,84 +454,24 @@ void saveWiFiCredentials(String ssid, String pass) {
     }
 }
 
+// Kept for the endpoint that still calls it; removed with that endpoint's change.
 String getSavedWiFiCredentials() {
-    if (!sdCardPresent || !SD.exists("/wifi_creds.txt")) return "[]";
-    
-    File f = SD.open("/wifi_creds.txt");
-    if (!f) return "[]";
-    
     String json = "[";
     bool first = true;
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) continue;
-        
-        int s1 = line.indexOf("SSID=\"");
-        int s2 = line.indexOf("\"", s1 + 6);
-        int p1 = line.indexOf("PASSWORD=\"");
-        int p2 = line.indexOf("\"", p1 + 10);
-        
-        if (s1 != -1 && s2 != -1) {
-            if (!first) json += ",";
-            String ssid = line.substring(s1 + 6, s2);
-            String pass = (p1 != -1 && p2 != -1) ? line.substring(p1 + 10, p2) : "";
-            // Bug-hunt #21: escape " and \ (and control chars) in ssid/pass
-            // before splicing into JSON. Prior behaviour emitted broken JSON
-            // if a WPA2 PSK contained a literal " — the dashboard's JSON.
-            // parse rejected the whole payload and the saved-WiFi list read
-            // as empty.
-            auto jsonEsc = [](const String& in) {
-                String out; out.reserve(in.length() + 4);
-                for (size_t i = 0; i < in.length(); ++i) {
-                    char c = in[i];
-                    switch (c) {
-                        case '"':  out += "\\\""; break;
-                        case '\\': out += "\\\\"; break;
-                        case '\b': out += "\\b";  break;
-                        case '\f': out += "\\f";  break;
-                        case '\n': out += "\\n";  break;
-                        case '\r': out += "\\r";  break;
-                        case '\t': out += "\\t";  break;
-                        default:
-                            if ((unsigned char)c < 0x20) {
-                                char buf[8];
-                                snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                                out += buf;
-                            } else out += c;
-                    }
-                }
-                return out;
-            };
-            json += "{\"ssid\":\"" + jsonEsc(ssid) + "\",\"pass\":\"" + jsonEsc(pass) + "\"}";
-            first = false;
-        }
+    for (const SavedWiFi& e : readSavedWiFi()) {
+        if (!first) json += ",";
+        json += "{\"ssid\":\"" + jsonEscapeStr(e.ssid) + "\",\"pass\":\"" + jsonEscapeStr(e.pass) + "\"}";
+        first = false;
     }
-    f.close();
     json += "]";
     return json;
 }
 
 std::vector<String> getSavedSSIDs() {
+    // SSIDs only. Passwords are never returned by any endpoint; they are read
+    // server-side through getSavedWiFiPassword() when joining.
     std::vector<String> ssids;
-    if (!sdCardPresent || !SD.exists("/wifi_creds.txt")) return ssids;
-    
-    File f = SD.open("/wifi_creds.txt");
-    if (!f) return ssids;
-    
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) continue;
-        
-        int s1 = line.indexOf("SSID=\"");
-        int s2 = line.indexOf("\"", s1 + 6);
-        
-        if (s1 != -1 && s2 != -1) {
-            ssids.push_back(line.substring(s1 + 6, s2));
-        }
-    }
-    f.close();
+    for (const SavedWiFi& e : readSavedWiFi()) ssids.push_back(e.ssid);
     return ssids;
 }
 
@@ -447,16 +494,20 @@ void deleteWiFiCredential(String ssid) {
 
     while (f.available()) {
         String line = f.readStringUntil('\n');
-        if (line.indexOf("SSID=\"" + ssid + "\"") == -1) {
+        SavedWiFi e;
+        // Copy every other line through unchanged; drop only the target network.
+        if (!(parseSavedWiFiLine(line, e) && e.ssid == ssid)) {
             temp.println(line);
         }
     }
     f.close();
     temp.close();
-    // Only swap into place after we've built a valid temp file.
-    SD.remove("/wifi_creds.txt");
-    if (!SD.rename("/temp_creds.txt", "/wifi_creds.txt")) {
-        Serial.println("[WiFi] deleteWiFiCredential: rename failed — creds file MAY be missing; check /temp_creds.txt");
+
+    // Swap the new list in. replaceFileOnSD keeps the old list until the new one
+    // is in place, and restores it if the rename fails.
+    if (!replaceFileOnSD("/temp_creds.txt", "/wifi_creds.txt")) {
+        Serial.println("[WiFi] deleteWiFiCredential: replace failed - original list kept, new list left in /temp_creds.txt");
+        return;
     }
     Serial.println("[WiFi] Deleted credentials for: " + ssid);
 }
@@ -495,19 +546,18 @@ void processAutoConnect() {
         return;
     }
 
-    String credsJson = getSavedWiFiCredentials();
+    // Parsed list and direct SSID comparison: no JSON round trip, so SSIDs and
+    // passwords with quotes or backslashes are matched and joined correctly.
+    std::vector<SavedWiFi> saved = readSavedWiFi();
     for (int i = 0; i < n; i++) {
         String netSSID = WiFi.SSID(i);
-        if (credsJson.indexOf("\"ssid\":\"" + netSSID + "\"") != -1) {
-            int start = credsJson.indexOf("\"ssid\":\"" + netSSID + "\"");
-            int passStart = credsJson.indexOf("\"pass\":\"", start) + 8;
-            int passEnd = credsJson.indexOf("\"", passStart);
-            String pass = credsJson.substring(passStart, passEnd);
-
-            Serial.println("[WiFi] Auto-connect: Found visible saved network " + netSSID + ". Joining...");
-            logDebug("Auto-connect: joining " + netSSID);
-            joinWiFi(netSSID, pass);
-            break;
+        for (const SavedWiFi& e : saved) {
+            if (e.ssid == netSSID) {
+                Serial.println("[WiFi] Auto-connect: Found visible saved network " + netSSID + ". Joining...");
+                logDebug("Auto-connect: joining " + netSSID);
+                joinWiFi(e.ssid, e.pass);
+                return;
+            }
         }
     }
 }
