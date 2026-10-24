@@ -171,6 +171,29 @@ static char *ltrim(char *s) {
     return s;
 }
 
+/* Values that reach shell command strings in bridge.c and main.c are checked
+ * here, at parse time, so those files need no change. A rejected value leaves
+ * the field unchanged and logs a warning. */
+#define CS_IPV4  "0123456789."
+#define CS_RANGE "0123456789.,"
+#define CS_IFACE "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
+#define CS_PATH  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-"
+
+static int charset_ok(const char *v, const char *allowed, size_t maxlen) {
+    size_t n = strlen(v);
+    if (n > maxlen) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!strchr(allowed, v[i])) return 0;
+    return 1;
+}
+
+/* Payload paths are joined onto /mnt/sd and handed to 'sh'. Empty is allowed. */
+static int payload_path_ok(const char *v, size_t maxlen) {
+    if (!v[0]) return 1;
+    if (v[0] != '/' || strstr(v, "..")) return 0;
+    return charset_ok(v, CS_PATH, maxlen);
+}
+
 int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     if (!key) return -1;
     /* Giant switch: one line per schema key. Boring on purpose. */
@@ -181,6 +204,18 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
 #define B(k, field)  if (!strcasecmp(key, k)) { c->field = bool_of(val); return 0; }
 #define I(k, field)  if (!strcasecmp(key, k)) { c->field = (int)strtol(val, NULL, 0); return 0; }
 #define H(k, field)  if (!strcasecmp(key, k)) { c->field = (uint16_t)strtoul(val, NULL, 0); return 0; }
+/* V: copy only if the value uses an allowed charset; returns -2 when rejected. */
+#define V(k, field, allowed) if (!strcasecmp(key, k)) { \
+    if (!charset_ok(val, allowed, sizeof(c->field) - 1)) { \
+        LOGW("cfg", "%s rejected (bad characters or too long); field unchanged", k); \
+        return -2; } \
+    cp(c->field, sizeof(c->field), val); return 0; }
+/* P: payload path, see payload_path_ok(). */
+#define P(k, field) if (!strcasecmp(key, k)) { \
+    if (!payload_path_ok(val, sizeof(c->field) - 1)) { \
+        LOGW("cfg", "%s rejected (must be /path with [A-Za-z0-9._/-], no ..); field unchanged", k); \
+        return -2; } \
+    cp(c->field, sizeof(c->field), val); return 0; }
 
     S("HOSTNAME", hostname);
     S("DEVICE_NAME", device_name);
@@ -202,14 +237,14 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     B("PASSTHROUGH_LAN", passthrough_lan);
     S("NETMODE", netmode);
     B("ASSIGN_IP", assign_ip);
-    S("DHCP_RANGE", dhcp_range);
-    S("GATEWAY_IP", gateway_ip);
+    V("DHCP_RANGE", dhcp_range, CS_RANGE);
+    V("GATEWAY_IP", gateway_ip, CS_IPV4);
     S("DNS_UPSTREAM", dns_upstream);
     B("MAC_CLONE", mac_clone);
-    S("MAC_CLONE_FROM", mac_clone_from);
-    S("STATIC_IP", static_ip);
-    S("STATIC_NETMASK", static_netmask);
-    S("STATIC_GATEWAY", static_gateway);
+    V("MAC_CLONE_FROM", mac_clone_from, CS_IFACE);
+    V("STATIC_IP", static_ip, CS_IPV4);
+    V("STATIC_NETMASK", static_netmask, CS_IPV4);
+    V("STATIC_GATEWAY", static_gateway, CS_IPV4);
 
     B("LOG_TO_SD", log_to_sd);
     S("RECORD_FORMAT", record_format);
@@ -255,9 +290,9 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     I("HID_DELAY_MS", hid_delay_ms);
 
     B("PAYLOADS", payloads);
-    S("PAYLOAD_SWITCH1", payload_switch1);
-    S("PAYLOAD_SWITCH2", payload_switch2);
-    S("PAYLOAD_SWITCH3", payload_switch3);
+    P("PAYLOAD_SWITCH1", payload_switch1);
+    P("PAYLOAD_SWITCH2", payload_switch2);
+    P("PAYLOAD_SWITCH3", payload_switch3);
     I("PAYLOAD_TAP_WINDOW_MS", payload_tap_window_ms);
 
     B("SSH", ssh);
@@ -350,6 +385,8 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
 #undef B
 #undef I
 #undef H
+#undef V
+#undef P
     return -1; /* unknown key */
 }
 
@@ -374,7 +411,7 @@ int cfg_load(const char *path) {
     }
 
     char line[1024];
-    int unknown = 0, parsed = 0, lineno = 0;
+    int unknown = 0, parsed = 0, rejected = 0, lineno = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
         char *p = ltrim(line);
@@ -397,15 +434,19 @@ int cfg_load(const char *path) {
         for (int i = (int)strlen(key) - 1; i >= 0 && (key[i] == ' ' || key[i] == '\t'); i--) key[i] = 0;
         val = ltrim(val);
 
-        if (cfg_set_kv(&g_cfg, key, val) == 0) {
+        int rc = cfg_set_kv(&g_cfg, key, val);
+        if (rc == 0) {
             parsed++;
+        } else if (rc == -2) {
+            rejected++;   /* cfg_set_kv already logged the line */
         } else {
             unknown++;
             LOGW("cfg", "line %d: unknown key '%s'", lineno, key);
         }
     }
     fclose(f);
-    LOGI("cfg", "loaded %d keys (%d unknown) from %s", parsed, unknown, path);
+    LOGI("cfg", "loaded %d keys (%d unknown, %d rejected) from %s",
+         parsed, unknown, rejected, path);
     __atomic_add_fetch(&g_cfg_gen, 1, __ATOMIC_RELEASE);
     return 0;
 }

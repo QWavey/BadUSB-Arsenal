@@ -48,6 +48,11 @@ keys apply without reboot; those that don't are listed below.
 | MAC_CLONE_FROM | iface | eth0 | |
 | STATIC_IP, STATIC_NETMASK, STATIC_GATEWAY | | DHCP if empty |
 
+Validated at load: `GATEWAY_IP`, `DHCP_RANGE` and `STATIC_*` accept only digits,
+dots and commas. `MAC_CLONE_FROM` accepts an interface name. `PAYLOAD_SWITCH1-3`
+accept a `/path` made of `A-Za-z0-9._/-` with no `..`. A rejected value keeps the
+field's previous value and logs a warning.
+
 ### 4. Recording
 | key | type | default | notes |
 |-----|------|---------|-------|
