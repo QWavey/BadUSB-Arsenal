@@ -10,7 +10,7 @@
 - [ ] #1 Classic ESP32: MISO on GPIO37, which the chip lacks — sd:4 — SKIP — not applicable: the repo targets ESP32-S3 (repo description); this applies only if the target were a classic ESP32
 - [ ] #1 ESP32-S3 octal memory: GPIO34-37 reserved internally — sd:2, sd:3, sd:4, sd:5 — FIX — open: the module variant is not named, and free pins cannot be chosen safely without its datasheet. The issue's VSPI example (MISO on GPIO19) must not be used on ESP32-S3, where GPIO19 is USB D-.
 - [ ] #1 SD pins all in GPIO 33-37, which octal memory may use — sd:2, sd:3, sd:4, sd:5 — FIX — open: same blocker as the item above; unverified until the module is confirmed
-- [ ] #1 README has none of the pinout content its description promises — README.md:1 — FIX — pending
+- [x] #1 README has none of the pinout content its description promises — README.md:1 — FIX — fixed in 5bdc6a9
 - [ ] #1 Header has no extension and no include guard — sd:1 — SKIP — style only: the header holds only #define lines, and identical macro redefinitions are legal C, so double inclusion does not break the build
 - [ ] #1 Pin defines not checked for uniqueness or range — sd:2, sd:3, sd:4, sd:5 — SKIP — improvement only: the current values are unique and inside the ESP32-S3 GPIO range (0-48)
 
