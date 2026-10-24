@@ -12,17 +12,17 @@ This firmware is **Alpha**. It exists to bring back devices that are already bri
 
 ## Flash it
 
-The easy path is the web flasher at **(https://qwavey.github.io/flashers/)**. It ships `firmware.hex`, links to `dfu-programmer` and Zadig, and walks you through the whole thing.
+The easy path is the web flasher at **(https://qwavey.github.io/flashers/)**. It ships the prebuilt `docs/firmware.hex`, links to `dfu-programmer` and Zadig, and walks you through the whole thing.
 
 Manual, in short:
 
 1. **Enter DFU mode.** Unplug the device. Hold the small board button (BOOT / HWB / similar) and plug it back in. Release the button.
 2. **Install the WinUSB driver with Zadig (first time only on Windows).** [Zadig](https://zadig.akeo.ie/), `Options` > `List All Devices`, pick `AT32UC3B DFU`, select `WinUSB`, click `Install Driver`.
-3. **Flash.** From an Administrator Command Prompt in the folder that has `firmware.hex` and `dfu-programmer.exe`:
+3. **Flash.** From an Administrator Command Prompt in the repository root, using the bundled `tools\dfu-programmer.exe` and the prebuilt `docs\firmware.hex`:
    ```cmd
-   dfu-programmer at32uc3b1 erase --force
-   dfu-programmer at32uc3b1 flash firmware.hex
-   dfu-programmer at32uc3b1 launch
+   tools\dfu-programmer.exe at32uc3b1 erase --force
+   tools\dfu-programmer.exe at32uc3b1 flash docs\firmware.hex
+   tools\dfu-programmer.exe at32uc3b1 launch
    ```
    The device reboots as a HID keyboard; the status LED goes solid when it is ready.
 
@@ -37,9 +37,8 @@ Manual, in short:
 ├── hwtest/             Bench-test payloads (jitter, storage, opcode coverage, ...)
 ├── languages/          Keymap JSON files
 ├── tools/              AVR toolchain, dfu-programmer, inject_inspect.py, wrap_inject.py
-├── docs/               WebUSB flasher (GitHub Pages)
+├── docs/               WebUSB flasher (GitHub Pages) and the prebuilt firmware.hex
 ├── build/              Output of `make` (firmware.elf/hex/map)
-├── firmware.hex        Prebuilt image (what the flasher writes)
 ├── CONFIG.TXT
 ├── flash_firmware.bat  One-click: erase, flash, launch
 ├── Makefile
@@ -72,7 +71,7 @@ Needs the AVR32 GNU toolchain (`avr32-gcc`, `avr32-objcopy`, `avr32-size`). A Wi
 make all
 ```
 
-Output: `build/firmware.elf`, `build/firmware.hex`, `build/firmware.map`. Copy `build/firmware.hex` over `firmware.hex` at the repo root to bundle it with the flasher page.
+Output: `build/firmware.elf`, `build/firmware.hex`, `build/firmware.map`. Copy `build/firmware.hex` over `docs/firmware.hex` to bundle it with the flasher page.
 
 ## Memory Map
 
@@ -87,7 +86,7 @@ Output: `build/firmware.elf`, `build/firmware.hex`, `build/firmware.map`. Copy `
 
 ## Bench Testing
 
-Compile a payload into `INJECT.BIN` with `tools/wrap_inject.py`, drop it on the SD card, reboot. `tools/inject_inspect.py` disassembles a `.BIN` back to a readable trace. Files in `hwtest/` are the regression suite (`test_payload.txt` is the general one; the rest each isolate one behavior).
+Compile a payload into `INJECT.BIN` with `tools/wrap_inject.py`, drop it on the SD card, reboot. `tools/inject_inspect.py` disassembles a `.BIN` back to a readable trace. Files in `hwtest/` are manual bench payloads, run by hand on the device. They are not an automated regression suite (`test_payload.txt` is the general one; the rest each isolate one behavior).
 
 ## Verify (host)
 
