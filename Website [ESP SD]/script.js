@@ -2277,18 +2277,19 @@ function loadSavedNetworks() {
         networks.forEach(net => {
             const item = document.createElement('div');
             item.className = 'file-item';
-            item.innerHTML = `<span style="flex:1">${net.ssid}</span><button onclick="connectToSaved('${net.ssid}','${net.pass}')" style="font-size:11px;padding:3px 8px;">Connect</button><button class="danger" onclick="deleteSavedNetwork('${net.ssid}')" style="font-size:11px;padding:3px 8px;">✕</button>`;
+            item.innerHTML = `<span style="flex:1">${net.ssid}</span><button onclick="connectToSaved('${net.ssid}')" style="font-size:11px;padding:3px 8px;">Connect</button><button class="danger" onclick="deleteSavedNetwork('${net.ssid}')" style="font-size:11px;padding:3px 8px;">✕</button>`;
             list.appendChild(item);
         });
     }).catch(() => { if (list) list.innerHTML = 'Failed to load'; });
 }
 
-function connectToSaved(ssid, password) {
+function connectToSaved(ssid) {
     const statusEl = document.getElementById('wifiStatus');
     if (statusEl) statusEl.textContent = 'Connecting to ' + ssid + '...';
-    fetch('/api/join-internet', {
+    // The device looks up the stored password itself; it is never sent to the browser.
+    fetch('/api/join-saved', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ssid, password})
+        body: JSON.stringify({ssid})
     }).then(r => r.json()).then(res => { if (res.status === 'connecting') pollWiFiJoinStatus(); });
 }
 
@@ -2332,7 +2333,11 @@ function saveLanguageSettings() {
 }
 
 function saveWiFiSettings() {
+    // Changing the AP settings needs the current AP password (the device refuses without it).
+    const current = prompt('Current AP password (required to change these settings):');
+    if (current === null || current === '') return;
     const data = {
+        currentPassword: current,
         ssid: document.getElementById('wifiSSID').value,
         password: document.getElementById('wifiPassword').value,
         scanTime: parseInt(document.getElementById('wifiScanTime').value)
@@ -4128,6 +4133,9 @@ function factoryReset() {
     );
     if (!ok) return;
     if (!confirm('Really? This cannot be undone.')) return;
+    // The device refuses a factory reset without the current AP password.
+    const apPass = prompt('Type the current AP password to confirm the factory reset:');
+    if (apPass === null || apPass === '') return;
 
     // Show a big blocking overlay while the reset runs.
     const overlay = document.createElement('div');
@@ -4148,8 +4156,15 @@ function factoryReset() {
         document.head.appendChild(s);
     }
 
-    fetch('/api/factory-reset', { method: 'POST' })
-        .then(r => r.text())
+    fetch('/api/factory-reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: apPass })
+    })
+        .then(r => {
+            if (r.status === 403) throw new Error('refused');
+            return r.text();
+        })
         .then(msg => {
             const cd = document.getElementById('factoryCountdown');
             let n = 15;
@@ -4158,7 +4173,13 @@ function factoryReset() {
                 if (--n <= 0) { clearInterval(iv); location.reload(true); }
             }, 1000);
         })
-        .catch(() => {
+        .catch(err => {
+            if (err && err.message === 'refused') {
+                const ov = document.getElementById('factoryResetOverlay');
+                if (ov) ov.remove();
+                alert('Factory reset refused: wrong AP password.');
+                return;
+            }
             // The socket dying mid-request IS the success signal - the ESP
             // is rebooting. Just wait and reload.
             setTimeout(() => location.reload(true), 15000);
