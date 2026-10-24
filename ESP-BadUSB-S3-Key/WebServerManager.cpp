@@ -60,7 +60,7 @@ h1{font-size:28px;margin:0 0 8px;letter-spacing:-0.01em}
 label.file{display:block;border:1px dashed var(--line);border-radius:10px;padding:22px;text-align:center;cursor:pointer;color:var(--muted)}
 label.file:hover{color:var(--text);border-color:var(--accent)}
 label.file input{display:none}
-button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:12px 18px;font:600 16px/1 inherit;cursor:pointer;width:100%;margin-top:12px}
+button{background:var(--accent);color:#fff;border:0;border-radius:10px;padding:12px 18px;font-family:inherit;font-size:16px;font-weight:600;line-height:1;cursor:pointer;width:100%;margin-top:12px}
 button[disabled]{opacity:.5;cursor:not-allowed}
 .log{background:#000;color:#9ac;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;border-radius:10px;padding:12px;min-height:80px;white-space:pre-wrap;margin-top:12px}
 .err{color:var(--danger)}
