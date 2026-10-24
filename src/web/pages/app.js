@@ -69,14 +69,30 @@ async function runHid() {
   flash(r.ok ? 'payload fired' : 'payload failed', r.ok ? 'ok' : 'danger');
 }
 
+// Booleans follow the firmware rules: TRUE, YES, ON or 1, in any case.
+const TRUTHY = ['TRUE', 'YES', 'ON', '1'];
+
 async function toggleKey(key) {
   const t = await api('/api/config');
   if (typeof t !== 'string') return;
-  const re = new RegExp('^' + key + '=.*$', 'm');
-  const cur = (t.match(re) || [''])[0];
-  const next = cur.endsWith('TRUE') ? `${key}=FALSE` : `${key}=TRUE`;
-  const body = cur ? t.replace(re, next) : (t + `\n${next}\n`);
-  await api('/api/config', { method: 'POST', body });
+  const eol = t.includes('\r\n') ? '\r\n' : '\n';   // keep the file's line endings
+  const lines = t.split(/\r?\n/);
+  const keyRe = new RegExp('^\\s*' + key + '\\s*=');
+  let idx = -1;                                      // the last assignment wins
+  lines.forEach((ln, i) => { if (keyRe.test(ln)) idx = i; });
+  if (idx < 0) {
+    lines.push(`${key}=TRUE`);
+  } else {
+    const ln = lines[idx];
+    const rest = ln.slice(ln.indexOf('=') + 1);
+    // '#' starts a comment only at the start of the value or after whitespace
+    const cut = rest.match(/(^|\s+)#/);
+    const value = (cut ? rest.slice(0, cut.index) : rest).trim().toUpperCase();
+    const on = TRUTHY.includes(value);
+    const tail = !cut ? '' : (cut.index === 0 ? ' ' + rest : rest.slice(cut.index));
+    lines[idx] = `${key}=${on ? 'FALSE' : 'TRUE'}${tail}`;
+  }
+  await api('/api/config', { method: 'POST', body: lines.join(eol) });
   refreshStatus();
 }
 
