@@ -101,7 +101,7 @@ static int auth_ok(const char *req) {
             L == strlen(g_cfg.api_token) &&
             !memcmp(at, g_cfg.api_token, L)) return 1;
     }
-    if (!strncasecmp(at, "Basic ", 6)) {
+    if (!strncasecmp(at, "Basic ", 6) && g_cfg.webui_pass[0]) {
         char expect[128];
         snprintf(expect, sizeof(expect), "%s:%s", g_cfg.webui_user, g_cfg.webui_pass);
         char enc[200];
@@ -386,6 +386,11 @@ static void *accept_loop(void *arg) {
 
 int httpd_start(void) {
     if (!g_cfg.webui) return 0;
+    /* No credentials means no WebUI: a blank password must never be accepted. */
+    if (!g_cfg.webui_pass[0] && !g_cfg.api_token[0]) {
+        LOGE("web", "WebUI not started: set WEBUI_PASS or API_TOKEN in config.txt");
+        return -1;
+    }
     g_listen = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));

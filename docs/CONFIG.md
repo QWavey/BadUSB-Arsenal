@@ -63,8 +63,7 @@ keys apply without reboot; those that don't are listed below.
 | WEBUI | bool | TRUE | |
 | WEBUI_PORT | int | 80 | |
 | WEBUI_BIND | ip | 0.0.0.0 | |
-| WEBUI_HTTPS | bool | FALSE | TLS not implemented yet |
-| WEBUI_USER / WEBUI_PASS | str | root / ghostlink | |
+| WEBUI_USER / WEBUI_PASS | str | root / (blank) | WebUI stays off while both WEBUI_PASS and API_TOKEN are blank. Plain HTTP only. |
 | WEBUI_LANG | str | en | |
 
 ### 6. DeadNet

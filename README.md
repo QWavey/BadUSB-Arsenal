@@ -134,7 +134,7 @@ sudo ./scripts/format-sdcard.sh /dev/sdX
 
 - Plug the WebBee's USB-C into a laptop.
 - It appears as a USB Ethernet (NCM) device, offers DHCP on 172.16.24.0/24.
-- WebUI: <http://172.16.24.1/>  (Basic auth, `root` / `ghostlink`)
+- WebUI: <http://172.16.24.1/>  (Basic auth, user `root`, password = `WEBUI_PASS`; the WebUI stays off until a password or `API_TOKEN` is set)
 - SSH: `ssh root@172.16.24.1`  (password is also `ghostlink`; change it)
 - mDNS: `http://ghostlink.local/`
 

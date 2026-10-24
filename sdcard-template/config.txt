@@ -56,9 +56,8 @@ VERDICT_INCLUDE_PAYLOAD=FALSE       # TRUE adds first 64B payload per verdict
 WEBUI=TRUE
 WEBUI_PORT=80
 WEBUI_BIND=0.0.0.0                  # usb0+eth0 by default
-WEBUI_HTTPS=FALSE
 WEBUI_USER=root
-WEBUI_PASS=                          # required: set a password before first use
+WEBUI_PASS=                          # required: WebUI stays off until this or API_TOKEN is set
 WEBUI_LANG=en
 
 

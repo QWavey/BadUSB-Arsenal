@@ -71,7 +71,8 @@ void cfg_set_default(ghost_cfg_t *c) {
     c->webui_port = 80;
     cp(c->webui_bind, sizeof(c->webui_bind), "0.0.0.0");
     cp(c->webui_user, sizeof(c->webui_user), "root");
-    cp(c->webui_pass, sizeof(c->webui_pass), "ghostlink");
+    /* No default password: httpd stays off until WEBUI_PASS or API_TOKEN is set. */
+    cp(c->webui_pass, sizeof(c->webui_pass), "");
     cp(c->webui_lang, sizeof(c->webui_lang), "en");
 
     c->deadnet_ipv4 = 1;
@@ -110,7 +111,7 @@ void cfg_set_default(ghost_cfg_t *c) {
 
     cp(c->wifi_mode, sizeof(c->wifi_mode), "STA");
     cp(c->wifi_ap_ssid, sizeof(c->wifi_ap_ssid), "GhostLink");
-    cp(c->wifi_ap_pass, sizeof(c->wifi_ap_pass), "ghostlink");
+    cp(c->wifi_ap_pass, sizeof(c->wifi_ap_pass), "");
 
     c->cron = 1;
     cp(c->cron_file, sizeof(c->cron_file), "/Scripts/cron.txt");
@@ -215,7 +216,6 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     B("WEBUI", webui);
     I("WEBUI_PORT", webui_port);
     S("WEBUI_BIND", webui_bind);
-    B("WEBUI_HTTPS", webui_https);
     S("WEBUI_USER", webui_user);
     S("WEBUI_PASS", webui_pass);
     S("WEBUI_LANG", webui_lang);

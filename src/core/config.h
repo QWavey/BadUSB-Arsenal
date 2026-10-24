@@ -56,7 +56,6 @@ typedef struct {
     int  webui;
     int  webui_port;
     char webui_bind[32];
-    int  webui_https;
     char webui_user[32];
     char webui_pass[64];
     char webui_lang[8];
