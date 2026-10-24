@@ -310,12 +310,13 @@ static void dispatch_scsi(void) {
             bot.io_blocks_left = (uint16_t)(((uint16_t)bot.CBWCB[7] << 8) | bot.CBWCB[8]);
             /* Bounds-check against the advertised capacity (SCSI LBA-out-of-range).
              * Without it an out-of-range read pulls garbage sector-by-sector.
-             * Fail closed: with no known capacity (disk==0) nothing is readable.
-             * The CBW must also match the command (see cbw_rw10_ok). */
+             * Overflow-safe form; permissive only when capacity is unknown
+             * (disk==0), which matches the READ_CAPACITY fallback.  The CBW must
+             * also match the command (see cbw_rw10_ok). */
             {
                 uint32_t disk = mc_partition_sectors > 0 ? mc_partition_sectors : mc_total_sectors;
-                if (!cbw_rw10_ok(0x80) || disk == 0 ||
-                    bot.io_lba >= disk || bot.io_blocks_left > disk - bot.io_lba) {
+                if (!cbw_rw10_ok(0x80) ||
+                    (disk > 0 && (bot.io_lba >= disk || bot.io_blocks_left > disk - bot.io_lba))) {
                     if (bot.dCBWDataTransferLength > 0) ep3_stall();   /* IN data stage */
                     bot.csw_status   = 1;
                     bot.data_residue = bot.dCBWDataTransferLength;
@@ -339,12 +340,13 @@ static void dispatch_scsi(void) {
             bot.io_blocks_left = (uint16_t)(((uint16_t)bot.CBWCB[7] << 8) | bot.CBWCB[8]);
             /* Bounds-check BEFORE any sd_write_sector: a write past the advertised
              * volume would corrupt a physical sector outside it (e.g. beyond the
-             * partition).  Reject as LBA-out-of-range instead. Fail closed when
-             * capacity is unknown (disk==0), and reject a CBW that does not match. */
+             * partition).  Reject as LBA-out-of-range instead. Permissive only
+             * when capacity is unknown (disk==0), and reject a CBW that does not
+             * match the command (see cbw_rw10_ok). */
             {
                 uint32_t disk = mc_partition_sectors > 0 ? mc_partition_sectors : mc_total_sectors;
-                if (!cbw_rw10_ok(0x00) || disk == 0 ||
-                    bot.io_lba >= disk || bot.io_blocks_left > disk - bot.io_lba) {
+                if (!cbw_rw10_ok(0x00) ||
+                    (disk > 0 && (bot.io_lba >= disk || bot.io_blocks_left > disk - bot.io_lba))) {
                     if (bot.dCBWDataTransferLength > 0) ep2_stall();   /* OUT data stage */
                     bot.csw_status   = 1;
                     bot.data_residue = bot.dCBWDataTransferLength;
