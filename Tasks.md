@@ -125,41 +125,43 @@ the shutdown command has been issued.
 
 ## GitHub issues (synced 2026-10-24)
 
-Source: open issues of QWavey/webbee-ghostlink. #1 is an audit umbrella; its 36 bullets are filed as #2-#37 and tracked below. HELD items touch attack or evasion code (deadnet/deauth, HID injection, the usb0/eth0 forwarder and redirect/DNS spoof paths, credential capture). They are not changed. Reason for every HELD item: attack behaviour, needs authorization context.
+Source: open issues of QWavey/webbee-ghostlink. #1 is an audit umbrella whose 36 bullets are filed as #2-#37 and tracked below, so #1 has no checkbox. HELD items touch attack or evasion code (deadnet/deauth, HID injection, the usb0/eth0 forwarder, redirect/DNS spoofing, credential capture). They were not changed. Each HELD item carries the reason: attack behaviour, needs authorization context.
 
-- [ ] #2 Non-empty credentials committed in SD config template — sdcard-template/config.txt:61,149 — FIX — pending
-- [ ] #3 Unauthenticated config dump in shell-PoC web server — sdcard-template/ghostlink.sh:232-245 — FIX — pending
-- [ ] #4 Default admin password, all-interface bind, cleartext Basic auth — src/core/config.c:72-74,113,218; src/web/httpd.c — FIX — pending (partial: bind and plain HTTP remain, see status when done)
-- [ ] #5 Config values interpolated into system() commands — src/net/bridge.c:32,85-160; src/core/main.c:171-182 — FIX — pending (validation at config parse; bridge.c and main.c unchanged)
-- [ ] #6 Shell eval of config values in SD launcher — sdcard-template/ghostlink.sh:57-65 — FIX — pending
+Verification: no C toolchain is installed on this machine, so the C changes were not compiled or run. config.c, httpd.c, recorder.c, main.c, gadget.c and supervisor.c were syntax-checked with clang against stub headers, with no errors in changed code. Shell scripts passed sh/bash -n, app.js passed node --check, and the toggle, escape and shell-parser logic were exercised in Node and sh. Nothing was flashed or run on hardware.
+
+- [x] #2 Non-empty credentials committed in SD config template — sdcard-template/config.txt:61,149 — FIX — fixed in 9556df3. The values remain in git history: treat them as public and rotate any device already flashed.
+- [x] #3 Unauthenticated config dump in shell-PoC web server — sdcard-template/ghostlink.sh:232-245 — FIX — fixed in 814c8eb
+- [ ] #4 Default admin password, all-interface bind, cleartext Basic auth — src/core/config.c:72-74,218; src/web/httpd.c — FIX — partly fixed in 2423ccb: no default password, blank credentials refused, WEBUI_HTTPS removed. Open: WEBUI_BIND still defaults to 0.0.0.0 (usb0-only would break BRIDGE mode, where usb0 has no IP); WebUI is still plain HTTP.
+- [x] #5 Config values interpolated into system() commands — src/net/bridge.c:32,85-160; src/core/main.c:171-182 — FIX — fixed in a615dd5 by validating values at parse time; bridge.c and main.c unchanged
+- [x] #6 Shell eval of config values in SD launcher — sdcard-template/ghostlink.sh:57-65 — FIX — fixed in 65fd0b0
 - [ ] #7 Path traversal in HID payload endpoint — src/web/httpd.c:292-300; src/hid/ducky.c:112-115 — HELD — attack behaviour, needs authorization context
-- [ ] #8 Config save can write a truncated file — src/web/httpd.c:204-212,311-337 — FIX — pending
-- [ ] #9 Config-controlled strings inserted via innerHTML — src/web/pages/app.js:13-26,36; src/web/httpd.c:166-186 — FIX — pending
-- [ ] #10 Insecure defaults: root SSH with password auth and destructive panic scrub — src/core/config.c:98-101,141-142 — FIX — pending (partial: SSH keys are not read anywhere in this repo, so the stock sshd config still needs checking on device)
+- [x] #8 Config save can write a truncated file — src/web/httpd.c:204-212,311-337 — FIX — fixed in f3723f7. Schema validation before the rename is not added; only size cap, full-length read and write checks.
+- [x] #9 Config-controlled strings inserted via innerHTML — src/web/pages/app.js:13-26,36; src/web/httpd.c:166-186 — FIX — fixed in f459767
+- [x] #10 Insecure defaults: root SSH with password auth and destructive panic scrub — src/core/config.c:98-101,141-142 — FIX — fixed in 596ea4b. The SSH keys are read by nothing in this repo, so the stock sshd on the device still needs checking.
 - [ ] #11 Sniffer persists usernames and partial passwords — onboard/sniff.py:440-501 — HELD — attack behaviour, needs authorization context
 - [ ] #12 Expression evaluator is not a sandbox — onboard/ducky.py:278,443,600-614 — HELD — attack behaviour, needs authorization context
-- [ ] #13 Root scripts write predictable /tmp paths — onboard/install.sh:44-46; onboard/hid_enable.sh:30-31; sdcard-template/ghostlink.sh:159-190 — FIX — pending
-- [ ] #14 WebUI config save truncates and overwrites config.txt — src/web/httpd.c:204-212,311-337 — FIX — pending
-- [ ] #15 Unchecked rotate() failure leaves g_pcap NULL and crashes recorder — src/record/recorder.c:259-268 — FIX — pending
+- [x] #13 Root scripts write predictable /tmp paths — onboard/install.sh:44-46; onboard/hid_enable.sh:30-31; sdcard-template/ghostlink.sh:159-190 — FIX — fixed in 08642c5. Anything outside this repo that polls /tmp/.hid_ok must read /run/ghostlink/.hid_ok. onboard/ghostlink.sh writes dnsmasq files to /tmp; not in the issue and shared with webui.py, so left as is.
+- [x] #14 WebUI config save truncates and overwrites config.txt — src/web/httpd.c:204-212,311-337 — FIX — fixed in f3723f7
+- [x] #15 Unchecked rotate() failure leaves g_pcap NULL and crashes recorder — src/record/recorder.c:259-268 — FIX — fixed in f2a42c8
 - [ ] #16 Forwarder can echo frames between usb0 and eth0 without end — onboard/forwarder.py:121-130 — HELD — attack behaviour, needs authorization context
-- [ ] #17 recorder_stop() can block forever on an idle interface — src/record/recorder.c:246,286-290 — FIX — pending
+- [x] #17 recorder_stop() can block forever on an idle interface — src/record/recorder.c:246,286-290 — FIX — fixed in 1bc4f9a
 - [ ] #18 Redirect DNS answers point at REDIRECT_TO, not the device — src/net/redirect.c:85-173 — HELD — attack behaviour, needs authorization context
-- [ ] #19 WebUI toggles cannot turn values off on CRLF config files — src/web/pages/app.js:69-78 — FIX — pending
-- [ ] #20 Config parser truncates any value containing '#' — src/core/config.c:372-378; onboard/redirect302.py:23 — FIX — pending (C parser fixed; redirect302.py part HELD, redirect code)
-- [ ] #21 /api/query returns invalid JSON and sends conflicting length headers — src/web/httpd.c:254-289 — FIX — pending
-- [ ] #22 deadnet_stop() joins threads based on current config — src/net/deadnet.c:201-213 — HELD — attack behaviour, needs authorization context
-- [ ] #23 Stop does not unblock listeners, so restart fails or runs two accept loops — src/web/httpd.c:373-412; src/net/redirect.c:79-237 — FIX — pending (WebUI part; redirect part HELD)
-- [ ] #24 Hot reload and layout table are unsynchronised despite the documented RW lock — src/core/config.c:351; src/hid/layouts.c:33-63 — FIX — pending (config half; layout table part HELD, HID code)
+- [x] #19 WebUI toggles cannot turn values off on CRLF config files — src/web/pages/app.js:69-78 — FIX — fixed in 6fdd58f. The same toggle drives the DEADNET and REDIRECT switches; only how the switch reads the file changed.
+- [ ] #20 Config parser truncates any value containing '#' — src/core/config.c:372-378; onboard/redirect302.py:23 — FIX — partly fixed in 5b981ea (C parser). Open: onboard/redirect302.py still cuts at any '#'; it is redirect code, HELD.
+- [x] #21 /api/query returns invalid JSON and sends conflicting length headers — src/web/httpd.c:254-289 — FIX — fixed in 9b37d69
+- [ ] #22 deadnet_stop() joins threads based on current config, not on what was started — src/net/deadnet.c:201-213 — HELD — attack behaviour, needs authorization context
+- [ ] #23 Stop does not unblock listeners, so restart fails or runs two accept loops — src/web/httpd.c:373-412; src/net/redirect.c:79-237 — FIX — partly fixed in ad5d3f5 (WebUI accept thread). Open: redirect.c stop and bind handling, HELD (redirect code).
+- [ ] #24 Hot reload and layout table are unsynchronised despite the documented RW lock — src/core/config.c:351; src/hid/layouts.c:33-63 — FIX — partly fixed in b7d7bbe (config is parsed into a copy and no longer zeroed during reload; still no lock). Open: layout table race in src/hid/layouts.c, HELD (HID-injection code).
 - [ ] #25 DeadNet IPv4 reads the interface address once and can poison 0.0.0.x — src/net/deadnet.c:96-119 — HELD — attack behaviour, needs authorization context
-- [ ] #26 POST /api/config truncates bodies larger than one recv() — src/web/httpd.c:311-337 — FIX — pending
-- [ ] #27 Recorder restarts its file index at 1 each boot and overwrites captures — src/record/recorder.c:70-72,157-163 — FIX — pending
-- [ ] #28 config.txt is parsed four different ways; C parser cuts values at any '#' — src/core/config.c:376-378; onboard/ghostlink.sh:19-23; onboard/button.py:49-62; onboard/redirect302.py:17-24 — FIX — pending (redirect302.py and its RED_TO default HELD, redirect code)
-- [ ] #29 Stop and reconfigure paths can hang or leave threads running — src/record/recorder.c:246,286-289 — FIX — pending (recorder part; redirect and deadnet parts HELD)
+- [x] #26 POST /api/config truncates bodies larger than one recv() — src/web/httpd.c:311-337 — FIX — fixed in f3723f7
+- [x] #27 Recorder restarts its file index at 1 each boot and overwrites captures — src/record/recorder.c:70-72,157-163 — FIX — fixed in f514aca
+- [ ] #28 config.txt is parsed four different ways; C parser cuts values at any '#' — src/core/config.c:376-378; onboard/ghostlink.sh:19-23; onboard/button.py:49-62; onboard/redirect302.py:17-24 — FIX — partly fixed in 5b981ea and 65fd0b0 (C parser and SD launcher use the whitespace rule; DHCP fallback aligned). Open: onboard/redirect302.py and its RED_TO default, HELD (redirect code).
+- [ ] #29 Stop and reconfigure paths can hang or leave threads running — src/record/recorder.c:246,286-289; src/net/redirect.c:80-237; src/net/deadnet.c:209-213 — FIX — partly fixed in 1bc4f9a (recorder). Open: redirect and deadnet stop paths, HELD.
 - [ ] #30 forwarder.py loop guard relies on MAC matching; exits on link flaps — onboard/forwarder.py:42-130 — HELD — attack behaviour, needs authorization context
-- [ ] #31 Chunked /api/query response is malformed and /api/hid accepts path traversal — src/web/httpd.c:118-130,254-300 — FIX — pending (/api/query part; /api/hid path part HELD, HID injection)
-- [ ] #32 WebUI inserts unescaped values into innerHTML; toggle logic misreads values — src/web/pages/app.js:13-75 — FIX — pending
-- [ ] #33 button.py ignores live config for timing keys and mishandles hold-then-tap — onboard/button.py:124-198 — HELD — attack behaviour, needs authorization context
+- [ ] #31 Chunked /api/query response is malformed and /api/hid accepts path traversal — src/web/httpd.c:118-130,254-300 — FIX — partly fixed in 9b37d69 (/api/query). Open: /api/hid path traversal in r_hid, HELD (HID injection).
+- [x] #32 WebUI inserts unescaped values into innerHTML; toggle logic misreads values — src/web/pages/app.js:13-75 — FIX — fixed in f459767 (escaping) and 6fdd58f (toggles)
+- [ ] #33 button.py ignores live config for timing keys and mishandles hold-then-tap — onboard/button.py:124-198 — HELD — attack behaviour, needs authorization context (button press fires HID payloads)
 - [ ] #34 HID payloads run blocking on the button thread, unlocked, with stale layouts — src/hid/ducky.c:33-165; src/hid/layouts.c:24-33 — HELD — attack behaviour, needs authorization context
 - [ ] #35 Redirect DNS and HTTP replies have protocol and header defects — src/net/redirect.c:7-206 — HELD — attack behaviour, needs authorization context
-- [ ] #36 Makefile lacks header dependencies; no tests; repeated work in deadnet loop — Makefile:44-58; src/core/config.c:9-18,467 — FIX — pending (header deps and unistd.h; deadnet.c items HELD; host test target is an improvement, SKIP)
-- [ ] #37 Docs and logs disagree with code; device defaults are weak — src/core/main.c:10,193,240,243,258; src/net/gadget.c:128,143-151; docs/CONFIG.md:27 — FIX — pending
+- [ ] #36 Makefile lacks header dependencies; no tests; repeated work in deadnet loop — Makefile:44-58; src/core/config.c:9-18,467 — FIX — partly fixed in 7f5deeb (header dependencies, unistd.h). Open: deadnet.c icmp6_cksum and per-interval list parsing, HELD. The host test target is an improvement, not a defect: SKIP.
+- [ ] #37 Docs and logs disagree with code; device defaults are weak — src/core/main.c:10,193,240,243,258; src/net/gadget.c:128,143-151; docs/CONFIG.md:27 — FIX — partly fixed in c66e47a. Open: WEBUI_BIND default 0.0.0.0 (see #4).
