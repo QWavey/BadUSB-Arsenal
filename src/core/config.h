@@ -7,7 +7,8 @@
 /*
  * Config schema. One canonical structure every module reads from.
  * Values are populated by cfg_load() parsing config.txt.
- * Hot-reload rewrites fields atomically under a shared RW lock.
+ * Hot-reload parses into a private copy and copies it over this struct. No
+ * lock is held, so readers can see old and new fields mixed during the copy.
  */
 
 typedef struct {

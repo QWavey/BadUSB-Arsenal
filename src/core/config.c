@@ -400,12 +400,18 @@ static void strip_comment(char *v) {
     }
 }
 
+/* Parses into a private copy and copies it over g_cfg once at the end. The
+ * old code zeroed the live struct first, so other threads could read zeros
+ * for the whole parse. The final copy is still unlocked: a reader can see old
+ * and new fields mixed for the duration of the memcpy. */
 int cfg_load(const char *path) {
-    cfg_set_default(&g_cfg);
+    ghost_cfg_t next;
+    cfg_set_default(&next);
 
     FILE *f = fopen(path, "r");
     if (!f) {
         LOGW("cfg", "no config at %s, using defaults", path);
+        memcpy(&g_cfg, &next, sizeof(g_cfg));
         __atomic_add_fetch(&g_cfg_gen, 1, __ATOMIC_RELEASE);
         return -1;
     }
@@ -434,7 +440,7 @@ int cfg_load(const char *path) {
         for (int i = (int)strlen(key) - 1; i >= 0 && (key[i] == ' ' || key[i] == '\t'); i--) key[i] = 0;
         val = ltrim(val);
 
-        int rc = cfg_set_kv(&g_cfg, key, val);
+        int rc = cfg_set_kv(&next, key, val);
         if (rc == 0) {
             parsed++;
         } else if (rc == -2) {
@@ -447,6 +453,7 @@ int cfg_load(const char *path) {
     fclose(f);
     LOGI("cfg", "loaded %d keys (%d unknown, %d rejected) from %s",
          parsed, unknown, rejected, path);
+    memcpy(&g_cfg, &next, sizeof(g_cfg));
     __atomic_add_fetch(&g_cfg_gen, 1, __ATOMIC_RELEASE);
     return 0;
 }
