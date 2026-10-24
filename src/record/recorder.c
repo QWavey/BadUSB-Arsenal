@@ -256,6 +256,8 @@ static void *rec_worker(void *arg) {
         r.ts_usec = (uint32_t)tv.tv_usec;
         r.caplen  = (uint32_t)n;
         r.len     = (uint32_t)n;
+        /* A failed rotate() leaves g_pcap NULL: drop frames instead of writing to it. */
+        if (!g_pcap) continue;
         fwrite(&r, sizeof(r), 1, g_pcap);
         fwrite(buf, (size_t)n, 1, g_pcap);
         g_bytes += sizeof(r) + (size_t)n;
@@ -265,7 +267,7 @@ static void *rec_worker(void *arg) {
         size_t rot = (size_t)g_cfg.record_rotate_mb * 1024 * 1024;
         if (rot && g_bytes >= rot) {
             fflush(g_pcap);
-            rotate();
+            if (rotate() < 0) LOGE("rec", "rotation failed: pcap writes stopped until restart");
         }
     }
     close(s);
