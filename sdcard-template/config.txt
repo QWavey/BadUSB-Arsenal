@@ -58,7 +58,7 @@ WEBUI_PORT=80
 WEBUI_BIND=0.0.0.0                  # usb0+eth0 by default
 WEBUI_HTTPS=FALSE
 WEBUI_USER=root
-WEBUI_PASS=ghostlink                # change me on first boot
+WEBUI_PASS=                          # required: set a password before first use
 WEBUI_LANG=en
 
 
@@ -146,7 +146,7 @@ WIFI_MODE=STA                        # STA | AP | SCAN | MONITOR
 WIFI_SSID=
 WIFI_PASS=
 WIFI_AP_SSID=GhostLink
-WIFI_AP_PASS=ghostlink
+WIFI_AP_PASS=                        # required before WIFI_MODE=AP
 
 
 # ----- 18. Scheduled jobs ------------------------------------------------------
