@@ -44,6 +44,11 @@ static void spi_delay(void) {
 
 static uint8_t use_hw_spi = 0;
 
+/* Set when a bounded hardware-SPI wait expires.  A block transfer that hit a
+ * timeout moved garbage, so the read and write paths check this flag before
+ * they trust the data. */
+static volatile uint8_t spi_timed_out = 0;
+
 /* Route MISO/MOSI/SCK to SPI0 (function A); CS (PA17) stays a manual GPIO. */
 static void spi_pins_peripheral(void) {
     volatile avr32_gpio_port_t *pa = _GPIO_PORT(0);
@@ -71,9 +76,11 @@ static void spi_set_clock(uint32_t scbr) {
 static BYTE spi_hw_xfer(BYTE out) {
     uint32_t g = 200000;
     while (!(SPI_SR & SPI_SR_TDRE) && --g);
+    if (!g) spi_timed_out = 1;
     SPI_TDR = out;                            /* PCS=0; CS is the manual GPIO on PA17 */
     g = 200000;
     while (!(SPI_SR & SPI_SR_RDRF) && --g);
+    if (!g) spi_timed_out = 1;
     return (BYTE)(SPI_RDR & 0xFF);
 }
 
@@ -88,9 +95,11 @@ static void spi_hw_read_block(BYTE *buf, unsigned n) {
     for (unsigned i = 0; i < n; i++) {
         if (i + 1 < n) {                      /* queue the NEXT byte's clocks early */
             g = 200000; while (!(SPI_SR & SPI_SR_TDRE) && --g);
+            if (!g) { spi_timed_out = 1; return; }
             SPI_TDR = 0xFF;
         }
         g = 200000; while (!(SPI_SR & SPI_SR_RDRF) && --g);
+        if (!g) { spi_timed_out = 1; return; }
         buf[i] = (BYTE)(SPI_RDR & 0xFF);      /* collect byte i */
     }
 }
@@ -102,9 +111,11 @@ static void spi_hw_write_block(const BYTE *buf, unsigned n) {
     uint32_t g;
     for (unsigned i = 0; i < n; i++) {
         g = 200000; while (!(SPI_SR & SPI_SR_TDRE) && --g);
+        if (!g) { spi_timed_out = 1; return; }
         SPI_TDR = buf[i];
     }
     g = 200000; while (!(SPI_SR & (1u<<9)) && --g);   /* TXEMPTY: shifter drained */
+    if (!g) spi_timed_out = 1;
     (void)SPI_RDR;                                     /* clear any RDRF/overrun */
 }
 
@@ -183,6 +194,7 @@ static uint8_t spi_dead = 0;
  * to raise the payload size ceiling.  8 slots still comfortably cover the 3-4
  * sectors mc_precache() touches at boot. */
 #define MC_MAX 8
+#define SD_READ_ATTEMPTS 3   /* bounded tries for one block read before it is reported as an error */
 static uint32_t mc_sectors[MC_MAX];
 static uint8_t  mc_data[MC_MAX][512];
 static uint16_t mc_count = 0;
@@ -372,28 +384,41 @@ DSTATUS disk_initialize(void) {
     return ty ? 0 : STA_NOINIT;
 }
 
+/* One CMD17 block read into `buf`.  Returns 1 only when the card answered, the
+ * data token arrived, and no bounded SPI wait expired while the block moved.
+ * The card is deselected on every path. */
+static int read_block_once(DWORD cmd_sector, BYTE *buf) {
+    int ok = 0;
+    if (send_cmd(17, cmd_sector) == 0) {
+        uint16_t t = 40000;
+        while (rcv_spi() != 0xFE && --t);
+        if (t) {
+            spi_timed_out = 0;
+            if (use_hw_spi) spi_hw_read_block(buf, 512);
+            else            for (int i = 0; i < 512; i++) buf[i] = rcv_spi();
+            rcv_spi(); rcv_spi();                  /* CRC: read and discarded */
+            ok = !spi_timed_out;
+        }
+    }
+    DESELECT();
+    rcv_spi();
+    return ok;
+}
+
 DRESULT disk_readp(BYTE* buff, DWORD sector, UINT offset, UINT count) {
     if (cached_sector != sector) {
         /* SDHC/SDXC (CardType==12) use block address; all others need byte address */
         DWORD cmd_sector = (CardType == 12) ? sector : (sector * 512);
-        if (send_cmd(17, cmd_sector) == 0) {
-            uint16_t t = 40000;
-            while (rcv_spi() != 0xFE && --t);
-            if (t) {
-                if (use_hw_spi) spi_hw_read_block(sector_cache, 512);
-                else            for (int i = 0; i < 512; i++) sector_cache[i] = rcv_spi();
-                rcv_spi(); rcv_spi();
-                cached_sector = sector;
-                /* Store in multi-sector cache for post-USB reads */
-                mc_store(sector, sector_cache);
-            } else {
-                return RES_ERROR;
-            }
-        } else {
-            return RES_ERROR;
-        }
-        DESELECT();
-        rcv_spi();
+        int ok = 0;
+        /* A failed attempt can leave sector_cache half overwritten, so the cache
+         * is invalidated first; only a complete, error-free read validates it. */
+        cached_sector = 0xFFFFFFFF;
+        for (uint8_t attempt = 0; attempt < SD_READ_ATTEMPTS && !ok; attempt++)
+            ok = read_block_once(cmd_sector, sector_cache);
+        if (!ok) return RES_ERROR;          /* cached_sector and mc_store() untouched */
+        cached_sector = sector;
+        /* Store in multi-sector cache for post-USB reads */
+        mc_store(sector, sector_cache);
     }
     if (buff) {
         for (UINT i = 0; i < count; i++) {
@@ -411,14 +436,17 @@ DRESULT sd_read_sector(DWORD sector, BYTE *buff) {
     if (!spi_dead) {
         return disk_readp(buff, sector, 0, 512);
     }
-    /* FALLBACK: SPI was marked unavailable — serve the boot snapshot, else 0s. */
+    /* FALLBACK: SPI was marked unavailable, so only the boot snapshot can answer.
+     * Any other sector is reported as an error. Returning zeros as success would
+     * make the host read blank data as if it were the card's real contents. */
     if (mc_find(sector, buff) == 0) return RES_OK;
-    if (buff) memset(buff, 0, 512);
-    return RES_OK; /* Lie to the host to avoid SPI timeouts */
+    return RES_ERROR;
 }
 
 DRESULT sd_write_sector(DWORD sector, const BYTE *buff) {
     DWORD cmd_sector = (CardType == 12) ? sector : (sector * 512);
+    cached_sector = 0xFFFFFFFF;            /* a failed write may leave the cached copy stale */
+    spi_timed_out = 0;
     if (send_cmd(24, cmd_sector) == 0) {
         sd_spi_transfer(0xFE);
         if (use_hw_spi) spi_hw_write_block(buff, 512);
@@ -430,10 +458,11 @@ DRESULT sd_write_sector(DWORD sector, const BYTE *buff) {
             while (rcv_spi() == 0 && --bc);   /* wait out the card's programming-busy (MISO held low) */
             DESELECT(); rcv_spi();
             cached_sector = 0xFFFFFFFF;
-            /* Don't claim success if the card never released busy (bc exhausted):
-             * the sector may not be committed, and reporting RES_OK would let the
-             * host believe a write landed that didn't. */
-            return bc ? RES_OK : RES_ERROR;
+            /* Don't claim success if the card never released busy (bc exhausted),
+             * or if an SPI wait expired while the block moved: the sector may not
+             * be committed, and reporting RES_OK would let the host believe a
+             * write landed that didn't. */
+            return (bc && !spi_timed_out) ? RES_OK : RES_ERROR;
         }
     }
     DESELECT(); rcv_spi();
