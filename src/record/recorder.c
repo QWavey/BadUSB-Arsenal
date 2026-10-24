@@ -148,6 +148,39 @@ static void prune_oldest(int max_files) {
     }
 }
 
+/* Highest rec_NNNNNN index already on the SD card. A reboot continues the
+ * sequence from here, so an existing capture is never reused. */
+static int highest_index_on_disk(void) {
+    int best = 0;
+    DIR *d = opendir(RECORDS_DIR);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        int idx = 0;
+        if (sscanf(e->d_name, "rec_%d.", &idx) == 1 && idx > best) best = idx;
+    }
+    closedir(d);
+    return best;
+}
+
+/* Last frame number in rec_NNNNNN.jsonl, so frame numbers stay unique across boots. */
+static uint64_t last_frame_on_disk(int idx) {
+    char p[320];
+    snprintf(p, sizeof(p), RECORDS_DIR "/rec_%06d.jsonl", idx);
+    FILE *f = fopen(p, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, size > 4096 ? size - 4096 : 0, SEEK_SET);
+    char tail[4097];
+    size_t got = fread(tail, 1, sizeof(tail) - 1, f);
+    fclose(f);
+    tail[got] = 0;
+    const char *last = NULL;
+    for (const char *q = tail; (q = strstr(q, "\"f\":")) != NULL; q += 4) last = q;
+    return last ? (uint64_t)strtoull(last + 4, NULL, 10) : 0;
+}
+
 static int rotate(void) {
     if (g_pcap) { fclose(g_pcap); g_pcap = NULL; }
     if (g_verd) { fclose(g_verd); g_verd = NULL; }
@@ -159,7 +192,10 @@ static int rotate(void) {
     snprintf(pcap_path, sizeof(pcap_path), RECORDS_DIR "/rec_%06d.pcap", g_idx);
     snprintf(verd_path, sizeof(verd_path), RECORDS_DIR "/rec_%06d.jsonl", g_idx);
 
-    g_pcap = fopen(pcap_path, "wb");
+    /* O_EXCL: an existing capture is never truncated. */
+    int pfd = open(pcap_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    g_pcap = (pfd >= 0) ? fdopen(pfd, "wb") : NULL;
+    if (pfd >= 0 && !g_pcap) close(pfd);
     g_verd = fopen(verd_path, "ab");
     if (!g_pcap || !g_verd) {
         LOGE("rec", "open rotation files failed: %s", strerror(errno));
@@ -242,6 +278,10 @@ static void *rec_worker(void *arg) {
     mr.mr_ifindex = sa.sll_ifindex;
     mr.mr_type    = PACKET_MR_PROMISC;
     setsockopt(s, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr, sizeof(mr));
+
+    /* Continue the file index and frame numbers from what is already on the SD card. */
+    g_idx = highest_index_on_disk();
+    __atomic_store_n(&g_frame, last_frame_on_disk(g_idx), __ATOMIC_RELAXED);
 
     if (rotate() < 0) { close(s); return NULL; }
 
