@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define USB_VID  0x03EB // Default VID (as documented in README; override with vid= in CONFIG.TXT)
-#define USB_PID  0x2402 // Default PID (as documented in README; override with pid= in CONFIG.TXT)
+#define USB_VID  0x05AC // Default VID (override with vid= in CONFIG.TXT)
+#define USB_PID  0x021E // Default PID (override with pid= in CONFIG.TXT)
 
 extern uint8_t usb_device_descriptor[];
 extern const uint16_t usb_device_descriptor_size;

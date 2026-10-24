@@ -47,7 +47,7 @@ Manual, in short:
 
 ## USB Identity
 
-VID `0x03EB` (Atmel), PID `0x2402`, HID keyboard with 8-byte input reports and 1 ms polling. In DFU mode the PID is `0x2FF6`. The defaults are set in `src/usb_descriptors.h` and can be overridden with `vid` and `pid` in `CONFIG.TXT`. Get your own VID/PID for production.
+VID `0x05AC`, PID `0x021E` (the shipped default; these are Apple's IDs and this project does not own them), HID keyboard with 8-byte input reports and 1 ms polling. In DFU mode the PID is `0x2FF6`. The defaults are set in `src/usb_descriptors.h` and can be overridden with `vid` and `pid` in `CONFIG.TXT`. Get your own VID/PID for production.
 
 ## HID Interface
 
@@ -82,7 +82,7 @@ Compile a payload into `INJECT.BIN` with `tools/wrap_inject.py`, drop it on the 
 
 ## Verify (host)
 
-Plug the device in outside DFU mode. Device Manager (Keyboards) or USBView should list VID `03EB` PID `2402` as a HID keyboard. The status LED goes solid once the firmware has started. The firmware has no command or heartbeat reports, so `hidapitester` read or send steps do not apply.
+Plug the device in outside DFU mode. Device Manager (Keyboards) or USBView should list VID `05AC` PID `021E` as a HID keyboard. The status LED goes solid once the firmware has started. The firmware has no command or heartbeat reports, so `hidapitester` read or send steps do not apply.
 
 ## Troubleshooting
 
