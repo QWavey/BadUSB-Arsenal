@@ -47,21 +47,13 @@ Manual, in short:
 
 ## USB Identity
 
-VID `0x03EB` (Atmel), PID `0x2402`, HID keyboard, 64-byte reports (`0x01` OUT, `0x02` IN), 1 ms polling. In DFU mode the PID is `0x2FF6`. Get your own VID/PID for production.
+VID `0x03EB` (Atmel), PID `0x2402`, HID keyboard with 8-byte input reports and 1 ms polling. In DFU mode the PID is `0x2FF6`. The defaults are set in `src/usb_descriptors.h` and can be overridden with `vid` and `pid` in `CONFIG.TXT`. Get your own VID/PID for production.
 
-## HID Report Protocol
+## HID Interface
 
-OUT (host to device), Report ID `0x01`: byte 1 is the command code, bytes 2 to 63 the payload.
+The firmware enumerates as a standard USB HID keyboard. Its input report is 8 bytes (modifier, reserved, six key slots), and the poll interval is 1 ms. The device has no vendor-defined report IDs and no command protocol, so the host cannot send commands to it over HID.
 
-| Command | Code   | Effect                                     |
-|---------|--------|--------------------------------------------|
-| NOP     | `0x00` | Ping, replies with ACK                     |
-| LED ON  | `0x01` | Status LED on                              |
-| LED OFF | `0x02` | Status LED off                             |
-| LED TOG | `0x03` | Toggle status LED                          |
-| ECHO    | `0x10` | Device echoes bytes 2 to 63 in an IN report|
-
-IN (device to host), Report ID `0x02`: byte 1 is `0x01` alive or `0xFF` error, bytes 2 to 5 are a 4-byte LE uptime in ms, byte 6 is the button state, rest is reserved or echo. Heartbeat every 100 ms.
+The only host-to-device report the firmware reads is the standard one-byte keyboard LED output report, which carries the NumLock, CapsLock and ScrollLock bits. Any other SET_REPORT is stalled.
 
 ## Build
 
@@ -90,7 +82,7 @@ Compile a payload into `INJECT.BIN` with `tools/wrap_inject.py`, drop it on the 
 
 ## Verify (host)
 
-Use [hidapitester](https://github.com/todbot/hidapitester/releases): `--list` to find VID `03EB` PID `2402`, `--read-input 64 --length 64` for the heartbeat, `--send-output 0x01,0x01 --length 64` for LED ON.
+Plug the device in outside DFU mode. Device Manager (Keyboards) or USBView should list VID `03EB` PID `2402` as a HID keyboard. The status LED goes solid once the firmware has started. The firmware has no command or heartbeat reports, so `hidapitester` read or send steps do not apply.
 
 ## Troubleshooting
 
