@@ -26,12 +26,6 @@ Manual, in short:
    ```
    The device reboots as a HID keyboard; the status LED goes solid when it is ready.
 
-Published SHA-256 values, to check downloads against before use:
-
-- `docs/firmware.hex`: `9c30d9547abb6932c9195453a9629e24f8c72f4cf668800015fbb6a946ed4dff`
-- `tools/dfu-programmer.exe`: `a86cd0cc025823802152ef9e3b015a100c5d25ae3715fcd8064074f483add870`
-- Zadig 2.9: not published yet
-
 `flash_firmware.bat` at the repo root is the one-click path. It flashes `build\firmware.hex` (run `make all` first) with the bundled `tools\dfu-programmer.exe`. It runs erase, then flash with `--suppress-validation`, then `launch --no-reset`. Because validation is off, the flash is not read back. The script stops if the erase fails, unless you type `y` to continue. It prints the image's SHA-256 before it writes.
 
 ## Folder Structure
@@ -69,7 +63,7 @@ Needs the AVR32 GNU toolchain (`avr32-gcc`, `avr32-objcopy`, `avr32-size`). A Wi
 make all
 ```
 
-Output: `build/firmware.elf`, `build/firmware.hex`, `build/firmware.map`. Copy `build/firmware.hex` over `docs/firmware.hex` to bundle it with the flasher page. The flasher refuses a bundled image whose SHA-256 differs from `BUNDLED_FW_SHA256` in `docs/index.html`, so update that constant and the hash in the Flash section whenever the image changes.
+Output: `build/firmware.elf`, `build/firmware.hex`, `build/firmware.map`. Copy `build/firmware.hex` over `docs/firmware.hex` to bundle it with the flasher page.
 
 ## Memory Map
 
