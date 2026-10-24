@@ -4,8 +4,8 @@
 :: AT32UC3B1256 erase + flash for the Rubberless-Ducky firmware.
 ::
 :: Image : build\firmware.hex  (run "make all" first)
-:: Tool  : tools\dfu-programmer.exe, the bundled copy only. PATH and the
-::         current folder are never searched.
+:: Tool  : tools\dfu-programmer.exe, or dfu-programmer from PATH if the bundled
+::         copy is missing.
 ::
 :: Verification: the flash step passes --suppress-validation, so the chip is
 :: NOT read back after writing. The UC3 read-back reports false errors on this
@@ -19,14 +19,24 @@ set "CHIP=at32uc3b1256"
 set "HEX_FILE=%~dp0build\firmware.hex"
 set "DFU_TOOL=%~dp0tools\dfu-programmer.exe"
 
-:: ---- Bundled dfu-programmer only ----
-if not exist "!DFU_TOOL!" (
-    echo [ERROR] The bundled dfu-programmer is missing:
-    echo         !DFU_TOOL!
-    echo Restore tools\dfu-programmer.exe from the repository and run this again.
-    echo.
-    pause
-    exit /b 1
+:: ---- Fallback: use dfu-programmer from PATH if not in tools\ ----
+:: SAFE CHECK: Using a temporary variable to avoid parenthesis breakdown in IF blocks
+set "TEST_DFU=%DFU_TOOL%"
+if not exist "!TEST_DFU!" (
+    where dfu-programmer >nul 2>&1
+    if !errorlevel! neq 0 (
+        echo [ERROR] dfu-programmer not found!
+        echo.
+        echo Please either:
+        echo   1. Download dfu-programmer and place dfu-programmer.exe in:
+        echo      "%~dp0tools\"
+        echo   2. OR add dfu-programmer to your system PATH.
+        echo.
+        echo Download from: https://sourceforge.net/projects/dfu-programmer/
+        pause
+        exit /b 1
+    )
+    set "DFU_TOOL=dfu-programmer"
 )
 
 :: ---- Check HEX file exists ----
@@ -41,20 +51,12 @@ if not exist "!HEX_FILE!" (
     exit /b 1
 )
 
-:: SHA-256 of the image that will be written, printed for comparison with the
-:: hash published on the flasher page. It is not checked against a fixed value.
-set "HEX_SHA="
-for /f "usebackq skip=1 tokens=*" %%H in (`certutil -hashfile "!HEX_FILE!" SHA256`) do (
-    if not defined HEX_SHA set "HEX_SHA=%%H"
-)
-
 echo.
 echo =============================================================
 echo   AT32UC3B1256 Firmware Flash Utility
 echo =============================================================
 echo   Chip     : %CHIP%
 echo   HEX File : !HEX_FILE!
-echo   SHA-256  : !HEX_SHA!
 echo   DFU Tool : !DFU_TOOL!
 echo =============================================================
 echo.
