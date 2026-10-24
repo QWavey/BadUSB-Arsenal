@@ -48,6 +48,9 @@ static volatile int g_run = 0;
 static int          g_listen = -1;
 static pthread_t    g_t;
 
+/* Largest request body accepted. The shipped config.txt is about 9 KB. */
+#define REQ_BODY_MAX (64 * 1024)
+
 /* base64 encode (no newlines) */
 static void b64enc(const uint8_t *in, size_t n, char *out) {
     static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -202,11 +205,22 @@ static void r_config_get(int c) {
 }
 
 static void r_config_post(int c, const char *body, size_t len) {
-    FILE *f = fopen("/mnt/sd/config.txt.new", "w");
+    /* An empty body must never replace a working config. */
+    if (!body || len == 0) { send_json(c, 400, "{\"ok\":false}"); return; }
+    const char *tmp = "/mnt/sd/config.txt.new";
+    FILE *f = fopen(tmp, "w");
     if (!f) { send_text(c, 500, "write fail\n"); return; }
-    fwrite(body, 1, len, f);
-    fflush(f); fsync(fileno(f)); fclose(f);
-    rename("/mnt/sd/config.txt.new", "/mnt/sd/config.txt");
+    int ok = (fwrite(body, 1, len, f) == len);
+    if (fflush(f) != 0) ok = 0;
+    if (fsync(fileno(f)) != 0) ok = 0;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { unlink(tmp); send_json(c, 500, "{\"ok\":false}"); return; }
+    /* rename only after the complete body is on disk */
+    if (rename(tmp, "/mnt/sd/config.txt") != 0) {
+        unlink(tmp);
+        send_json(c, 500, "{\"ok\":false}");
+        return;
+    }
     cfg_load("/mnt/sd/config.txt");
     send_json(c, 200, "{\"ok\":true}");
 }
@@ -306,13 +320,34 @@ static void r_reboot(int c) {
     reboot(RB_AUTOBOOT);
 }
 
+/* Content-Length from the header block, or 0 when absent. Values above
+ * REQ_BODY_MAX come back as REQ_BODY_MAX + 1 so the caller can refuse them. */
+static size_t content_length(const char *req) {
+    const char *p = strcasestr(req, "\r\nContent-Length:");
+    if (!p) return 0;
+    p += 17;
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = NULL;
+    unsigned long long v = strtoull(p, &end, 10);
+    if (end == p) return 0;
+    return v > REQ_BODY_MAX ? (size_t)REQ_BODY_MAX + 1 : (size_t)v;
+}
+
 /* ---------- request dispatch ---------- */
 
 static void *req_thread(void *arg) {
     int c = (int)(intptr_t)arg;
     char buf[8192];
-    ssize_t n = recv(c, buf, sizeof(buf)-1, 0);
-    if (n <= 0) { close(c); return NULL; }
+    size_t n = 0;
+    /* Read until the header block ends or the buffer is full. */
+    while (n < sizeof(buf) - 1) {
+        ssize_t r = recv(c, buf + n, sizeof(buf) - 1 - n, 0);
+        if (r <= 0) break;
+        n += (size_t)r;
+        buf[n] = 0;
+        if (strstr(buf, "\r\n\r\n")) break;
+    }
+    if (n == 0) { close(c); return NULL; }
     buf[n] = 0;
 
     /* parse request line */
@@ -328,12 +363,26 @@ static void *req_thread(void *arg) {
     char *qs = strchr(path, '?');
     if (qs) { *qs = 0; qs++; }
 
-    /* body */
-    const char *body = strstr(buf, "\r\n\r\n");
+    /* body: exactly Content-Length bytes, read in full */
+    char *body = NULL;
     size_t blen = 0;
-    if (body) {
-        body += 4;
-        blen = (size_t)(buf + n - body);
+    const char *hdr_end = strstr(buf, "\r\n\r\n");
+    if (hdr_end) {
+        size_t want = content_length(buf);
+        if (want > REQ_BODY_MAX) { send_text(c, 413, "body too large\n"); close(c); return NULL; }
+        size_t have = n - (size_t)(hdr_end + 4 - buf);
+        if (have > want) have = want;
+        body = malloc(want + 1);
+        if (!body) { send_text(c, 500, "out of memory\n"); close(c); return NULL; }
+        memcpy(body, hdr_end + 4, have);
+        while (have < want) {
+            ssize_t r = recv(c, body + have, want - have, 0);
+            if (r <= 0) break;
+            have += (size_t)r;
+        }
+        if (have < want) { free(body); send_text(c, 400, "short body\n"); close(c); return NULL; }
+        body[want] = 0;
+        blen = want;
     }
 
     if      (!strcmp(path, "/api/status"))  r_status(c);
@@ -366,6 +415,7 @@ static void *req_thread(void *arg) {
     } else {
         send_text(c, 404, "not found\n");
     }
+    free(body);
     close(c);
     return NULL;
 }
