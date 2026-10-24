@@ -57,7 +57,7 @@ The only host-to-device report the firmware reads is the standard one-byte keybo
 
 ## Build
 
-Needs the AVR32 GNU toolchain (`avr32-gcc`, `avr32-objcopy`, `avr32-size`). A Windows build is vendored at `tools/AVR Toolchain/`; add its `bin/` to `PATH`. Also needs Make (`choco install make`, Git for Windows, MSYS2, or WSL).
+Needs the AVR32 GNU toolchain (`avr32-gcc`, `avr32-objcopy`, `avr32-size`). A Windows build is vendored at `tools/AVR Toolchain/`. Either add its `bin/` to `PATH`, or leave `PATH` alone and point the Makefile at it with `make all TC_BIN="tools/AVR Toolchain/bin"`. Also needs Make (`choco install make`, Git for Windows, MSYS2, or WSL).
 
 ```cmd
 make all
@@ -88,7 +88,7 @@ Plug the device in outside DFU mode. Device Manager (Keyboards) or USBView shoul
 
 - **No device present**: enter DFU mode (hold button while plugging in), run Zadig on Windows
 - **`dfu-programmer` not found**: the scripts use only `tools/dfu-programmer.exe`, so restore that file from the repository. `PATH` is not searched. `make flash` accepts another copy through `DFU=...`
-- **`avr32-gcc` not found**: add `tools/AVR Toolchain/bin/` to `PATH`
+- **`avr32-gcc` not found**: add `tools/AVR Toolchain/bin/` to `PATH`, or pass `TC_BIN="tools/AVR Toolchain/bin"` to `make`
 - **LED does not light after flash**: check `LED_PIN` in `src/main.c`
 - **HID device does not appear**: unplug, replug, check VID/PID in Device Manager
 - **Web flasher does not see the device**: the Atmel DFU bootloader does not advertise WebUSB descriptors, so Chrome only offers it if no other driver has claimed it. On Windows this means WinUSB via Zadig. If it still does not appear, use the manual `dfu-programmer` commands.
