@@ -16,6 +16,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <unistd.h>   /* fsync() in cfg_save() */
 
 ghost_cfg_t g_cfg;
 volatile uint64_t g_cfg_gen = 0;

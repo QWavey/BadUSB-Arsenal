@@ -23,7 +23,7 @@ BIN       := $(OUT)/ghostlink
 
 CFLAGS    := -Os -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation \
              -ffunction-sections -fdata-sections \
-             -D_GNU_SOURCE -std=gnu11 -pthread
+             -D_GNU_SOURCE -std=gnu11 -pthread -MMD -MP
 LDFLAGS   := -Wl,--gc-sections -pthread
 
 SRC := \
@@ -42,6 +42,9 @@ SRC := \
   src/web/pages_embed.c
 
 OBJ := $(SRC:%.c=$(OUT)/%.o)
+
+# Header dependencies written by -MMD -MP, so editing config.h rebuilds users.
+-include $(OBJ:.o=.d)
 
 all: $(BIN)
 
