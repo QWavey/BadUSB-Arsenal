@@ -977,8 +977,10 @@ void setup() {
   Serial.println("ESP32-S3 BadUSB Ready!");
   Serial.print("Connect to WiFi: ");
   Serial.println(ap_ssid);
-  Serial.print("Password: ");
-  Serial.println(ap_password);
+  // The passphrase is not printed to serial; only its length.
+  Serial.print("Password: (hidden, ");
+  Serial.print(ap_password.length());
+  Serial.println(" chars)");
   Serial.println("Open browser and go to: 192.168.4.1");
 
   // User report: silent USB "didn't work on first boot, but worked after

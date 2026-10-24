@@ -55,7 +55,7 @@ static void cmdHelp() {
         "  ram                  heap usage\r\n"
         "  sd                   SD card usage\r\n"
         "  ip                   AP IP\r\n"
-        "  ap                   AP SSID + password\r\n"
+        "  ap                   AP SSID (password hidden)\r\n"
         "  scripts              list scripts on SD\r\n"
         "  run <name>           run a script from /scripts/<name>\r\n"
         "  exec <line>          execute one DuckyScript line\r\n"
@@ -66,7 +66,8 @@ static void cmdHelp() {
 }
 static void cmdIp() { USBSerial.print("\r\nAP IP: " + WiFi.softAPIP().toString() + "\r\n"); }
 static void cmdAp() {
-    USBSerial.print("\r\nAP SSID: " + ap_ssid + "\r\nAP PASS: " + ap_password + "\r\n");
+    // The passphrase is never printed over USB; only its length is shown.
+    USBSerial.print("\r\nAP SSID: " + ap_ssid + "\r\nAP PASS: (hidden, " + String(ap_password.length()) + " chars)\r\n");
 }
 static void cmdClear(){ USBSerial.print("\x1b[2J\x1b[H"); }
 static void cmdReboot(){ USBSerial.print("\r\nRebooting...\r\n"); delay(200); ESP.restart(); }

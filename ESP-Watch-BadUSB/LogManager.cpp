@@ -123,7 +123,10 @@ void addToHistory(String command) {
   // (append is O(1) on FAT), and fall back to the full rewrite only when
   // the ring buffer just dropped its oldest entry (then the on-disk copy
   // has to match).
-  if (!sdCardPresent) return;
+  // Commands can contain secrets, so they are written to the card only while
+  // logging is on, the same switch the other log files honour. The in-memory
+  // history still works either way.
+  if (!sdCardPresent || !loggingEnabled) return;
   if (trimmed) {
     saveCommandHistory();          // full rewrite because head dropped
   } else {
