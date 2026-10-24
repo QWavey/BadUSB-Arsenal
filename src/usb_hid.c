@@ -738,6 +738,13 @@ static void ep0_handle_setup(void)
         }
 
         if (req == HID_SET_REPORT) {
+            /* Only the keyboard LED output report is accepted: report type Output
+             * (2), report ID 0, exactly one byte. Anything else is stalled rather
+             * than being read as an LED report. */
+            if ((wValue >> 8) != 2 || (wValue & 0xFF) != 0 || wLength != 1) {
+                ep0_stall();
+                return;
+            }
             /* Wait for OUT data — BOUNDED.  The previous unbounded spin could
              * lock the whole device forever if the host's OUT stage never
              * arrived (e.g. an aborted control transfer), which presented as
