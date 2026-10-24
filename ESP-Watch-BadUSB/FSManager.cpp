@@ -7,6 +7,113 @@
 #include <ArduinoJson.h>
 #include "esp32-hal-tinyusb.h"    // tud_ready() for the MSC-safe SD check (v4.4)
 
+// ---- Path and name safety ---------------------------------------------------
+
+// A leaf name is one path component: no separators, no control characters, no
+// leading dot (dotfiles are hidden, and our ".part" / ".bak" temp names start
+// with one). ".." is covered by the leading-dot rule.
+bool isSafeLeafName(const String& name) {
+  if (name.length() == 0 || name.length() > 255) return false;
+  if (name.startsWith(".")) return false;
+  for (size_t i = 0; i < name.length(); ++i) {
+    char c = name[i];
+    if (c == '/' || c == '\\' || (unsigned char)c < 0x20 || c == 0x7F) return false;
+  }
+  return true;
+}
+
+// Turns a client-supplied path into a canonical absolute SD path. Empty and
+// "." segments are dropped, a ".." segment or a backslash or control character
+// makes the path unusable. Relative input is NOT resolved against the current
+// directory here; callers that need that do it before calling this.
+bool canonicalSdPath(const String& in, String& out) {
+  if (in.length() == 0 || in.length() > 512) return false;
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    if (c == '\\' || (unsigned char)c < 0x20 || c == 0x7F) return false;
+  }
+  String result = "";
+  int len = (int)in.length();
+  int start = 0;
+  while (start <= len) {
+    int slash = in.indexOf('/', start);
+    int end = (slash < 0) ? len : slash;
+    String seg = in.substring(start, end);
+    if (seg == "..") return false;
+    if (seg.length() > 0 && seg != ".") result += "/" + seg;
+    if (slash < 0) break;
+    start = slash + 1;
+  }
+  out = (result.length() == 0) ? String("/") : result;
+  return true;
+}
+
+// The Wi-Fi credential store holds plaintext passwords. No web endpoint may
+// list, read, copy, cut or use it, under any spelling of the name.
+bool isSecretSdPath(const String& absPath) {
+  return absPath.equalsIgnoreCase("/wifi_creds.txt") ||
+         absPath.equalsIgnoreCase("/temp_creds.txt") ||
+         absPath.equalsIgnoreCase("/.wifi_creds.txt.bak");
+}
+
+// Root, the web UI assets and the credential files. Delete refuses these.
+bool isProtectedSdPath(const String& absPath) {
+  if (absPath == "/") return true;
+  return absPath.equalsIgnoreCase("/index.html") ||
+         absPath.equalsIgnoreCase("/style.css") ||
+         absPath.equalsIgnoreCase("/script.js") ||
+         isSecretSdPath(absPath);
+}
+
+// Moves src over dst without ever leaving dst missing. SD rename will not
+// overwrite an existing file, so the old dst is first renamed to a hidden
+// backup name, and is put back if the second rename fails. The backup is only
+// removed after the new file is in place.
+bool replaceFileOnSD(const String& src, const String& dst) {
+  if (!SD.exists(src)) return false;
+  if (!SD.exists(dst)) return SD.rename(src, dst);
+
+  String dir = getParentDirectory(dst);
+  String bak = (dir == "/" ? String("/") : dir + "/") + "." + getFileNameFromPath(dst) + ".bak";
+  if (SD.exists(bak)) SD.remove(bak);
+  if (!SD.rename(dst, bak)) return false;
+
+  if (SD.rename(src, dst)) {
+    SD.remove(bak);
+    return true;
+  }
+  if (!SD.rename(bak, dst)) {
+    Serial.println("[FS] replace failed and restore failed - original kept at " + bak);
+  }
+  return false;
+}
+
+String jsonEscapeStr(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b";  break;
+      case '\f': out += "\\f";  break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
 bool initSDCard() {
   // Watch port: microSD sits on the 1-bit SDMMC bus, NOT SPI. The upstream
   // Key firmware brought the card up via SPI + SD.begin(CS). Here we
@@ -234,6 +341,12 @@ bool loadLanguage(String language) {
 
 String loadScript(String filename) {
   if (!sdCardPresent) return "";
+  // Leaf names only: a name with "/" or ".." could reach outside /scripts.
+  if (!isSafeLeafName(filename)) {
+    lastError = "Invalid script name";
+    errorCount++;
+    return "";
+  }
 
   String filePath = String(DIR_SCRIPTS) + "/" + filename;
   File file = SD.open(filePath);
@@ -254,6 +367,11 @@ String loadScript(String filename) {
 
 bool saveScript(String filename, String content) {
   if (!sdCardPresent) return false;
+  if (!isSafeLeafName(filename)) {
+    lastError = "Invalid script name";
+    errorCount++;
+    return false;
+  }
 
   if (!filename.endsWith(".txt")) {
     filename += ".txt";
@@ -297,12 +415,10 @@ bool saveScript(String filename, String content) {
     return false;
   }
 
-  // Atomic-ish swap: drop the old file, then rename tmp over the final
-  // path. A power drop between remove + rename leaves the tmp on disk —
-  // recovery is manual (rename it back), but the WORST case never nukes
-  // the original without a fully-flushed replacement waiting on flash.
-  if (SD.exists(filePath)) SD.remove(filePath);
-  if (!SD.rename(tmpPath, filePath)) {
+  // Swap the tmp file in. replaceFileOnSD keeps the old script under a hidden
+  // backup name until the new one is in place, and restores it if the rename
+  // fails, so a failed save never leaves the script missing.
+  if (!replaceFileOnSD(tmpPath, filePath)) {
     Serial.println("Failed to rename tmp -> final: " + filePath);
     lastError = "Failed to finalize script: " + filename;
     errorCount++;
@@ -317,6 +433,11 @@ bool saveScript(String filename, String content) {
 
 bool deleteScript(String filename) {
   if (!sdCardPresent) return false;
+  if (!isSafeLeafName(filename)) {
+    lastError = "Invalid script name";
+    errorCount++;
+    return false;
+  }
 
   String filePath = String(DIR_SCRIPTS) + "/" + filename;
 
@@ -564,11 +685,28 @@ bool copySDFile(String sourcePath, String destPath) {
   }
   destTest.close();
 
-  if (SD.exists(destPath)) {
-    SD.remove(destPath);
+  // Copying a file onto itself (same folder, same name) used to remove the
+  // source before reading it, so the data was lost. Refuse instead.
+  String srcCanon, dstCanon;
+  if (!canonicalSdPath(sourcePath, srcCanon) || !canonicalSdPath(destPath, dstCanon)) {
+    Serial.println("[FS] copy refused: unsafe path: " + sourcePath + " -> " + destPath);
+    sourceFile.close();
+    return false;
+  }
+  if (srcCanon.equalsIgnoreCase(dstCanon)) {
+    Serial.println("[FS] copy refused: source and destination are the same file: " + srcCanon);
+    lastError = "Source and destination are the same file";
+    errorCount++;
+    sourceFile.close();
+    return false;
   }
 
-  File destFile = SD.open(destPath, FILE_WRITE);
+  // Write to a ".part" sibling and only move it over the destination once the
+  // whole copy has been written. A failed copy never removes the old file.
+  String partPath = destPath + ".part";
+  if (SD.exists(partPath)) SD.remove(partPath);
+
+  File destFile = SD.open(partPath, FILE_WRITE);
   if (!destFile) {
     Serial.println("Failed to create destination file: " + destPath);
     sourceFile.close();
@@ -593,8 +731,8 @@ bool copySDFile(String sourcePath, String destPath) {
   sourceFile.close();
   destFile.close();
 
-  if (writeFailed) {
-    SD.remove(destPath);   // don't leave a torn/partial file behind
+  if (writeFailed || !replaceFileOnSD(partPath, destPath)) {
+    SD.remove(partPath);   // don't leave a torn/partial file behind
     return false;
   }
   return true;
@@ -618,6 +756,13 @@ bool moveSDFile(String sourcePath, String destPath) {
 }
 
 bool deleteDirectory(String path) {
+  // Never recurse from the card root: that would delete every file on it.
+  String canon;
+  if (!canonicalSdPath(path, canon) || canon == "/") {
+    Serial.println("[FS] refused to delete directory: " + path);
+    return false;
+  }
+
   File dir = SD.open(path);
   if (!dir) {
     return false;
@@ -690,9 +835,14 @@ bool downloadFileFromURL(String url, String path) {
     int len = http.getSize();
     WiFiClient * stream = http.getStreamPtr();
 
-    File file = SD.open(path, FILE_WRITE);
+    // Stream into a ".part" file and only move it over the final name once the
+    // whole body has arrived. A stalled, short or failed transfer never replaces
+    // the previous file and is never reported as success.
+    String partPath = path + ".part";
+    if (SD.exists(partPath)) SD.remove(partPath);
+    File file = SD.open(partPath, FILE_WRITE);
     if (!file) {
-      Serial.println("Failed to open file for writing: " + path);
+      Serial.println("Failed to open file for writing: " + partPath);
       http.end();
       return false;
     }
@@ -704,17 +854,22 @@ bool downloadFileFromURL(String url, String path) {
     // whole loop() thread indefinitely. Break out after 15 s of no bytes.
     unsigned long lastDataMs = millis();
     const unsigned long IDLE_TIMEOUT_MS = 15000;
-    while (http.connected() && (len > 0 || len == -1)) {
+    bool idleTimedOut = false;
+    bool writeFailed = false;
+    // Keep reading while the stream still holds buffered bytes, even after the
+    // peer has closed, so the last chunk is not dropped.
+    while ((http.connected() || stream->available() > 0) && (len > 0 || len == -1)) {
       size_t size = stream->available();
       if (size) {
         int c = stream->readBytes(buff, ((size > sizeof(buff)) ? sizeof(buff) : size));
         if (c > 0) {
-          file.write(buff, c);
+          if (file.write(buff, c) != (size_t)c) { writeFailed = true; break; }
           if (len > 0) len -= c;
           lastDataMs = millis();
         }
       } else if (millis() - lastDataMs > IDLE_TIMEOUT_MS) {
         Serial.println("[HTTP] download idle timeout — aborting");
+        idleTimedOut = true;
         break;
       }
       delay(1);
@@ -722,6 +877,20 @@ bool downloadFileFromURL(String url, String path) {
 
     file.close();
     http.end();
+
+    // len > 0 here means the server promised more bytes than arrived. len == -1
+    // (no length given) is complete when the peer closes normally.
+    bool complete = !idleTimedOut && !writeFailed && len <= 0;
+    if (!complete) {
+      Serial.println("[HTTP] download incomplete or write failed - keeping previous file: " + path);
+      SD.remove(partPath);
+      return false;
+    }
+    if (!replaceFileOnSD(partPath, path)) {
+      Serial.println("Failed to move download into place: " + path);
+      SD.remove(partPath);
+      return false;
+    }
     Serial.println("File downloaded successfully: " + path);
     return true;
   } else {

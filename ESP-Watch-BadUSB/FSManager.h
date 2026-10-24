@@ -31,4 +31,12 @@ bool moveSDFile(String sourcePath, String destPath);
 bool deleteDirectory(String path);
 bool ensureDirectoryExists(String path);
 
+// Path and name safety shared by every file endpoint and the script helpers.
+bool isSafeLeafName(const String& name);             // one path component, no leading dot
+bool canonicalSdPath(const String& in, String& out); // absolute, no ".." / "\" / control chars
+bool isSecretSdPath(const String& absPath);          // Wi-Fi credential files: never listed, read or copied
+bool isProtectedSdPath(const String& absPath);       // root and web UI / credential files: never deleted
+bool replaceFileOnSD(const String& src, const String& dst); // rename src over dst, keeping dst if it fails
+String jsonEscapeStr(const String& in);              // escape a value for a JSON string literal
+
 #endif // FS_MANAGER_H
