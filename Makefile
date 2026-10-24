@@ -2,29 +2,41 @@
 # Makefile for AT32UC3B1 Custom HID Firmware
 #
 # Targets:
-#   make all      - Build firmware.elf and firmware.hex
+#   make all      - Build build/firmware.elf and build/firmware.hex
 #   make clean    - Remove build artifacts
 #   make flash    - Erase chip and flash firmware via dfu-programmer
 #   make launch   - Launch the firmware after flashing
 #   make erase    - Erase chip only (no flash)
 #   make size     - Show section sizes
 #
-# Prerequisites (must be on PATH):
+# Prerequisites:
 #   avr32-gcc         AVR32 GNU Compiler
 #   avr32-objcopy     AVR32 objcopy (for ELF -> HEX conversion)
 #   avr32-size        Section size reporter
-#   dfu-programmer    DFU flashing tool
+#   dfu-programmer    DFU flashing tool (tools/dfu-programmer.exe by default)
+#
+# The avr32-* tools are found on PATH unless TC_BIN names their directory, e.g.
+#   make all TC_BIN="tools/AVR Toolchain/bin"
+# DFU overrides the dfu-programmer path the same way (make flash DFU=...).
 # =============================================================================
 
 # ---- Toolchain ---------------------------------------------------------------
-TC_BIN  = C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/bin
-TC_INC  = C:/Program Files (x86)/Atmel/AVR Tools/AVR Toolchain/avr32/include
-CC      = "$(TC_BIN)/avr32-gcc.exe"
-AS      = "$(TC_BIN)/avr32-gcc.exe"
-LD      = "$(TC_BIN)/avr32-gcc.exe"
-OBJCOPY = "$(TC_BIN)/avr32-objcopy.exe"
-SIZE    = "$(TC_BIN)/avr32-size.exe"
-DFU     = "$(CURDIR)/tools/dfu-programmer.exe"
+# TC_BIN is empty by default, which resolves the avr32-* tools from PATH.
+TC_BIN ?=
+
+ifeq ($(strip $(TC_BIN)),)
+CC      = avr32-gcc
+OBJCOPY = avr32-objcopy
+SIZE    = avr32-size
+else
+CC      = "$(TC_BIN)/avr32-gcc"
+OBJCOPY = "$(TC_BIN)/avr32-objcopy"
+SIZE    = "$(TC_BIN)/avr32-size"
+endif
+AS      = $(CC)
+LD      = $(CC)
+
+DFU ?= "$(CURDIR)/tools/dfu-programmer.exe"
 
 # ---- Target device (for dfu-programmer) --------------------------------------
 DFU_TARGET = at32uc3b1256
@@ -44,13 +56,10 @@ C_SRCS   = $(SRC_DIR)/main.c \
 
 ASM_SRCS = $(SRC_DIR)/startup.S
 
-OBJS     = $(BUILD_DIR)/main.o        \
-           $(BUILD_DIR)/usb_hid.o     \
-           $(BUILD_DIR)/usb_descriptors.o \
-           $(BUILD_DIR)/mmc.o         \
-           $(BUILD_DIR)/pff.o         \
-           $(BUILD_DIR)/usb_msc.o     \
-           $(BUILD_DIR)/startup.o
+# Objects are derived from the source lists, so a listed file is always built.
+OBJS     = $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(C_SRCS)) \
+           $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(ASM_SRCS))
+DEPS     = $(OBJS:.o=.d)
 
 # ---- Linker script -----------------------------------------------------------
 LDSCRIPT = $(SRC_DIR)/at32uc3b1.ld
@@ -63,15 +72,15 @@ TARGET_HEX = $(BUILD_DIR)/firmware.hex
 MCU      = uc3b1256
 
 CFLAGS   = -mpart=$(MCU)            \
-            -isystem "$(TC_INC)"     \
             -O2                      \
             -Wall                    \
             -Wextra                  \
-            -std=gnu99                 \
+            -std=gnu99               \
             -ffunction-sections      \
             -fdata-sections          \
             -ffreestanding           \
             -fno-builtin             \
+            -MMD -MP                 \
             -I$(SRC_DIR)
 
 ASFLAGS  = -mpart=$(MCU)            \
@@ -99,22 +108,18 @@ all: $(BUILD_DIR) $(TARGET_HEX)
 $(BUILD_DIR):
 	@cmd /c if not exist $(BUILD_DIR) mkdir $(BUILD_DIR)
 
-# Compile C sources
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+# Compile C sources. Headers are tracked through the generated .d files.
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	@echo "[CC]  $<"
 	$(CC) $(CFLAGS) -c $< -o $@
 
-
-
-
-
 # Assemble startup file
-$(BUILD_DIR)/startup.o: $(SRC_DIR)/startup.S
+$(BUILD_DIR)/startup.o: $(SRC_DIR)/startup.S | $(BUILD_DIR)
 	@echo "[AS]  $<"
 	$(CC) $(ASFLAGS) -c $< -o $@
 
-# Link ELF
-$(TARGET_ELF): $(OBJS)
+# Link ELF. The linker script is a prerequisite, so editing it relinks.
+$(TARGET_ELF): $(OBJS) $(LDSCRIPT)
 	@echo "[LD]  $@"
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 
@@ -122,6 +127,9 @@ $(TARGET_ELF): $(OBJS)
 $(TARGET_HEX): $(TARGET_ELF)
 	@echo "[HEX] $@"
 	$(OBJCOPY) -O ihex $< $@
+
+# Header dependencies written by -MMD -MP (absent on a first build; that is fine).
+-include $(DEPS)
 
 # ---- Flash targets -----------------------------------------------------------
 
