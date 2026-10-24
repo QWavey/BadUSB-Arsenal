@@ -233,6 +233,10 @@ static void *rec_worker(void *arg) {
         close(s); return NULL;
     }
 
+    /* Bounded recv: the loop re-checks g_run every second, so stop can join. */
+    struct timeval rt = { 1, 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rt, sizeof(rt));
+
     struct packet_mreq mr;
     memset(&mr, 0, sizeof(mr));
     mr.mr_ifindex = sa.sll_ifindex;
@@ -276,17 +280,23 @@ static void *rec_worker(void *arg) {
     return NULL;
 }
 
+static int g_started = 0;   /* set only while a worker thread exists */
+
 int recorder_start(void) {
     if (!g_cfg.log_to_sd) { LOGI("rec", "disabled"); return 0; }
+    if (g_started) return 0;
     mkdir(SD_ROOT, 0755);
     mkdir(RECORDS_DIR, 0755);
     g_run = 1;
-    pthread_create(&g_t, NULL, rec_worker, NULL);
+    if (pthread_create(&g_t, NULL, rec_worker, NULL) != 0) { g_run = 0; return -1; }
+    g_started = 1;
     return 0;
 }
 
 int recorder_stop(void) {
+    if (!g_started) return 0;   /* never join a thread that was not created */
     g_run = 0;
     pthread_join(g_t, NULL);
+    g_started = 0;
     return 0;
 }
