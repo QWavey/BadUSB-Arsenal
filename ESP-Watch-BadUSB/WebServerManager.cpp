@@ -27,6 +27,18 @@ static inline void watchSafeRestart() {
   usb_persist_restart(RESTART_NO_PERSIST);
 }
 
+// Compares a claimed AP passphrase with the real one in constant time, so the
+// response time does not reveal how many leading characters matched.
+static bool passphraseMatches(const String& claimed) {
+  const size_t n = ap_password.length();
+  uint8_t diff = (claimed.length() == n) ? 0 : 1;
+  for (size_t i = 0; i < n; ++i) {
+    char c = (i < claimed.length()) ? claimed[i] : 0;
+    diff |= (uint8_t)(c ^ ap_password[i]);
+  }
+  return diff == 0;
+}
+
 void setupWebServer() {
   server.enableCORS(true);
 
@@ -39,6 +51,10 @@ void setupWebServer() {
   server.on("/api/cut-file", HTTP_POST, handleCutFile);
   server.on("/api/paste-file", HTTP_POST, handlePasteFile);
   server.on("/api/upload", HTTP_POST, []() {
+    if (uploadFailed) {
+      server.send(400, "text/plain", "Upload failed: " + uploadFilename);
+      return;
+    }
     server.send(200, "text/plain", "Upload complete: " + uploadFilename);
   }, handleFileUpload);
 
@@ -283,7 +299,7 @@ $('#go').addEventListener('click', async () => {
     }
 
     String password = doc["password"].as<String>();
-    if (password == ap_password) {
+    if (passphraseMatches(password)) {
       server.send(200, "text/plain; charset=utf-8", "Self-destruct initiated");
       delay(1000);
       selfDestruct();
@@ -370,15 +386,8 @@ $('#go').addEventListener('click', async () => {
   // Legacy /api/toggle-shell + /api/reset-shell-pw fully removed (v4.6).
   // The new PuTTY-over-COM slider uses /api/toggle-com below.
 
-  // v4.4: one-shot fetch of the WiFi passwords for the Settings tab. Not part
-  // of /api/stats because that endpoint is polled every 5 s and broadcasted
-  // the passwords back to every connected client. Only fetch on tab open.
-  server.on("/api/wifi-secrets", []() {
-    String out = "{\"apPassword\":\"" + ap_password + "\"" +
-                 ",\"staPassword\":\"" + ((WiFi.status() == WL_CONNECTED) ? current_sta_password : String("")) + "\"}";
-    server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-    server.send(200, "application/json", out);
-  });
+  // /api/wifi-secrets was removed: it returned the AP and upstream Wi-Fi
+  // passphrases to any client that could reach the device.
 
   // Reset ATTACKMODE to defaults (HID only, no storage, no size cap) - the
   // way out when a script left the device in a stuck composition.
@@ -504,7 +513,7 @@ $('#go').addEventListener('click', async () => {
     String json = "[";
     for (size_t i = 0; i < activeTasks.size(); i++) {
       if (i > 0) json += ",";
-      json += "{\"id\":" + String(activeTasks[i].id) + ",\"description\":\"" + activeTasks[i].description + "\"}";
+      json += "{\"id\":" + String(activeTasks[i].id) + ",\"description\":\"" + jsonEscapeStr(activeTasks[i].description) + "\"}";
     }
     json += "]";
     server.send(200, "application/json", json);
@@ -531,7 +540,7 @@ $('#go').addEventListener('click', async () => {
     String json = "[";
     for (size_t i = 0; i < availableScripts.size(); i++) {
       if (i > 0) json += ",";
-      json += "\"" + availableScripts[i] + "\"";
+      json += "\"" + jsonEscapeStr(availableScripts[i]) + "\"";
     }
     json += "]";
     server.send(200, "application/json; charset=utf-8", json);
@@ -541,7 +550,7 @@ $('#go').addEventListener('click', async () => {
     String json = "[";
     for (size_t i = 0; i < availableLanguages.size(); i++) {
       if (i > 0) json += ",";
-      json += "\"" + availableLanguages[i] + "\"";
+      json += "\"" + jsonEscapeStr(availableLanguages[i]) + "\"";
     }
     json += "]";
     server.send(200, "application/json; charset=utf-8", json);
@@ -597,6 +606,11 @@ $('#go').addEventListener('click', async () => {
   server.on("/api/check-file", []() {
     if (server.hasArg("file")) {
       String filename = server.arg("file");
+      // Leaf names only, so the check cannot be pointed outside /scripts.
+      if (!isSafeLeafName(filename)) {
+        server.send(400, "text/plain; charset=utf-8", "Invalid file name");
+        return;
+      }
       if (!filename.endsWith(".txt")) filename += ".txt";
       String filePath = String(DIR_SCRIPTS) + "/" + filename;
       bool exists = SD.exists(filePath);
@@ -643,6 +657,13 @@ $('#go').addEventListener('click', async () => {
     String body = server.arg("plain");
     DynamicJsonDocument doc(512);
     if (deserializeJson(doc, body)) { reject(400, "Invalid JSON body"); return; }
+
+    // Changing the AP settings needs the current AP passphrase. Without this,
+    // anyone who can reach the device could rewrite its credentials.
+    String claimed = doc["currentPassword"] | "";
+    if (!passphraseMatches(claimed)) {
+      reject(403, "Supply currentPassword (current AP passphrase) to change Wi-Fi settings"); return;
+    }
 
     String newSsid = doc["ssid"].as<String>();
     String newPsk  = doc["password"].as<String>();
@@ -995,8 +1016,8 @@ $('#go').addEventListener('click', async () => {
     doc["wifiSSID"] = ap_ssid;
     // v4.4: passwords removed from /api/stats — the dashboard polled this
     // every 5 s and broadcasted AP + STA passwords over WiFi in every reply.
-    // Settings page can hit /api/wifi-secrets on demand for the initial
-    // populate. Leave empty strings here for JS backward-compat.
+    // No endpoint returns passwords now. Empty strings are kept for JS
+    // backward-compat.
     doc["wifiPassword"] = "";
     doc["staSSID"] = (WiFi.status() == WL_CONNECTED) ? current_sta_ssid : "";
     doc["staPassword"] = "";
@@ -1122,6 +1143,13 @@ $('#go').addEventListener('click', async () => {
   //     while it wipes, so the browser sees "Factory reset in progress..."
   //     before the ESP reboots and the socket dies.
   server.on("/api/factory-reset", HTTP_POST, []() {
+    // A factory reset wipes the card and the settings, so it needs the current
+    // AP passphrase in the body: {"password":"..."}.
+    DynamicJsonDocument reqDoc(256);
+    if (deserializeJson(reqDoc, server.arg("plain")) || !passphraseMatches(reqDoc["password"] | "")) {
+      server.send(403, "text/plain; charset=utf-8", "Wrong or missing AP password - factory reset refused");
+      return;
+    }
     server.send(200, "text/plain; charset=utf-8",
                 "Factory reset started — scripts, uploads, logs, and settings will be wiped. LED will blink blue. Reboots in ~5s.");
     delay(150);   // let LWIP drain the response
@@ -1223,7 +1251,7 @@ $('#go').addEventListener('click', async () => {
     // before the owner does and lock them out.
     {
       String claimed = doc["currentPassword"] | "";
-      if (claimed != ap_password) {
+      if (!passphraseMatches(claimed)) {
         reject(403, "Supply currentPassword (current AP passphrase) to run setup");
         return;
       }
@@ -1529,7 +1557,7 @@ $('#go').addEventListener('click', async () => {
       return;
     }
     String password = doc["password"].as<String>();
-    if (password != ap_password) {
+    if (!passphraseMatches(password)) {
       server.send(403, "text/plain", "Invalid password");
       return;
     }
@@ -1719,8 +1747,34 @@ $('#go').addEventListener('click', async () => {
   });
 
   // ---- Saved WiFi Credentials ----
+  // SSIDs only: passwords never leave the device. The dashboard joins a saved
+  // network through /api/join-saved, which uses the stored password server-side.
   server.on("/api/saved-wifi", []() {
-    server.send(200, "application/json", getSavedWiFiCredentials());
+    String json = "[";
+    std::vector<String> ssids = getSavedSSIDs();
+    for (size_t i = 0; i < ssids.size(); i++) {
+      if (i > 0) json += ",";
+      json += "{\"ssid\":\"" + jsonEscapeStr(ssids[i]) + "\"}";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/api/join-saved", HTTP_POST, []() {
+    String body = server.arg("plain");
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, body) || !doc.containsKey("ssid")) {
+      server.send(400, "application/json", "{\"success\":false,\"message\":\"Invalid request\"}");
+      return;
+    }
+    String ssid = doc["ssid"].as<String>();
+    String pass;
+    if (!getSavedWiFiPassword(ssid, pass)) {
+      server.send(404, "application/json", "{\"success\":false,\"message\":\"Network is not saved\"}");
+      return;
+    }
+    joinWiFi(ssid, pass);
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Connecting to WiFi: " + jsonEscapeStr(ssid) + "...\"}");
   });
 
   server.on("/api/delete-saved-wifi", HTTP_POST, []() {

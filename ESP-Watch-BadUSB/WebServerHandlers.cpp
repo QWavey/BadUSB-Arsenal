@@ -6,20 +6,57 @@
 #include "LEDManager.h"
 #include <ArduinoJson.h>
 
+// Set when the current upload fails; the POST reply reads it.
+bool uploadFailed = false;
+// Upload in progress: the final destination and the ".part" file the data is
+// written to. An aborted upload removes exactly that ".part" file.
+static String s_uploadPath;
+static String s_uploadTmp;
+
+// Makes a file name safe inside a quoted HTTP header value.
+static String headerSafeName(const String& in) {
+  String out;
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in[i];
+    if (c == '"' || c == '\\' || (unsigned char)c < 0x20 || c == 0x7F) continue;
+    out += c;
+  }
+  return out;
+}
+
+// Path checks for client-supplied paths. Returns 0 when the path is usable,
+// 400 when it is unsafe, and 403 when it names a Wi-Fi credential file.
+// checkRootPath resolves relative names from "/" (the file endpoints do this);
+// checkCwdPath resolves them from the current directory (use/copy/cut/paste do).
+static int checkRootPath(const String& raw, String& canon) {
+  String p = raw.startsWith("/") ? raw : ("/" + raw);
+  if (!canonicalSdPath(p, canon)) return 400;
+  return isSecretSdPath(canon) ? 403 : 0;
+}
+
+static int checkCwdPath(const String& raw, String& canon) {
+  String p = raw.startsWith("/") ? raw : (currentDirectory + raw);
+  if (!canonicalSdPath(p, canon)) return 400;
+  return isSecretSdPath(canon) ? 403 : 0;
+}
+
 void handleFileUpload() {
   HTTPUpload& upload = server.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
     uploadFilename = upload.filename;
+    uploadFailed = false;
+    s_uploadPath = "";
+    s_uploadTmp = "";
     Serial.println("File upload start: " + uploadFilename);
 
     // v4.11 SECURITY: reject path-traversal in filenames. Without this a
     // client could POST `filename=../reboot_script.txt` and land the file at
     // `/scripts/../reboot_script.txt` == `/reboot_script.txt`, which setup()
     // auto-executes on next boot -> persistent DuckyScript RCE for anyone
-    // on the open AP. Enforce leaf-only names.
-    if (uploadFilename.indexOf('/') >= 0 || uploadFilename.indexOf('\\') >= 0 ||
-        uploadFilename.indexOf("..") >= 0 || uploadFilename.length() == 0) {
+    // on the open AP. Enforce leaf-only names (no separators, no control
+    // characters, no leading dot).
+    if (!isSafeLeafName(uploadFilename) || uploadFilename.indexOf("..") >= 0) {
       Serial.println("[UPLOAD] Rejected unsafe filename: " + uploadFilename);
       // Bug-hunt #1: also CLOSE the previous uploadFile so subsequent
       // UPLOAD_FILE_WRITE chunks — which the ESP32 WebServer library keeps
@@ -28,6 +65,7 @@ void handleFileUpload() {
       // upload could tail-append its data to an earlier legitimate file.
       if (uploadFile) uploadFile.close();
       uploadFilename = "";
+      uploadFailed = true;
       return;
     }
 
@@ -39,21 +77,27 @@ void handleFileUpload() {
     } else {
       uploadPath = String(DIR_UPLOADS) + "/" + uploadFilename;
     }
-    
+
     if (uploadFile) {
       uploadFile.close();
     }
-    
-    if (SD.exists(uploadPath)) {
-      SD.remove(uploadPath);
-    }
-    
-    uploadFile = SD.open(uploadPath, FILE_WRITE);
+
+    // Write to a ".part" sibling and move it over the real name only when the
+    // upload completes (see END). The old file stays until then, and an
+    // aborted upload never leaves a partial script or language file behind.
+    s_uploadPath = uploadPath;
+    s_uploadTmp = uploadPath + ".part";
+    if (SD.exists(s_uploadTmp)) SD.remove(s_uploadTmp);
+
+    uploadFile = SD.open(s_uploadTmp, FILE_WRITE);
     if (!uploadFile) {
-      Serial.println("Failed to create file: " + uploadPath);
+      Serial.println("Failed to create file: " + s_uploadTmp);
+      uploadFailed = true;
+      s_uploadPath = "";
+      s_uploadTmp = "";
       return;
     }
-    
+
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     // Bug-hunt #1: gate writes on both an open file AND a non-empty
     // uploadFilename. START clears uploadFilename on reject; without the
@@ -63,6 +107,7 @@ void handleFileUpload() {
       size_t bytesWritten = uploadFile.write(upload.buf, upload.currentSize);
       if (bytesWritten != upload.currentSize) {
         Serial.println("File write error: " + String(bytesWritten) + " vs " + String(upload.currentSize));
+        uploadFailed = true;   // END will discard the short file
       }
     }
 
@@ -70,51 +115,66 @@ void handleFileUpload() {
     if (uploadFile && uploadFilename.length() > 0) {
       uploadFile.flush();
       uploadFile.close();
-      Serial.println("File upload complete: " + uploadFilename + " size: " + String(upload.totalSize));
+      if (!uploadFailed && s_uploadTmp.length() > 0 && replaceFileOnSD(s_uploadTmp, s_uploadPath)) {
+        Serial.println("File upload complete: " + uploadFilename + " size: " + String(upload.totalSize));
 
-      if (uploadFilename.endsWith(".txt")) {
-        loadAvailableScripts();
-      } else if (uploadFilename.endsWith(".json")) {
-        loadAvailableLanguages();
+        if (uploadFilename.endsWith(".txt")) {
+          loadAvailableScripts();
+        } else if (uploadFilename.endsWith(".json")) {
+          loadAvailableLanguages();
+        }
+      } else {
+        Serial.println("File upload not stored: " + uploadFilename);
+        if (s_uploadTmp.length() > 0) SD.remove(s_uploadTmp);
+        uploadFailed = true;
       }
     }
+    s_uploadPath = "";
+    s_uploadTmp = "";
+
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     Serial.println("File upload aborted: " + uploadFilename);
-    if (uploadFile) {
-      uploadFile.close();
-      String uploadPath = String(DIR_UPLOADS) + "/" + uploadFilename;
-      if (SD.exists(uploadPath)) {
-        SD.remove(uploadPath);
-      }
-    }
+    if (uploadFile) uploadFile.close();
+    // Remove exactly the partial file this upload created, in its real folder.
+    if (s_uploadTmp.length() > 0 && SD.exists(s_uploadTmp)) SD.remove(s_uploadTmp);
+    s_uploadPath = "";
+    s_uploadTmp = "";
+    uploadFailed = true;
   }
 }
 
 void handleFileDownload() {
   if (server.hasArg("file")) {
     String filename = server.arg("file");
-    // v4.11 SECURITY: block `..` traversal so a client can't exfiltrate
-    // arbitrary SD content (e.g. /wifi_creds.txt, /update.espkg) with
-    // GET /api/download?file=../wifi_creds.txt on the open AP.
-    if (filename.indexOf("..") >= 0) {
-      Serial.println("[DOWNLOAD] Rejected traversal: " + filename);
+    // v4.11 SECURITY: canonical path check. Rejects ".." segments, backslashes
+    // and control characters. An absolute path gets no free pass, and the
+    // Wi-Fi credential files are never served: the saved-credentials file must
+    // not leave the device (GET /api/download?file=/wifi_creds.txt).
+    String filepath;
+    int rc = checkRootPath(filename, filepath);
+    if (rc == 400) {
+      Serial.println("[DOWNLOAD] Rejected path: " + filename);
       server.send(400, "text/plain", "Bad request");
       return;
     }
-    String filepath = filename;
-
-    if (!filepath.startsWith("/")) {
-      filepath = "/" + filepath;
+    if (rc == 403) {
+      Serial.println("[DOWNLOAD] Refused credential file: " + filename);
+      server.send(403, "text/plain", "Forbidden");
+      return;
+    }
+    if (filepath == "/") {   // a directory is not a file to download
+      server.send(400, "text/plain", "Bad request");
+      return;
     }
 
     if (SD.exists(filepath)) {
       File file = SD.open(filepath);
       if (file) {
         server.sendHeader("Content-Type", "application/octet-stream");
-        server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+        server.sendHeader("Content-Disposition", "attachment; filename=\"" + headerSafeName(getFileNameFromPath(filepath)) + "\"");
         server.streamFile(file, "application/octet-stream");
         file.close();
-        Serial.println("File downloaded: " + filename);
+        Serial.println("File downloaded: " + filepath);
       } else {
         server.send(500, "text/plain", "Failed to open file");
       }
@@ -129,15 +189,21 @@ void handleFileDownload() {
 void handleChangeDirectory() {
   if (server.hasArg("path")) {
     String path = server.arg("path");
+    // ".." is the one special value (go up). Anything else must be a clean path.
+    String checked;
+    if (path != ".." && !canonicalSdPath(path, checked)) {
+      server.send(400, "text/plain", "Invalid path");
+      return;
+    }
     changeDirectory(path);
-    server.send(200, "application/json", "{\"success\":true,\"currentDirectory\":\"" + currentDirectory + "\"}");
+    server.send(200, "application/json", "{\"success\":true,\"currentDirectory\":\"" + jsonEscapeStr(currentDirectory) + "\"}");
   } else {
     server.send(400, "text/plain", "No path specified");
   }
 }
 
 void handleGetCurrentDirectory() {
-  server.send(200, "application/json", "{\"currentDirectory\":\"" + currentDirectory + "\"}");
+  server.send(200, "application/json", "{\"currentDirectory\":\"" + jsonEscapeStr(currentDirectory) + "\"}");
 }
 
 void handleDetectOS() {
@@ -148,28 +214,34 @@ void handleDetectOS() {
 void handleUseFile() {
   if (server.hasArg("file")) {
     String filePath = server.arg("file");
-    useFile(filePath);
-    server.send(200, "application/json", "{\"success\":true,\"message\":\"File ready to use: " + filePath + "\"}");
+    // Resolve the way useFile() does, then check the result, so the path that
+    // gets stored is the one that was checked.
+    String canon;
+    int rc = checkCwdPath(filePath, canon);
+    if (rc != 0) {
+      server.send(rc, "text/plain", rc == 403 ? "Forbidden" : "Bad request");
+      return;
+    }
+    useFile(canon);
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"File ready to use: " + jsonEscapeStr(canon) + "\"}");
   } else {
     server.send(400, "text/plain", "No file specified");
   }
-}
-
-// v4.16 SECURITY: `..` traversal filter helper shared by copy/cut/paste.
-// Same policy as handleDeleteFile: refuse any path containing `..`.
-static bool __rejectTraversal(const String& p) {
-  return p.indexOf("..") >= 0;
 }
 
 void handleCopyFile() {
   if (server.hasArg("source")) {
     String sourcePath = server.arg("source");
     String destPath = server.hasArg("destination") ? server.arg("destination") : "";
-    if (__rejectTraversal(sourcePath) || __rejectTraversal(destPath)) {
-      server.send(400, "text/plain", "Bad request"); return;
+    String canon;
+    int rc = checkCwdPath(sourcePath, canon);
+    if (rc == 0 && destPath.length() > 0) rc = checkCwdPath(destPath, canon);
+    if (rc != 0) {
+      server.send(rc, "text/plain", rc == 403 ? "Forbidden" : "Bad request");
+      return;
     }
     copyFile(sourcePath, destPath);
-    server.send(200, "application/json", "{\"success\":true,\"message\":\"File copied: " + sourcePath + "\"}");
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"File copied: " + jsonEscapeStr(sourcePath) + "\"}");
   } else {
     server.send(400, "text/plain", "No source file specified");
   }
@@ -179,11 +251,17 @@ void handleCutFile() {
   if (server.hasArg("source")) {
     String sourcePath = server.arg("source");
     String destPath = server.hasArg("destination") ? server.arg("destination") : "";
-    if (__rejectTraversal(sourcePath) || __rejectTraversal(destPath)) {
-      server.send(400, "text/plain", "Bad request"); return;
+    String canon;
+    int rc = checkCwdPath(sourcePath, canon);
+    // Moving the root or a web UI file would break the dashboard.
+    if (rc == 0 && sourcePath.length() > 0 && isProtectedSdPath(canon)) rc = 403;
+    if (rc == 0 && destPath.length() > 0) rc = checkCwdPath(destPath, canon);
+    if (rc != 0) {
+      server.send(rc, "text/plain", rc == 403 ? "Forbidden" : "Bad request");
+      return;
     }
     cutFile(sourcePath, destPath);
-    server.send(200, "application/json", "{\"success\":true,\"message\":\"File cut: " + sourcePath + "\"}");
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"File cut: " + jsonEscapeStr(sourcePath) + "\"}");
   } else {
     server.send(400, "text/plain", "No source file specified");
   }
@@ -191,8 +269,11 @@ void handleCutFile() {
 
 void handlePasteFile() {
   String destPath = server.hasArg("destination") ? server.arg("destination") : "";
-  if (__rejectTraversal(destPath)) {
-    server.send(400, "text/plain", "Bad request"); return;
+  String canon;
+  int rc = (destPath.length() > 0) ? checkCwdPath(destPath, canon) : 0;
+  if (rc != 0) {
+    server.send(rc, "text/plain", rc == 403 ? "Forbidden" : "Bad request");
+    return;
   }
   pasteFile(destPath);
   server.send(200, "application/json", "{\"success\":true,\"message\":\"File pasted\"}");
@@ -203,9 +284,9 @@ void handleJoinInternet() {
     String ssid = server.arg("ssid");
     String password = server.arg("password");
     joinWiFi(ssid, password);
-    
+
     // Return success since it's started in the background
-    server.send(200, "application/json", "{\"success\":true,\"message\":\"Connecting to WiFi: " + ssid + "...\"}");
+    server.send(200, "application/json", "{\"success\":true,\"message\":\"Connecting to WiFi: " + jsonEscapeStr(ssid) + "...\"}");
   } else {
     server.send(400, "text/plain", "Missing SSID or password");
   }
@@ -220,13 +301,16 @@ void handleListFiles() {
   String path = currentDirectory;
   if (server.hasArg("path")) {
     path = server.arg("path");
-    if (path.indexOf("..") >= 0) {
-      server.send(400, "text/plain", "Invalid path");
-      return;
-    }
   }
-  
-  if (!path.startsWith("/")) path = "/" + path;
+
+  // Canonical check: rejects ".." segments, backslashes and control characters,
+  // and resolves relative names from the root.
+  String canon;
+  if (!canonicalSdPath(path.startsWith("/") ? path : ("/" + path), canon)) {
+    server.send(400, "text/plain", "Invalid path");
+    return;
+  }
+  path = canon;
 
   File root = SD.open(path);
   if (!root) {
@@ -248,7 +332,7 @@ void handleListFiles() {
     json += "\"name\":\"..\",";
     json += "\"size\":0,";
     json += "\"isDirectory\":true,";
-    json += "\"path\":\"" + getParentDirectory(path) + "\"";
+    json += "\"path\":\"" + jsonEscapeStr(getParentDirectory(path)) + "\"";
     json += "}";
     first = false;
   }
@@ -261,23 +345,24 @@ void handleListFiles() {
     }
 
     // Hide system files: the web UI assets served from SD, transient reboot
-    // helpers, dotfiles, and the .espkg staging file. They belong to the
-    // device, not the user, and shouldn't appear in the File Manager.
+    // helpers, dotfiles, the .espkg staging file, and the Wi-Fi credential
+    // files. They belong to the device, not the user, and shouldn't appear in
+    // the File Manager.
     bool isSystem =
         (path == "/") && (
           name == "index.html"        || name == "style.css"        ||
           name == "script.js"         || name == "update.espkg"     ||
           name == "reboot_script.txt" || name == "temp_resume.txt"  ||
-          name.startsWith(".")
+          name.startsWith(".")        || isSecretSdPath("/" + name)
         );
     if (!isSystem) {
       if (!first) json += ",";
       first = false;
       json += "{";
-      json += "\"name\":\"" + name + "\",";
+      json += "\"name\":\"" + jsonEscapeStr(name) + "\",";
       json += "\"size\":" + String(file.size()) + ",";
       json += "\"isDirectory\":" + String(file.isDirectory() ? "true" : "false") + ",";
-      json += "\"path\":\"" + path + (path.endsWith("/") ? "" : "/") + name + "\"";
+      json += "\"path\":\"" + jsonEscapeStr(path + (path.endsWith("/") ? "" : "/") + name) + "\"";
       json += "}";
     }
     file = root.openNextFile();
@@ -291,15 +376,20 @@ void handleListFiles() {
 void handleDeleteFile() {
   if (server.hasArg("file")) {
     String filename = server.arg("file");
-    
-    if (filename.indexOf("..") >= 0 || filename.length() == 0) {
+    String filepath;
+
+    // Canonical check (rejects "..", backslashes, control characters). Protected
+    // paths are refused: the root (deleting "/" used to wipe the whole card),
+    // the web UI files, and the Wi-Fi credential files.
+    if (filename.length() == 0 ||
+        !canonicalSdPath(filename.startsWith("/") ? filename : ("/" + filename), filepath)) {
       server.send(400, "text/plain", "Invalid filename");
       return;
     }
-
-    String filepath = filename;
-    if (!filepath.startsWith("/")) {
-      filepath = "/" + filepath;
+    if (isProtectedSdPath(filepath)) {
+      Serial.println("[DELETE] Refused protected path: " + filepath);
+      server.send(403, "text/plain", "Refusing to delete a protected file: " + filepath);
+      return;
     }
 
     if (SD.exists(filepath)) {
@@ -362,16 +452,17 @@ void handleCreateDirectory() {
 void handleFileInfo() {
   if (server.hasArg("file")) {
     String filename = server.arg("file");
-    // v4.11 SECURITY: block traversal so clients can't probe for
+    // v4.11 SECURITY: canonical path check, so clients can't probe for
     // /wifi_creds.txt etc. via file-info reconnaissance.
-    if (filename.indexOf("..") >= 0) {
+    String filepath;
+    int rc = checkRootPath(filename, filepath);
+    if (rc == 400) {
       server.send(400, "text/plain", "Bad request");
       return;
     }
-    String filepath = filename;
-
-    if (!filepath.startsWith("/")) {
-      filepath = "/" + filepath;
+    if (rc == 403) {
+      server.send(403, "text/plain", "Forbidden");
+      return;
     }
 
     if (SD.exists(filepath)) {
@@ -382,7 +473,7 @@ void handleFileInfo() {
         doc["size"] = file.size();
         doc["isDirectory"] = file.isDirectory();
         file.close();
-        
+
         String response;
         serializeJson(doc, response);
         server.send(200, "application/json", response);

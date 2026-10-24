@@ -454,19 +454,6 @@ void saveWiFiCredentials(String ssid, String pass) {
     }
 }
 
-// Kept for the endpoint that still calls it; removed with that endpoint's change.
-String getSavedWiFiCredentials() {
-    String json = "[";
-    bool first = true;
-    for (const SavedWiFi& e : readSavedWiFi()) {
-        if (!first) json += ",";
-        json += "{\"ssid\":\"" + jsonEscapeStr(e.ssid) + "\",\"pass\":\"" + jsonEscapeStr(e.pass) + "\"}";
-        first = false;
-    }
-    json += "]";
-    return json;
-}
-
 std::vector<String> getSavedSSIDs() {
     // SSIDs only. Passwords are never returned by any endpoint; they are read
     // server-side through getSavedWiFiPassword() when joining.

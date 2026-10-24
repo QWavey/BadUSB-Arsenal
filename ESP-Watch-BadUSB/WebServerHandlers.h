@@ -3,6 +3,9 @@
 
 #include "GlobalState.h"
 
+// True when the most recent upload was refused or could not be stored.
+extern bool uploadFailed;
+
 // API Handlers
 void handleFileUpload();
 void handleFileDownload();
