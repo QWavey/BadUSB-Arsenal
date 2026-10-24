@@ -442,9 +442,9 @@
 
 <h2>Downloads</h2>
 <div class="downloads">
-  <a class="dl" href="./firmware.hex" download><b>firmware.hex</b><span>Prebuilt image.</span></a>
-  <a class="dl" href="https://raw.githubusercontent.com/QWavey/Rubberless-Ducky/version-8/tools/dfu-programmer.exe" download><b>dfu-programmer.exe</b><span>Windows CLI flasher.</span></a>
-  <a class="dl" href="https://zadig.akeo.ie/downloads/zadig-2.9.exe" download><b>Zadig 2.9</b><span>Installs the WinUSB driver.</span></a>
+  <a class="dl" href="./firmware.hex" download><b>firmware.hex</b><span>Prebuilt image. SHA-256 <code style="word-break:break-all">9c30d9547abb6932c9195453a9629e24f8c72f4cf668800015fbb6a946ed4dff</code></span></a>
+  <a class="dl" href="https://raw.githubusercontent.com/QWavey/Rubberless-Ducky/89dff817fe8a53696b14004b4da15129b56f7b3d/tools/dfu-programmer.exe" download><b>dfu-programmer.exe</b><span>Windows CLI flasher, pinned to commit 89dff81. SHA-256 <code style="word-break:break-all">a86cd0cc025823802152ef9e3b015a100c5d25ae3715fcd8064074f483add870</code></span></a>
+  <a class="dl" href="https://zadig.akeo.ie/downloads/zadig-2.9.exe" download><b>Zadig 2.9</b><span>Installs the WinUSB driver. SHA-256 not published yet.</span></a>
   <a class="dl" href="https://github.com/QWavey/Rubberless-Ducky/tree/version-8/tools" target="_blank" rel="noopener"><b>Atmel tools</b><span>Toolchain, sources, libusb.</span></a>
 </div>
 
@@ -640,13 +640,25 @@ async function launchDevice() {
   log("launch: reset sent", "ok");
 }
 
+// SHA-256 of the bundled ./firmware.hex. The bundled image is written only if its
+// bytes hash to this value. Update it together with docs/firmware.hex.
+const BUNDLED_FW_SHA256 = '9c30d9547abb6932c9195453a9629e24f8c72f4cf668800015fbb6a946ed4dff';
+
+async function sha256Hex(buf) {
+  if (!window.crypto || !window.crypto.subtle) throw new Error("SHA-256 needs HTTPS or localhost");
+  const d = await window.crypto.subtle.digest('SHA-256', buf);
+  return [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function loadBundled() {
   const r = await fetch('./firmware.hex');
   if (!r.ok) throw new Error("HTTP " + r.status);
-  const text = await r.text();
-  const parsed = parseHex(text);
+  const buf = await r.arrayBuffer();
+  const digest = await sha256Hex(buf);
+  if (digest !== BUNDLED_FW_SHA256) throw new Error("bundled firmware.hex SHA-256 does not match the published value; refusing to load it");
+  const parsed = parseHex(new TextDecoder().decode(buf));
   hexBytes = parsed.bytes; hexBase = parsed.base;
-  log(`firmware: bundled, ${hexBytes.length} bytes at 0x${hexBase.toString(16)}`, "ok");
+  log(`firmware: bundled, ${hexBytes.length} bytes at 0x${hexBase.toString(16)}, SHA-256 verified`, "ok");
 }
 
 setStep('s2', 'active');
@@ -683,11 +695,13 @@ $('btnConnect').onclick = async () => {
 
 $('fileHex').onchange = async ev => {
   const f = ev.target.files[0]; if (!f) return;
-  const text = await f.text();
+  const buf = await f.arrayBuffer();
   try {
-    const parsed = parseHex(text);
+    const parsed = parseHex(new TextDecoder().decode(buf));
     hexBytes = parsed.bytes; hexBase = parsed.base;
-    log(`firmware: ${f.name}, ${hexBytes.length} bytes at 0x${hexBase.toString(16)}`, "ok");
+    const digest = await sha256Hex(buf).catch(() => 'unavailable');
+    log(`firmware: ${f.name}, ${hexBytes.length} bytes at 0x${hexBase.toString(16)}, SHA-256 ${digest}`, "ok");
+    if (digest !== BUNDLED_FW_SHA256) log("note: this is not the bundled firmware.hex. Compare its SHA-256 with the published value before flashing.");
   } catch (e) { log("parse: " + e.message, "err"); }
 };
 
