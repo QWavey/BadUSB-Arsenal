@@ -35,6 +35,8 @@
 #include "pff.h"
 #include "diskio.h"
 
+void error_blink(int code);   /* diagnose.c: blinks `code` on the red LED, never returns */
+
 /* ---------- Firmware build identity -------------------------------------
  * Stamped with the compiler's build date/time on EVERY build, so you can tell
  * which firmware is actually on the chip after many flash cycles.  The string
@@ -1395,6 +1397,16 @@ static uint16_t probe_host_latency(void) {
 /* ======================================================================
  * Boot + interpreter
  * ====================================================================== */
+/* Bounded boot-time wait.  If the crystal or PLL never settles, the chip would
+ * hang before the status LEDs are set up.  Instead the red LED shows `code`
+ * blinks, forever:  1 = OSC0 crystal not ready, 2 = PLL0 not locked.  The limit
+ * is far above the normal startup time (a few ms). */
+#define BOOT_WAIT_LIMIT 200000u
+#define BOOT_WAIT(cond, code) do {                              \
+        uint32_t boot_t_ = BOOT_WAIT_LIMIT;                     \
+        while (!(cond)) { if (--boot_t_ == 0) error_blink(code); } \
+    } while (0)
+
 int main(void)
 {
     Disable_global_interrupt();
@@ -1417,7 +1429,7 @@ int main(void)
     AVR32_PM.OSCCTRL0.startup = AVR32_PM_OSCCTRL0_STARTUP_2048_RCOSC;
     AVR32_PM.OSCCTRL0.mode    = AVR32_PM_OSCCTRL0_MODE_CRYSTAL_G3;
     AVR32_PM.mcctrl = AVR32_PM_MCCTRL_OSC0EN_MASK;
-    while (!(AVR32_PM.poscsr & AVR32_PM_POSCSR_OSC0RDY_MASK));
+    BOOT_WAIT(AVR32_PM.poscsr & AVR32_PM_POSCSR_OSC0RDY_MASK, 1);
 
     AVR32_PM.pll[0] = 0;
     AVR32_PM.pll[0] = (0 << AVR32_PM_PLLOSC_OFFSET)
@@ -1426,7 +1438,7 @@ int main(void)
                     | (3 << AVR32_PM_PLLOPT_OFFSET)
                     | (63 << AVR32_PM_PLLCOUNT_OFFSET);
     AVR32_PM.pll[0] |= AVR32_PM_PLLEN_MASK;
-    while (!(AVR32_PM.poscsr & AVR32_PM_POSCSR_LOCK0_MASK));
+    BOOT_WAIT(AVR32_PM.poscsr & AVR32_PM_POSCSR_LOCK0_MASK, 2);
 
     AVR32_FLASHC.fcr = (1 << AVR32_FLASHC_FCR_FWS_OFFSET);
     AVR32_PM.mcctrl  = AVR32_PM_MCCTRL_OSC0EN_MASK

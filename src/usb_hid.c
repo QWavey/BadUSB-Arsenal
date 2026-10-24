@@ -23,6 +23,20 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+void error_blink(int code);   /* diagnose.c: blinks `code` on the red LED, never returns */
+
+/* Bounded wait for an endpoint's CFGOK flag.  A timeout means the endpoint's
+ * FIFO could not be allocated, so show `code` on the red LED instead of spinning
+ * forever.  (Codes 5 to 8 are EP0 to EP3.) */
+#define USB_CFG_WAIT_LIMIT 2000000u
+static void usb_wait_cfgok(const volatile uint32_t *uesta, uint32_t mask, int code)
+{
+    uint32_t t = USB_CFG_WAIT_LIMIT;
+    while (!(*uesta & mask)) {
+        if (--t == 0) error_blink(code);
+    }
+}
+
 extern uint16_t current_vid;
 extern uint16_t current_pid;
 
@@ -322,7 +336,7 @@ void usb_device_task(void)
                           | AVR32_USBB_UECFG0_ALLOC_MASK;           /* Allocate memory */
 
         /* Wait for allocation to complete */
-        while (!(AVR32_USBB.uesta0 & AVR32_USBB_UESTA0_CFGOK_MASK));
+        usb_wait_cfgok(&AVR32_USBB.uesta0, AVR32_USBB_UESTA0_CFGOK_MASK, 5);
 
         fire_callback(USB_EVENT_RESET);
     }
@@ -435,7 +449,7 @@ static void configure_hid_endpoints(void)
          * NBUSYBK drain wait in hid_send_one() is the reliable path here.) */
         
 
-        while (!(AVR32_USBB.uesta1 & AVR32_USBB_UESTA1_CFGOK_MASK));
+        usb_wait_cfgok(&AVR32_USBB.uesta1, AVR32_USBB_UESTA1_CFGOK_MASK, 6);
     }
 
     if (current_attackmode == 2 || current_attackmode == 3) {
@@ -450,7 +464,7 @@ static void configure_hid_endpoints(void)
                            | AVR32_USBB_UECFG2_ALLOC_MASK;
         
 
-        while (!(AVR32_USBB.uesta2 & AVR32_USBB_UESTA2_CFGOK_MASK));
+        usb_wait_cfgok(&AVR32_USBB.uesta2, AVR32_USBB_UESTA2_CFGOK_MASK, 7);
 
         /* ---- EP3 IN (Bulk IN, 64 bytes) - MSC ---- */
         AVR32_USBB.uerst |= AVR32_USBB_UERST_EPRST3_MASK;
@@ -463,7 +477,7 @@ static void configure_hid_endpoints(void)
                            | AVR32_USBB_UECFG3_ALLOC_MASK;
         
 
-        while (!(AVR32_USBB.uesta3 & AVR32_USBB_UESTA3_CFGOK_MASK));
+        usb_wait_cfgok(&AVR32_USBB.uesta3, AVR32_USBB_UESTA3_CFGOK_MASK, 8);
 
         usb_msc_init();
     }
