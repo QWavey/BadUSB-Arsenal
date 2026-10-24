@@ -14,6 +14,10 @@
 SD=/mnt/sd
 CFG=$SD/config.txt
 LOG=$SD/Logs/ghostlink.log
+# Private runtime dir for pid, lease and docroot files. Fixed names in the
+# world-writable /tmp could be pre-created as symlinks by another local user.
+RUN=/run/ghostlink
+mkdir -p -m 700 "$RUN"
 
 log() {
     local t
@@ -165,7 +169,7 @@ if truthy "${GCFG_ASSIGN_IP:-TRUE}" && [ -e /sys/class/net/usb0 ]; then
     DR="${GCFG_DHCP_RANGE:-172.16.24.10,172.16.24.60}"
     RS="${DR%%,*}"
     RE="${DR##*,}"
-    cat > /tmp/udhcpd.conf <<EOF
+    cat > $RUN/udhcpd.conf <<EOF
 start   $RS
 end     $RE
 interface usb0
@@ -173,11 +177,11 @@ option subnet 255.255.255.0
 option router ${GCFG_GATEWAY_IP:-172.16.24.1}
 option dns ${GCFG_DNS_UPSTREAM:-1.1.1.1}
 option lease 86400
-lease_file /tmp/udhcpd.leases
-pidfile /tmp/udhcpd.pid
+lease_file $RUN/udhcpd.leases
+pidfile $RUN/udhcpd.pid
 EOF
-    [ -f /tmp/udhcpd.leases ] || touch /tmp/udhcpd.leases
-    udhcpd /tmp/udhcpd.conf 2>>$LOG &
+    [ -f $RUN/udhcpd.leases ] || touch $RUN/udhcpd.leases
+    udhcpd $RUN/udhcpd.conf 2>>$LOG &
     log "udhcpd on usb0 (range $RS-$RE)"
 fi
 
@@ -196,13 +200,13 @@ if truthy "${GCFG_LOG_TO_SD:-TRUE}"; then
                     -W 1 -s 65535 2>>$LOG
         done
     ) &
-    echo $! > /tmp/ghostlink-rec.pid
+    echo $! > $RUN/ghostlink-rec.pid
 fi
 
 # ---------- 8. webui (BusyBox httpd) ----------
 if truthy "${GCFG_WEBUI:-TRUE}"; then
-    mkdir -p /tmp/www
-    cat > /tmp/www/index.html <<'EOF'
+    mkdir -p $RUN/www
+    cat > $RUN/www/index.html <<'EOF'
 <!doctype html><html><head><meta charset=utf-8>
 <title>GhostLink (shell PoC)</title>
 <style>body{font-family:system-ui;background:#0a0d10;color:#e4e8ec;padding:24px}
@@ -218,8 +222,8 @@ code,pre{background:#141a20;padding:6px 10px;border-radius:4px;display:block;whi
 </ul>
 </body></html>
 EOF
-    mkdir -p /tmp/www/cgi-bin
-    cat > /tmp/www/cgi-bin/status <<'EOF'
+    mkdir -p $RUN/www/cgi-bin
+    cat > $RUN/www/cgi-bin/status <<'EOF'
 #!/bin/sh
 echo "Content-Type: text/plain"
 echo
@@ -238,20 +242,20 @@ echo
 echo "== gadget UDC bound =="
 cat /sys/kernel/config/usb_gadget/ghostlink/UDC 2>/dev/null
 EOF
-    cat > /tmp/www/cgi-bin/config <<EOF
+    cat > $RUN/www/cgi-bin/config <<EOF
 #!/bin/sh
 echo "Content-Type: text/plain"
 echo
 cat $CFG
 EOF
-    cat > /tmp/www/cgi-bin/records <<EOF
+    cat > $RUN/www/cgi-bin/records <<EOF
 #!/bin/sh
 echo "Content-Type: text/plain"
 echo
 ls -lh $SD/Records 2>/dev/null
 EOF
-    chmod +x /tmp/www/cgi-bin/*
-    httpd -p "${GCFG_WEBUI_PORT:-80}" -h /tmp/www -f &
+    chmod +x $RUN/www/cgi-bin/*
+    httpd -p "${GCFG_WEBUI_PORT:-80}" -h $RUN/www -f &
     log "webui on :${GCFG_WEBUI_PORT:-80}"
 fi
 

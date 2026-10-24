@@ -16,19 +16,21 @@
 #   2. Do the rebind: killall adbd → "" > UDC → symlink hid.usb0
 #      (if not already) → UDC > UDC → setsid adbd &.
 #   3. After we verify /dev/hidg0 exists AND the new adbd is up, we
-#      touch /tmp/.hid_ok which the watchdog polls. If present, the
+#      touch /run/ghostlink/.hid_ok which the watchdog polls. If present, the
 #      watchdog exits without rolling back.
 #
-# All stdout goes to /tmp/hid_enable.log so adb losing output doesn't
-# matter. Verify success later with: cat /tmp/hid_enable.log
+# All stdout goes to /run/ghostlink/hid_enable.log so adb losing output doesn't
+# matter. Verify success later with: cat /run/ghostlink/hid_enable.log
 # =============================================================================
 
 G=/sys/kernel/config/usb_gadget/rockchip
 CFG_DIR=$G/configs/b.1
 HID_LINK=$CFG_DIR/hid.usb0
 UDC_NAME=$(ls /sys/class/udc 2>/dev/null | head -n1)
-LOG=/tmp/hid_enable.log
-OK_MARK=/tmp/.hid_ok
+LOG=/run/ghostlink/hid_enable.log
+OK_MARK=/run/ghostlink/.hid_ok
+# Private dir (mode 700): fixed names in /tmp can be pre-created as symlinks.
+mkdir -p -m 700 /run/ghostlink
 ADBD=/usr/bin/adbd
 
 exec >> "$LOG" 2>&1

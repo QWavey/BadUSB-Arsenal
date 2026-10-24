@@ -41,9 +41,10 @@ cp extensions/hak5/*.txt   "$DEST/extensions/hak5/" 2>/dev/null || true
 cp extensions/hak5/*.ducky "$DEST/extensions/hak5/" 2>/dev/null || true
 chmod +x "$DEST"/*.sh "$DEST"/*.py
 # Strip CRLF from S99ghost too — busybox init refuses "set -eu\r".
-tr -d '\r' < S99ghost > /tmp/S99ghost.lf
-install -m 0755 /tmp/S99ghost.lf /etc/init.d/S99ghost
-rm -f /tmp/S99ghost.lf
+TMP=$(mktemp) || { echo "install: mktemp failed" >&2; exit 1; }
+tr -d '\r' < S99ghost > "$TMP"
+install -m 0755 "$TMP" /etc/init.d/S99ghost
+rm -f "$TMP"
 
 # One-time patch to /etc/init.d/S50usbdevice so it sources identity.env from
 # our dir. Idempotent — a sentinel comment stops us from patching twice.
