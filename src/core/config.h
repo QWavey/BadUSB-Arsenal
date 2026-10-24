@@ -22,7 +22,7 @@ typedef struct {
 
     /* 2. usb */
     int  usb;
-    char usb_mode[16];     /* NCM|RNDIS|HID|STORAGE|COMPOSITE */
+    char usb_mode[16];     /* NCM|RNDIS|COMPOSITE; HID and storage come from usb_hid / usb_storage */
     uint16_t usb_vid;
     uint16_t usb_pid;
     char usb_manufacturer[64];

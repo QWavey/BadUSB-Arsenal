@@ -26,12 +26,12 @@ keys apply without reboot; those that don't are listed below.
 | key | type | default | notes |
 |-----|------|---------|-------|
 | USB | bool | TRUE | master gadget switch |
-| USB_MODE | enum | NCM | NCM, RNDIS, HID, STORAGE, COMPOSITE |
+| USB_MODE | enum | NCM | NCM, RNDIS, COMPOSITE. HID and storage are set by USB_HID and USB_STORAGE |
 | USB_VID | hex | 0x1D6B | |
 | USB_PID | hex | 0x0137 | |
 | USB_MANUFACTURER | str | GhostLink | |
 | USB_PRODUCT | str | WebBee Passthrough | |
-| USB_SERIAL | str | AUTO | AUTO = derive from chip id |
+| USB_SERIAL | str | AUTO | AUTO = derive from the eth0 MAC address, stable across reboots |
 | USB_HID | bool | TRUE | expose /dev/hidg0 |
 | USB_STORAGE | bool | FALSE | expose SD as MSC too |
 

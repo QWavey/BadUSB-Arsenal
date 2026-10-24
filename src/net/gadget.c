@@ -125,7 +125,18 @@ int gadget_start(void) {
             }
             fclose(f);
         }
-        if (!serial[0]) snprintf(serial, sizeof(serial), "GHOST%08X", (unsigned)getpid());
+        if (!serial[0]) {
+            /* Stable across reboots: the eth0 hardware address without colons.
+             * The old getpid() fallback changed on every boot. */
+            char mac[32] = {0};
+            FILE *m = fopen("/sys/class/net/eth0/address", "r");
+            if (m) { if (!fgets(mac, sizeof(mac), m)) mac[0] = 0; fclose(m); }
+            size_t o = 0;
+            for (size_t i = 0; mac[i] && o + 1 < sizeof(serial); i++)
+                if (mac[i] != ':' && mac[i] != '\n' && mac[i] != '\r') serial[o++] = mac[i];
+            serial[o] = 0;
+            if (!serial[0]) snprintf(serial, sizeof(serial), "GHOSTLINK0");
+        }
     } else {
         strncpy(serial, g_cfg.usb_serial, sizeof(serial)-1);
         serial[sizeof(serial)-1] = 0;

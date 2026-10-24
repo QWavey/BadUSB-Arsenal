@@ -18,7 +18,7 @@ BOOT_LED=TRUE                       # blink the status LED through boot stages
 
 # ----- 2. USB personality ------------------------------------------------------
 USB=TRUE                            # master switch for USB-gadget side
-USB_MODE=NCM                        # NCM | RNDIS | HID | STORAGE | COMPOSITE
+USB_MODE=NCM                        # NCM | RNDIS | COMPOSITE (HID and storage use USB_HID / USB_STORAGE)
 USB_VID=0x1D6B                      # linux foundation
 USB_PID=0x0137
 USB_MANUFACTURER=GhostLink

@@ -7,7 +7,7 @@
  *   t=0.03s  log init to serial + /Logs/ghostlink.log
  *   t=0.04s  USB gadget composite (NCM + HID) via configfs
  *   t=0.08s  bridge up (br0 or NAT depending on NETMODE)
- *   t=0.09s  spawn: recorder, httpd, deadnet, redirect, hid, cron, mdns
+ *   t=0.09s  spawn: recorder, httpd, deadnet, redirect, hid
  *   t=0.10s  button watcher + LED
  *   t=0.11s  returns to supervisor loop
  *
@@ -214,6 +214,7 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
 
+    long t0 = now_ms();
     /* ultra-early serial so a boot hang shows a hint */
     log_init(LL_INFO, NULL, 1);
     LOGI("boot", "GhostLink firmware starting");
@@ -237,10 +238,10 @@ int main(int argc, char **argv) {
     if (g_cfg.hostname[0]) sethostname(g_cfg.hostname, strlen(g_cfg.hostname));
 
     /* USB first — bridge needs usb0 */
-    gadget_start();
+    if (gadget_start() != 0) LOGE("boot", "USB gadget failed to start; no USB until fixed");
 
     /* passthrough */
-    bridge_start();
+    if (bridge_start() != 0) LOGE("boot", "bridge failed to start");
 
     /* supervisor */
     supervisor_init();
@@ -255,7 +256,7 @@ int main(int argc, char **argv) {
     g_btn_run = 1;
     pthread_create(&g_btn_t, NULL, btn_worker, NULL);
 
-    LOGI("boot", "GhostLink ready in %ldms (uptime jiffies)", (long)clock() / 1000);
+    LOGI("boot", "GhostLink ready in %ldms", now_ms() - t0);
 
     /* reconcile loop — watches cfg generation and starts/stops services */
     uint64_t last_gen = 0;

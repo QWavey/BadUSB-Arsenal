@@ -1,8 +1,9 @@
 /*
- * A ~200-line service supervisor. Not a replacement for systemd — the point is
- * that boot is <1s because we never fork a shell, never pipe through logs,
- * never wait on a socket. Each registered service is a C function that returns
- * fast; long-running work happens in a pthread the service owns.
+ * Service supervisor: starts registered services in order, stops them in
+ * reverse, and reconciles them when config changes. Each service is a C
+ * function that returns quickly; long-running work runs in a pthread the
+ * service owns. Some services still call system() (bridge.c, main.c), so this
+ * file does not by itself avoid the shell.
  */
 
 #include "supervisor.h"
