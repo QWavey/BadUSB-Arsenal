@@ -26,7 +26,7 @@ Manual, in short:
    ```
    The device reboots as a HID keyboard; the status LED goes solid when it is ready.
 
-`flash_firmware.bat` at the repo root does all three commands in one click.
+`flash_firmware.bat` at the repo root is the one-click path. It flashes `build\firmware.hex` (run `make all` first) with the bundled `tools\dfu-programmer.exe`. It runs erase, then flash with `--suppress-validation`, then `launch --no-reset`. Because validation is off, the flash is not read back. The script stops if the erase fails, unless you type `y` to continue. It prints the image's SHA-256 before it writes.
 
 ## Folder Structure
 
@@ -87,7 +87,7 @@ Plug the device in outside DFU mode. Device Manager (Keyboards) or USBView shoul
 ## Troubleshooting
 
 - **No device present**: enter DFU mode (hold button while plugging in), run Zadig on Windows
-- **`dfu-programmer` not found**: use `tools/dfu-programmer.exe` or add it to `PATH`
+- **`dfu-programmer` not found**: the scripts use only `tools/dfu-programmer.exe`, so restore that file from the repository. `PATH` is not searched. `make flash` accepts another copy through `DFU=...`
 - **`avr32-gcc` not found**: add `tools/AVR Toolchain/bin/` to `PATH`
 - **LED does not light after flash**: check `LED_PIN` in `src/main.c`
 - **HID device does not appear**: unplug, replug, check VID/PID in Device Manager
