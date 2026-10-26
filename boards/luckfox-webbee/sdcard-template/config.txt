@@ -1,0 +1,248 @@
+# =============================================================================
+# GhostLink firmware — config.txt
+# =============================================================================
+# Everything below is read on boot (and hot-reloaded when you Save in the WebUI).
+# TRUE/FALSE are the only booleans. Blank or missing = default.
+# Lines beginning with # are comments. Keys are UPPER_CASE_WITH_UNDERSCORES.
+# =============================================================================
+
+
+# ----- 1. Core -----------------------------------------------------------------
+HOSTNAME=ghostlink
+DEVICE_NAME=WebBee-Ghost-01
+TIMEZONE=UTC
+LOCALE=en_US.UTF-8
+FAST_BOOT=TRUE                      # skip anything not strictly needed on boot
+BOOT_LED=TRUE                       # blink the status LED through boot stages
+
+
+# ----- 2. USB personality ------------------------------------------------------
+USB=TRUE                            # master switch for USB-gadget side
+USB_MODE=NCM                        # NCM | RNDIS | COMPOSITE (HID and storage use USB_HID / USB_STORAGE)
+USB_VID=0x1D6B                      # linux foundation
+USB_PID=0x0137
+USB_MANUFACTURER=GhostLink
+USB_PRODUCT=WebBee Passthrough
+USB_SERIAL=AUTO                     # AUTO = derive from CPU id
+USB_HID=TRUE                        # expose /dev/hidg0 (keyboard+mouse)
+USB_STORAGE=FALSE                   # expose SD as mass-storage to the host too
+
+
+# ----- 3. Network passthrough --------------------------------------------------
+PASSTHROUGH_LAN=TRUE                # bridge usb0 <-> eth0 at kernel level
+NETMODE=BRIDGE                      # BRIDGE | NAT | TRANSPARENT | VPN | ISOLATE
+ASSIGN_IP=TRUE                      # offer DHCP to the host-side on usb0
+DHCP_RANGE=172.16.24.10,172.16.24.60
+GATEWAY_IP=172.16.24.1
+DNS_UPSTREAM=1.1.1.1,9.9.9.9
+MAC_CLONE=FALSE                     # copy target MAC onto out-side
+MAC_CLONE_FROM=eth0
+STATIC_IP=                           # blank = DHCP on eth0
+STATIC_NETMASK=
+STATIC_GATEWAY=
+
+
+# ----- 4. Recording to SD ------------------------------------------------------
+LOG_TO_SD=TRUE                      # pcap + verdict stream to /Records
+RECORD_FORMAT=PCAPNG                # PCAP | PCAPNG
+RECORD_ROTATE_MB=64                 # rotate when a file grows beyond this
+RECORD_RING_FILES=32                # keep this many rotated files, delete oldest
+RECORD_FILTER=                      # BPF filter, blank = everything
+VERDICT_STREAM=TRUE                 # the novel bit: live JSONL side-channel
+VERDICT_INCLUDE_PAYLOAD=FALSE       # TRUE adds first 64B payload per verdict
+
+
+# ----- 5. Web UI ---------------------------------------------------------------
+WEBUI=TRUE
+WEBUI_PORT=80
+WEBUI_BIND=0.0.0.0                  # usb0+eth0 by default
+WEBUI_USER=root
+WEBUI_PASS=                          # required: WebUI stays off until this or API_TOKEN is set
+WEBUI_LANG=en
+
+
+# ----- 6. DeadNet (ARPv4 + NDPv6 havoc) ---------------------------------------
+# Based on github.com/flashnuke/deadnet, re-implemented in native C.
+DEADNET=FALSE                       # DANGER: do not enable on networks you don't own
+DEADNET_IPV4=TRUE                   # ARP spoof the subnet
+DEADNET_IPV6=TRUE                   # RA router-lifetime=0 flood
+DEADNET_INTERVAL_MS=800
+DEADNET_SPARE=                      # comma-sep IPs that stay reachable (admin)
+DEADNET_SELECTIVE=FALSE             # TRUE = only hit DEADNET_TARGETS
+DEADNET_TARGETS=                    # comma-sep IPs/MACs
+
+
+# ----- 7. Redirect (DNS + HTTP(S) coarse) --------------------------------------
+REDIRECT=FALSE
+REDIRECT_FROM=                       # google.com,facebook.com   (comma-sep)
+REDIRECT_TO=                         # example.com  (one target) or http://ip
+REDIRECT_PROTO=AUTO                  # AUTO | HTTP | HTTPS | DNS_ONLY
+REDIRECT_PRESERVE_PATH=TRUE          # /foo?bar=1 is appended to destination
+
+
+# ----- 8. DNS spoofing (fine-grained host list) --------------------------------
+DNS_SPOOF=FALSE
+DNS_SPOOF_FILE=/Spoofhosts/default.hosts   # /etc/hosts syntax on SD
+
+
+# ----- 9. Honeypot -------------------------------------------------------------
+HONEYPOT=FALSE
+HONEYPOT_PORTS=22,80,3389,445
+HONEYPOT_LOG=/Honeypot/sessions.jsonl
+HONEYPOT_BANNER=OpenSSH_8.9p1
+
+
+# ----- 10. HID / BadUSB --------------------------------------------------------
+HID_ENABLED=TRUE
+HID_LAYOUT=us                        # /Languages/<layout>.json
+HID_PAYLOAD=                         # /Payloads/<file>.ducky, blank = none
+HID_TRIGGER=BUTTON                   # BUTTON | WEBUI | BOOT | WEBHOOK
+HID_DELAY_MS=1500                    # wait after host enumerates before typing
+
+
+# ----- 11. Shark-Jack-style payloads ------------------------------------------
+PAYLOADS=TRUE
+PAYLOAD_SWITCH1=/Payloads/recon.sh   # mimic Shark Jack arming
+PAYLOAD_SWITCH2=/Payloads/attack.sh  # (we use button-tap counts instead)
+PAYLOAD_SWITCH3=
+PAYLOAD_TAP_WINDOW_MS=800            # how fast taps count as a sequence
+
+
+# ----- 12. SSH / remote --------------------------------------------------------
+SSH=TRUE
+SSH_PORT=22
+SSH_PASSWORD_AUTH=FALSE
+SSH_ROOT=FALSE
+
+
+# ----- 13. mDNS discovery ------------------------------------------------------
+MDNS=TRUE
+MDNS_NAME=ghostlink.local
+
+
+# ----- 14. Loot auto-exfil -----------------------------------------------------
+LOOT=TRUE
+LOOT_WEBHOOK=                        # https://your.c2/ingest
+LOOT_WEBHOOK_SECRET=
+LOOT_PRIORITY=HIGH                   # LOW | NORMAL | HIGH (traffic shaping)
+
+
+# ----- 15. VPN exfil tunnel ----------------------------------------------------
+VPN=FALSE
+VPN_TYPE=WIREGUARD                   # WIREGUARD | OPENVPN
+VPN_CONFIG=/Modules/wg0.conf
+
+
+# ----- 16. SSL strip / MITM ----------------------------------------------------
+# Educational use only. Deliberately opt-in, loud LED when active.
+SSL_STRIP=FALSE
+MITM_CA=/Modules/mitm.ca.pem
+
+
+# ----- 17. WiFi (optional dongle) ----------------------------------------------
+WIFI=FALSE
+WIFI_MODE=STA                        # STA | AP | SCAN | MONITOR
+WIFI_SSID=
+WIFI_PASS=
+WIFI_AP_SSID=GhostLink
+WIFI_AP_PASS=                        # required before WIFI_MODE=AP
+
+
+# ----- 18. Scheduled jobs ------------------------------------------------------
+CRON=TRUE
+CRON_FILE=/Scripts/cron.txt
+
+
+# ----- 19. LED behaviour -------------------------------------------------------
+LED=TRUE
+LED_IDLE=G:solid                     # <color>:<pattern>
+LED_RECORDING=Y:single
+LED_ATTACK=R:fast
+LED_WEBUI=C:slow
+
+
+# ----- 20. Alerts --------------------------------------------------------------
+ALERTS=TRUE
+ALERT_WEBHOOK=
+ALERT_ON_NEW_HOST=TRUE
+ALERT_ON_RULE_HIT=TRUE
+ALERT_ON_HONEYPOT=TRUE
+
+
+# ----- 21. Flow analytics ------------------------------------------------------
+FLOWS=TRUE                           # live flow table in WebUI
+FLOW_TIMEOUT_S=180
+FLOW_MAX=4096
+
+
+# ----- 22. Rate limiting / selective slow ------------------------------------
+RATE_LIMIT=FALSE
+RATE_LIMIT_TARGETS=                  # IPs or MACs
+RATE_LIMIT_KBPS=256
+
+
+# ----- 23. Scheduled recording -----------------------------------------------
+RECORD_SCHEDULE=                     # cron-ish "08:00-18:00 Mon-Fri"
+
+
+# ----- 24. Clock / NTP -------------------------------------------------------
+NTP=TRUE
+NTP_SERVERS=pool.ntp.org,time.cloudflare.com
+
+
+# ----- 25. Watchdog ----------------------------------------------------------
+WATCHDOG=TRUE                        # auto-reboot on hang (hw wdt + userspace)
+WATCHDOG_TIMEOUT_S=30
+
+
+# ----- 26. Panic / self-destruct ---------------------------------------------
+# If button is held for PANIC_HOLD_S the SD /Records folder is cryptographically
+# scrubbed and the device reboots clean. Use with care.
+PANIC_HOLD_S=10
+PANIC_SCRUB=FALSE
+
+
+# ----- 27. Firmware OTA ------------------------------------------------------
+OTA=FALSE
+OTA_URL=
+OTA_PUBKEY=/Firmware/ota.pub.pem
+
+
+# ----- 28. Logging -----------------------------------------------------------
+LOG_LEVEL=INFO                       # DEBUG | INFO | WARN | ERROR
+LOG_TO_SERIAL=TRUE
+LOG_TO_SD_FILE=/Logs/ghostlink.log
+
+
+# ----- 29. Modules -----------------------------------------------------------
+# Drop a .so into /Modules and name it here to auto-load on boot.
+MODULES_ENABLED=
+MODULES_DIR=/Modules
+
+
+# ----- 30. Pwnagotchi-style sibling discovery --------------------------------
+SIBLING_BEACON=FALSE                 # beacon on usb0 so paired devices find us
+SIBLING_KEY=
+
+
+# ----- 31. Captive-portal landing --------------------------------------------
+CAPTIVE_PORTAL=FALSE
+CAPTIVE_PORTAL_FILE=/WebUI/portal.html
+
+
+# ----- 32. Content inject (JS/HTML into cleartext HTTP) ----------------------
+INJECT=FALSE
+INJECT_FILE=/Modules/inject.js
+INJECT_MATCH=                         # host filter, blank = all cleartext HTTP
+
+
+# ----- 33. User isolation ----------------------------------------------------
+ISOLATE_CLIENTS=FALSE                 # when NETMODE=NAT, block client-to-client
+
+
+# ----- 34. API tokens --------------------------------------------------------
+API_TOKEN=                            # bearer for /api/*, blank = basic-auth
+
+
+# ----- 35. Factory reset gesture ---------------------------------------------
+FACTORY_RESET_TAPS=5                  # tap the button N times inside 3s

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Last-stage launcher for GhostLink. Keeps itself out of busybox init race by
+# running after S98 networking (which we skip anyway — gadget.c sets eth/usb up).
+
+case "$1" in
+  start)
+    /usr/sbin/ghostlink > /dev/kmsg 2>&1 &
+    ;;
+  stop)
+    killall ghostlink 2>/dev/null
+    ;;
+  *)
+    echo "usage: $0 start|stop"
+    exit 1
+    ;;
+esac
+exit 0

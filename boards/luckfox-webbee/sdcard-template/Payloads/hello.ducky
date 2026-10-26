@@ -1,0 +1,11 @@
+REM Minimal smoke test — opens notepad on Windows and types a line.
+DEFAULTDELAY 50
+DELAY 500
+GUI r
+DELAY 400
+STRING notepad
+ENTER
+DELAY 800
+STRING hello from GhostLink
+ENTER
+STRING run with HID_TRIGGER=BUTTON or push via /api/hid
