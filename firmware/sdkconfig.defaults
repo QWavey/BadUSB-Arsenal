@@ -1,0 +1,41 @@
+# ESP32-P4 target
+CONFIG_IDF_TARGET="esp32p4"
+
+# Our chip is revision v1.3 — v5.5's default targets v3.x-only variants.
+# Opt into the pre-v3 revision family, then pick the v1.x minimum.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# USB Host = HS peripheral (port 0), TinyUSB device = FS peripheral (port 1)
+# TinyUSB port selection: 0 = HS, 1 = FS. We put the DEVICE on HS to test U4-Slave routing.
+CONFIG_TINYUSB_RHPORT_HS=n
+CONFIG_TINYUSB_RHPORT_FS=y
+
+# TinyUSB HID class enabled
+CONFIG_TINYUSB_HID_COUNT=1
+CONFIG_TINYUSB_HID_BUFSIZE=64
+
+# We keep TinyUSB task at a decent priority
+CONFIG_TINYUSB_TASK_PRIORITY=5
+
+# Flash size for MINI-B (32MB). If your board is MINI-A (N16R32) that's 16MB flash — change to 16MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
+
+# Bigger monitor buffer for HID logs
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# USB Host: enable external hub support (the CH334F on U2/U3)
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
+
+# Log level: allow VERBOSE at runtime via esp_log_level_set (compiled-in max)
+CONFIG_LOG_MAXIMUM_EQUALS_DEFAULT=n
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Disable PSRAM — biggest single power draw (~80 mA). Passthrough doesn't need it.
+CONFIG_SPIRAM=n
+
+# Disable Bluetooth stack (not used)
+CONFIG_BT_ENABLED=n

@@ -1,0 +1,19 @@
+# ESP-IDF build artifacts (both firmwares)
+**/build/
+**/sdkconfig
+**/sdkconfig.old
+**/managed_components/
+**/.clangd
+**/.cache/
+
+# Runtime state
+**/live_monitor.log
+*.tmp
+*.bak
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
