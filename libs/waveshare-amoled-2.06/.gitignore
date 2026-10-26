@@ -1,0 +1,3 @@
+# Local configuration: board pin assignments and Wi-Fi credentials. Never commit these.
+pin_config.h
+**/wifi_secrets.h
