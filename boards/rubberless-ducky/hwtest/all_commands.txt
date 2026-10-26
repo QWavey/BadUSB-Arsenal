@@ -1,0 +1,191 @@
+REM ================================================================
+REM COMPLETE COMMAND PROBE - compile to tests/13.bin
+REM Every DuckyScript command/key, one area per block. DECODE probe:
+REM inject_inspect.py flags any opcode the firmware does not handle.
+REM Not meant to run on a host.
+REM
+REM NOTE: BACKSPACE is intentionally omitted here - it is keycode 0x2a
+REM (firmware-handled, in range) but the German language file lacks the
+REM name mapping (an upstream Hak5 gap; fixed in this repo's languages/).
+REM ================================================================
+
+REM ---- DEFINE (compile-time constant, no # prefix) ----
+DEFINE MARK 42
+
+REM ---- named keys (each -> raw keystroke, keycode must be <= 0x65) ----
+ENTER
+ESCAPE
+TAB
+SPACE
+DELETE
+INSERT
+HOME
+END
+PAGEUP
+PAGEDOWN
+UP
+DOWN
+LEFT
+RIGHT
+UPARROW
+DOWNARROW
+LEFTARROW
+RIGHTARROW
+CAPSLOCK
+NUMLOCK
+SCROLLLOCK
+PRINTSCREEN
+PAUSE
+BREAK
+MENU
+APP
+F1
+F2
+F3
+F4
+F5
+F6
+F7
+F8
+F9
+F10
+F11
+F12
+
+REM ---- modifiers WITH a key ----
+CTRL c
+CONTROL v
+SHIFT a
+ALT F4
+GUI r
+GUI-SHIFT s
+CTRL-ALT-DELETE
+CTRL-SHIFT ESCAPE
+
+REM ---- bare modifiers via INJECT_MOD (all six) ----
+INJECT_MOD CONTROL
+INJECT_MOD SHIFT
+INJECT_MOD ALT
+INJECT_MOD GUI
+INJECT_MOD WINDOWS
+INJECT_MOD COMMAND
+
+REM ---- typing ----
+STRING Hello, World! 12345
+STRINGLN done
+
+REM ---- RANDOM_* generators ----
+RANDOM_LOWERCASE_LETTER
+RANDOM_UPPERCASE_LETTER
+RANDOM_LETTER
+RANDOM_NUMBER
+RANDOM_SPECIAL
+RANDOM_CHAR
+
+REM ---- DELAY forms ----
+DELAY 1
+DELAY 500
+
+REM ---- VAR + every operator (declare once, then reassign without VAR) ----
+VAR $a = 10
+VAR $b = 3
+VAR $c = 0
+$c = ($a + $b)
+$c = ($a - $b)
+$c = ($a * $b)
+$c = ($a / $b)
+$c = ($a % $b)
+$c = ($a ^ $b)
+$c = ($a == $b)
+$c = ($a != $b)
+$c = ($a > $b)
+$c = ($a < $b)
+$c = ($a >= $b)
+$c = ($a <= $b)
+$c = ($a && $b)
+$c = ($a || $b)
+$c = ($a & $b)
+$c = ($a | $b)
+$c = ($a << $b)
+$c = ($a >> $b)
+
+REM ---- control flow: IF / ELSE / END_IF ----
+IF ($a > $b) THEN
+    STRING greater
+ELSE
+    STRING notgreater
+END_IF
+
+REM ---- WHILE / END_WHILE ----
+VAR $i = 0
+WHILE ($i < 3)
+    STRING loop
+    $i = ($i + 1)
+END_WHILE
+
+REM ---- FUNCTION / END_FUNCTION + call (no explicit RETURN keyword) ----
+FUNCTION MYFUNC()
+    STRING infunc
+END_FUNCTION
+MYFUNC()
+
+REM ---- ATTACKMODE variants + identity + SAVE/RESTORE ----
+ATTACKMODE HID
+ATTACKMODE OFF
+ATTACKMODE STORAGE
+ATTACKMODE HID STORAGE
+ATTACKMODE HID VID_05AC PID_021E
+ATTACKMODE HID MAN_HAK5 PROD_DUCKY SERIAL_1337
+ATTACKMODE HID VID_RANDOM PID_RANDOM MAN_RANDOM PROD_RANDOM SERIAL_RANDOM
+SAVE_ATTACKMODE
+RESTORE_ATTACKMODE
+
+REM ---- LEDs ----
+LED_OFF
+LED_R
+LED_G
+
+REM ---- button ----
+ENABLE_BUTTON
+DISABLE_BUTTON
+BUTTON_DEF
+    STRING pressed
+END_BUTTON
+WAIT_FOR_BUTTON_PRESS
+
+REM ---- HOLD / RELEASE (regular + bare-mod via INJECT_MOD) ----
+HOLD a
+RELEASE a
+INJECT_MOD
+HOLD CONTROL
+RELEASE CONTROL
+
+REM ---- lock-key waits ----
+SAVE_HOST_KEYBOARD_LOCK_STATE
+RESTORE_HOST_KEYBOARD_LOCK_STATE
+WAIT_FOR_CAPS_ON
+WAIT_FOR_CAPS_OFF
+WAIT_FOR_CAPS_CHANGE
+WAIT_FOR_NUM_ON
+WAIT_FOR_NUM_OFF
+WAIT_FOR_NUM_CHANGE
+WAIT_FOR_SCROLL_ON
+WAIT_FOR_SCROLL_OFF
+WAIT_FOR_SCROLL_CHANGE
+
+REM ---- exfil / reflection ----
+$_EXFIL_MODE_ENABLED = TRUE
+EXFIL $a
+$_EXFIL_MODE_ENABLED = FALSE
+
+REM ---- jitter ----
+$_JITTER_ENABLED = TRUE
+$_JITTER_MAX = 5
+$_JITTER_ENABLED = FALSE
+
+REM ---- payload control (LAST; these halt/loop when RUN, fine to decode) ----
+HIDE_PAYLOAD
+RESTORE_PAYLOAD
+RESET
+RESTART_PAYLOAD
+STOP_PAYLOAD

@@ -1,0 +1,34 @@
+# CONFIG.TXT — place this file in the SD-card root. The firmware scans the SD
+# root for it at boot (load_config -> pf_open("CONFIG.TXT")).
+#
+# Optional. Every line is  key = value  ('#' starts a comment). Any key you
+# omit keeps its firmware default, so a minimal file with just the one line you
+# care about is fine. Values are decimal unless noted. Read once at boot, before
+# USB — no reflash needed to retune.
+
+# --- Typing timing (milliseconds) ---
+# hold_ms            = 14     # key-held duration (press->release); the drop-critical value
+# gap_ms             = 8      # inter-key gap (release->next press)
+# mod_settle_ms      = 16     # settle after a Shift/AltGr change before the key
+
+# --- First-pass warm-up ramp (the opening STRING is paced slower, then speeds up) ---
+# warmup_slow_keys   = 56     # first N keys: slowest
+# warmup_slow_extra  = 14     # ...held hold_ms + this
+# warmup_ramp_keys   = 120    # up to N keys: medium
+# warmup_ramp_extra  = 6      # ...held hold_ms + this
+
+# --- Anti-detection jitter (adds 0..jitter_max ms of random hold per key) ---
+# jitter             = 0      # 1 = enable
+# jitter_max         = 0      # max random ms
+
+# --- USB identity (hex ok, e.g. 0x05AC) ---
+# vid                = 0x05AC
+# pid                = 0x021E
+
+# --- Self-calibrating timing (invention) ---
+# autocal            = 0      # 1 = measure host latency via the CapsLock LED echo
+                              #     and trim the warm-up ramp on a proven-fast host
+
+# --- Dry-run lint ---
+# dryrun             = 0      # 1 = validate the payload, blink the result, type nothing
+                              #     (3 green = OK, N red = N out-of-range jump targets)

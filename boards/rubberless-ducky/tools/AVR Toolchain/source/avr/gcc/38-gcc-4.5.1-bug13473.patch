@@ -1,0 +1,14 @@
+diff -rupw gcc/config/avr/avr.c gcc/config/avr/avr.c
+--- gcc/config/avr/avr.c	2011-02-18 14:30:45.000000000 -0600
++++ gcc/config/avr/avr.c	2011-02-18 10:46:48.000000000 -0600
+@@ -3356,8 +3356,8 @@ out_movhi_mr_r (rtx insn, rtx op[], int 
+ 		    AS2 (out,%m0-%2,%A1));
+ 	}
+       if (AVR_XMEGA)
+-        return *l = 4, (AS2 (sts,%A0,%A1) CR_TAB
+-			AS2 (sts,%B0,%B1));
++        return *l = 4, (AS2 (sts,%m0,%A1) CR_TAB
++			AS2 (sts,%m0+1,%B1));
+       else
+       return *l = 4, (AS2 (sts,%m0+1,%B1) CR_TAB
+ 		      AS2 (sts,%m0,%A1));

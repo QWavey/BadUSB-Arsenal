@@ -1,0 +1,188 @@
+diff -Naurp ./configure.ac ./configure.ac
+--- ./configure.ac	2011-03-29 16:44:46.000000000 -0500
++++ ./configure.ac	2011-03-29 16:48:11.000000000 -0500
+@@ -973,6 +973,9 @@ AM_CONDITIONAL(HAS_atxmega256a3, test "x
+ CHECK_AVR_DEVICE(atxmega256a3b)
+ AM_CONDITIONAL(HAS_atxmega256a3b, test "x$HAS_atxmega256a3b" = "xyes")
+ 
++CHECK_AVR_DEVICE(atxmega256a3bu)
++AM_CONDITIONAL(HAS_atxmega256a3bu, test "x$HAS_atxmega256a3bu" = "xyes")
++
+ CHECK_AVR_DEVICE(atxmega256d3)
+ AM_CONDITIONAL(HAS_atxmega256d3, test "x$HAS_atxmega256d3" = "xyes")
+ 
+@@ -1306,6 +1309,7 @@ AC_CONFIG_FILES([
+ 	avr/lib/avrxmega6/atxmega192d3/Makefile
+ 	avr/lib/avrxmega6/atxmega256a3/Makefile
+ 	avr/lib/avrxmega6/atxmega256a3b/Makefile
++	avr/lib/avrxmega6/atxmega256a3bu/Makefile
+ 	avr/lib/avrxmega6/atxmega256d3/Makefile
+ ])
+ 
+diff -Naurp ./devtools/gen-avr-lib-tree.sh ./devtools/gen-avr-lib-tree.sh
+--- ./devtools/gen-avr-lib-tree.sh	2011-03-29 16:44:46.000000000 -0500
++++ ./devtools/gen-avr-lib-tree.sh	2011-03-29 16:48:11.000000000 -0500
+@@ -286,6 +286,7 @@ atxmega192a3:crtx192a3.o:${DEV_DEFS}:${C
+ atxmega192d3:crtx192d3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+ atxmega256a3:crtx256a3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+ atxmega256a3b:crtx256a3b.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
++atxmega256a3bu:crtx256a3bu.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+ atxmega256d3:crtx256d3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS}\
+ "
+ 
+diff -Naurp ./doc/api/main_page.dox ./doc/api/main_page.dox
+--- ./doc/api/main_page.dox	2011-03-29 16:44:46.000000000 -0500
++++ ./doc/api/main_page.dox	2011-03-29 16:48:11.000000000 -0500
+@@ -278,6 +278,7 @@ compile-time.
+ - atxmega192d3
+ - atxmega256a3
+ - atxmega256a3b
++- atxmega256a3bu
+ - atxmega256d3
+ 
+ \par Miscellaneous Devices:
+diff -Naurp ./doc/api/using-tools.dox ./doc/api/using-tools.dox
+--- ./doc/api/using-tools.dox	2011-03-29 16:44:46.000000000 -0500
++++ ./doc/api/using-tools.dox	2011-03-29 16:48:11.000000000 -0500
+@@ -398,6 +398,7 @@ AVR will be defined as well when using t
+   <tr><td>avrxmega6</td><td>atxmega192d3</td><td>__AVR_ATxmega192D3__</td></tr>
+   <tr><td>avrxmega6</td><td>atxmega256a3</td><td>__AVR_ATxmega256A3__</td></tr>
+   <tr><td>avrxmega6</td><td>atxmega256a3b</td><td>__AVR_ATxmega256A3B__</td></tr>
++  <tr><td>avrxmega6</td><td>atxmega256a3bu</td><td>__AVR_ATxmega256A3BU__</td></tr>
+   <tr><td>avrxmega6</td><td>atxmega256d3</td><td>__AVR_ATxmega256D3__</td></tr>
+ 
+   <tr><td>avrxmega7</td><td>atxmega128a1</td><td>__AVR_ATxmega128A1__</td></tr>
+diff -Naurp ./include/avr/eeprom.h ./include/avr/eeprom.h
+--- ./include/avr/eeprom.h	2011-03-29 16:44:46.000000000 -0500
++++ ./include/avr/eeprom.h	2011-03-29 16:48:11.000000000 -0500
+@@ -385,6 +385,8 @@
+ # define _EEPROM_SUFFIX   _x256a3
+ #elif defined (__AVR_ATxmega256A3B__)
+ # define _EEPROM_SUFFIX   _x256a3b
++#elif defined (__AVR_ATxmega256A3BU__)
++# define _EEPROM_SUFFIX   _x256a3bu
+ #elif defined (__AVR_ATxmega256D3__)
+ # define _EEPROM_SUFFIX   _x256d3
+ #elif defined (__AVR_ATA6289__)
+diff -Naurp ./include/avr/io.h ./include/avr/io.h
+--- ./include/avr/io.h	2011-03-29 16:44:46.000000000 -0500
++++ ./include/avr/io.h	2011-03-29 16:48:11.000000000 -0500
+@@ -410,6 +410,8 @@
+ #  include <avr/iox256a3.h>
+ #elif defined (__AVR_ATxmega256A3B__)
+ #  include <avr/iox256a3b.h>
++#elif defined (__AVR_ATxmega256A3BU__)
++#  include <avr/iox256a3bu.h>
+ #elif defined (__AVR_ATxmega256D3__)
+ #  include <avr/iox256d3.h>
+ #elif defined (__AVR_ATA6289__)
+diff -Naurp ./include/avr/iox256a3bu.h ./include/avr/iox256a3bu.h
+--- ./include/avr/iox256a3bu.h	1969-12-31 18:00:00.000000000 -0600
++++ ./include/avr/iox256a3bu.h	2011-03-29 16:49:07.000000000 -0500
+@@ -0,0 +1,2 @@
++#define _VECTORS_SIZE 0
++#define EIND 0
+diff -Naurp ./include/avr/Makefile.am ./include/avr/Makefile.am
+--- ./include/avr/Makefile.am	2011-03-29 16:44:46.000000000 -0500
++++ ./include/avr/Makefile.am	2011-03-29 16:48:11.000000000 -0500
+@@ -202,6 +202,7 @@ avr_HEADERS = \
+     iox192d3.h \
+     iox256a3.h \
+     iox256a3b.h \
++    iox256a3bu.h \
+     iox256d3.h \
+     iox32a4.h \
+     iox32d4.h \
+diff -Naurp ./include/avr/power.h ./include/avr/power.h
+--- ./include/avr/power.h	2011-03-29 16:44:46.000000000 -0500
++++ ./include/avr/power.h	2011-03-29 16:48:11.000000000 -0500
+@@ -364,7 +364,8 @@ find out which macros are applicable to 
+ || defined(__AVR_ATxmega128A3__) \
+ || defined(__AVR_ATxmega192A3__) \
+ || defined(__AVR_ATxmega256A3__) \
+-|| defined(__AVR_ATxmega256A3B__)
++|| defined(__AVR_ATxmega256A3B__) \
++|| defined(__AVR_ATxmega256A3BU__)
+ 
+ #define power_aes_enable()  (PR_PRGEN &= (uint8_t)~(PR_AES_bm))
+ #define power_aes_disable() (PR_PRGEN |= (uint8_t)PR_AES_bm)
+@@ -389,6 +390,34 @@ find out which macros are applicable to 
+ #define power_usartf1_enable()  (PR_PRPF &= (uint8_t)~(PR_USART1_bm))
+ #define power_usartf1_disable() (PR_PRPF |= (uint8_t)PR_USART1_bm)
+ 
++#if defined(__AVR_ATxmega256A3BU__)
++#define power_usb_enable()   (PR_PRGEN &= (uint8_t)~(PR_USB_bm))
++#define power_usb_disable()  (PR_PRGEN &= (uint8_t)(PR_USB_bm))
++
++#define power_all_enable() \
++do { \
++    PR_PRGEN &= (uint8_t)~(PR_AES_bm|PR_EBI_bm|PR_RTC_bm|PR_EVSYS_bm|PR_DMA_bm|PR_USB_bm); \
++    PR_PRPA &= (uint8_t)~(PR_DAC_bm|PR_ADC_bm|PR_AC_bm); \
++    PR_PRPB &= (uint8_t)~(PR_DAC_bm|PR_ADC_bm|PR_AC_bm); \
++    PR_PRPC &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPD &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPE &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPF &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++} while(0)
++
++#define power_all_disable() \
++do { \
++    PR_PRGEN |= (uint8_t)(PR_AES_bm|PR_EBI_bm|PR_RTC_bm|PR_EVSYS_bm|PR_DMA_bm|PR_USB_bm); \
++    PR_PRPA |= (uint8_t)(PR_DAC_bm|PR_ADC_bm|PR_AC_bm); \
++    PR_PRPB |= (uint8_t)(PR_DAC_bm|PR_ADC_bm|PR_AC_bm); \
++    PR_PRPC |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPD |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPE |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPF |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++} while(0)
++
++#else
++
+ #define power_all_enable() \
+ do { \
+     PR_PRGEN &= (uint8_t)~(PR_AES_bm|PR_EBI_bm|PR_RTC_bm|PR_EVSYS_bm|PR_DMA_bm); \
+@@ -412,6 +441,8 @@ do { \
+     PR_PRPF |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
+ #endif
+ 
++#endif
++
+ #if defined(__AVR_ATxmega16A4__) \
+ || defined(__AVR_ATxmega16D4__) \
+ || defined(__AVR_ATxmega32A4__) \
+@@ -428,7 +459,8 @@ do { \
+ || defined(__AVR_ATxmega192A3__) \
+ || defined(__AVR_ATxmega192D3__) \
+ || defined(__AVR_ATxmega256A3__) \
+-|| defined(__AVR_ATxmega256A3B__)
++|| defined(__AVR_ATxmega256A3B__) \
++|| defined(__AVR_ATxmega256A3BU__)
+ 
+ 
+ #define power_rtc_enable()  (PR_PRGEN &= (uint8_t)~(PR_RTC_bm))
+diff -Naurp ./include/avr/sleep.h ./include/avr/sleep.h
+--- ./include/avr/sleep.h	2011-03-29 16:44:46.000000000 -0500
++++ ./include/avr/sleep.h	2011-03-29 16:48:11.000000000 -0500
+@@ -444,7 +444,8 @@
+ || defined(__AVR_ATxmega192D3__) \
+ || defined(__AVR_ATxmega256A3__) \
+ || defined(__AVR_ATxmega256D3__) \
+-|| defined(__AVR_ATxmega256A3B__)
++|| defined(__AVR_ATxmega256A3B__) \
++|| defined(__AVR_ATxmega256A3BU__)
+ 
+     #define SLEEP_MODE_IDLE         (0)
+     #define SLEEP_MODE_PWR_DOWN     (SLEEP_SMODE1_bm)
+diff -Naurp ./include/avr/wdt.h ./include/avr/wdt.h
+--- ./include/avr/wdt.h	2011-03-29 16:44:46.000000000 -0500
++++ ./include/avr/wdt.h	2011-03-29 16:48:11.000000000 -0500
+@@ -147,7 +147,8 @@
+ || defined(__AVR_ATxmega192D3__) \
+ || defined(__AVR_ATxmega256A3__) \
+ || defined(__AVR_ATxmega256D3__) \
+-|| defined(__AVR_ATxmega256A3B__)
++|| defined(__AVR_ATxmega256A3B__) \
++|| defined(__AVR_ATxmega256A3BU__)
+ 
+ /*
+     wdt_enable(WDT_PER_8KCLK_gc);

@@ -1,0 +1,31 @@
+REM ============================================================
+REM  STORAGE TEST — compile in PayloadStudio -> INJECT.BIN on SD root.
+REM  Verifies the device shows as a real, browsable, read/write USB stick
+REM  WHILE also acting as a keyboard (composite HID + Mass Storage).
+REM ============================================================
+
+ATTACKMODE HID STORAGE
+REM [device enumerates as keyboard + USB stick; the drive may take a few
+REM  seconds to appear in Explorer — that is normal for composite]
+
+DELAY 2500
+STRING Storage test running. A USB stick should now appear in Explorer.
+ENTER
+STRING You should be able to open, copy, rename, and DELETE files on it.
+ENTER
+
+REM Keep the device alive so the drive stays mounted for you to test.
+WHILE TRUE
+    DELAY 1000
+END_WHILE
+
+REM ============================================================
+REM  PASS CRITERIA
+REM   1. A removable "USB stick" appears (with your spoofed VID/PID/MAN if set).
+REM   2. Its real files are listed and OPEN correctly (real reads).
+REM   3. You can create / rename / copy-to / DELETE / move files, and the
+REM      change survives (real writes) — i.e. all normal Windows actions.
+REM   If files show but are empty/garbage, or writes vanish on replug, the SD
+REM      is NOT reachable after USB on this board — tell me and we dig into WHY
+REM      (chip-select / clock / bit-bang timing), not give up.
+REM ============================================================

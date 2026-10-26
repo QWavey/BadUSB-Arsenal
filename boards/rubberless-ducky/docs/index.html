@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rubberless-Ducky Flasher</title>
+<link rel="icon" type="image/svg+xml" href="./favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #ededea;
+    --panel:     #f5f4f1;
+    --fg:        #16161a;
+    --fg-2:      #3a3a41;
+    --muted:     #6b6b73;
+    --line:      #cfcec9;
+    --line-2:    #dedcd7;
+    --accent:    #b23f0d;
+    --accent-2:  #c2410c;
+    --accent-fg: #fff5e6;
+    --warn-fg:   #6a2c05;
+    --warn-bg:   #f3e0c9;
+    --warn-line: #d99555;
+    --ok-fg:     #14532d;
+    --ok-bg:     #d4ecc9;
+    --ok-line:   #4b8f6a;
+    --err-fg:    #7f1d1d;
+    --err-bg:    #f3ccc9;
+    --err-line:  #b0322a;
+    --code-bg:   #e3e1dc;
+    --code-fg:   #16161a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg:        #0d0d10;
+      --panel:     #16161a;
+      --fg:        #eeeeeb;
+      --fg-2:      #c9c9c3;
+      --muted:     #8a8a92;
+      --line:      #2a2a30;
+      --line-2:    #1e1e23;
+      --accent:    #f97316;
+      --accent-2:  #ea580c;
+      --accent-fg: #16110c;
+      --warn-fg:   #fbd693;
+      --warn-bg:   #33220b;
+      --warn-line: #b8752a;
+      --ok-fg:     #bbf7d0;
+      --ok-bg:     #0f2a1a;
+      --ok-line:   #4b8f6a;
+      --err-fg:    #fecaca;
+      --err-bg:    #2d1010;
+      --err-line:  #b0322a;
+      --code-bg:   #1c1c22;
+      --code-fg:   #eeeeeb;
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
+    font-size: 16px; line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  .shell {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    min-height: 100vh;
+  }
+
+  /* -------- Brand slab -------- */
+  aside.brand {
+    background: var(--accent);
+    color: var(--accent-fg);
+    padding: 36px 30px 28px;
+    position: sticky; top: 0;
+    height: 100vh;
+    display: flex; flex-direction: column;
+    gap: 22px;
+    overflow: hidden;
+  }
+  aside.brand::before {
+    content: "";
+    position: absolute; inset: 0;
+    background: repeating-linear-gradient(180deg, transparent 0 3px, rgba(0,0,0,0.035) 3px 4px);
+    pointer-events: none;
+  }
+  aside.brand > * { position: relative; z-index: 1; }
+  aside.brand .mark {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin: 0;
+  }
+  aside.brand h1.wordmark {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-weight: 700;
+    font-size: 40px;
+    line-height: 1;
+    letter-spacing: -0.02em;
+    margin: 8px 0 0;
+  }
+  aside.brand h1.wordmark span {
+    display: block;
+    font-weight: 400;
+    color: rgba(255, 245, 230, 0.7);
+  }
+  aside.brand .art {
+    margin: auto 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  aside.brand .art svg { width: 170px; height: auto; }
+  aside.brand .specs {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: rgba(255, 245, 230, 0.25);
+    border: 1px solid rgba(255, 245, 230, 0.25);
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+  }
+  aside.brand .specs > div {
+    background: var(--accent);
+    padding: 9px 11px;
+  }
+  aside.brand .specs > div b {
+    display: block; color: rgba(255, 245, 230, 0.7); font-weight: 500;
+    font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+  aside.brand .foot {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 11px;
+    color: rgba(255, 245, 230, 0.7);
+    display: flex; justify-content: space-between; gap: 12px;
+  }
+  aside.brand .foot a { color: rgba(255, 245, 230, 0.95); text-decoration: underline; text-underline-offset: 2px; }
+
+  /* -------- Main -------- */
+  main.content {
+    padding: 36px 40px 72px;
+    max-width: 640px;
+  }
+  p { margin: 8px 0 12px; color: var(--fg-2); }
+  a { color: var(--accent-2); text-decoration: underline; text-underline-offset: 3px; }
+  a:hover { text-decoration-thickness: 2px; }
+  a:focus-visible, button:focus-visible, .dl:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 2px;
+  }
+  code {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 13px;
+    background: var(--code-bg); color: var(--code-fg);
+    padding: 1px 5px; border-radius: 3px;
+  }
+
+  h2 {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-weight: 500;
+    font-size: 12px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 32px 0 12px;
+  }
+  h2:first-child { margin-top: 0; }
+
+  /* -------- Warning banner -------- */
+  .warn {
+    background: var(--warn-bg); color: var(--warn-fg);
+    border-left: 3px solid var(--warn-line);
+    border-radius: 0 4px 4px 0;
+    padding: 12px 14px;
+    font-size: 14px;
+    line-height: 1.5;
+    margin: 0 0 24px;
+  }
+  .warn b {
+    display: block;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-weight: 600; font-size: 11px;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+
+  /* -------- Downloads (KEPT) -------- */
+  .downloads {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 10px;
+  }
+  .dl {
+    display: block;
+    padding: 14px 15px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    color: var(--fg);
+    text-decoration: none;
+    transition: border-color 0.12s;
+  }
+  .dl:hover { border-color: var(--fg); text-decoration: none; }
+  .dl b {
+    display: block;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-weight: 600;
+    font-size: 13.5px;
+  }
+  .dl span {
+    display: block;
+    color: var(--muted);
+    font-size: 12.5px;
+    margin-top: 3px;
+    line-height: 1.4;
+  }
+
+  /* -------- Step wizard -------- */
+  .wizard {
+    display: grid;
+    gap: 10px;
+  }
+  .step {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 16px 18px;
+    display: grid;
+    grid-template-columns: 28px 1fr auto;
+    align-items: center;
+    gap: 14px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .step.done   { border-color: var(--ok-line); }
+  .step.error  { border-color: var(--err-line); background: var(--err-bg); }
+  .step.active { border-color: var(--accent); }
+  .step .status {
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 1.5px solid var(--line);
+    background: var(--bg);
+    display: grid; place-items: center;
+    color: transparent;
+  }
+  .step.active .status {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--accent-fg);
+  }
+  .step.done .status {
+    border-color: var(--ok-line);
+    background: var(--ok-line);
+    color: #fff;
+  }
+  .step.error .status {
+    border-color: var(--err-line);
+    background: var(--err-line);
+    color: #fff;
+  }
+  .step .status svg { width: 12px; height: 12px; display: block; }
+  .step .body .n {
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 2px;
+  }
+  .step .body h4 {
+    margin: 0;
+    font-size: 15px; font-weight: 600; color: var(--fg);
+  }
+  .step .body p {
+    margin: 3px 0 0;
+    font-size: 13px; line-height: 1.45; color: var(--fg-2);
+  }
+  .step .act { display: flex; gap: 8px; align-items: center; }
+
+  button, .btn {
+    font: 500 13px/1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: 0.03em;
+    background: var(--fg);
+    color: var(--bg);
+    border: 1px solid var(--fg);
+    padding: 9px 13px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: opacity 0.12s;
+  }
+  button.primary {
+    background: var(--accent);
+    color: var(--accent-fg);
+    border-color: var(--accent);
+  }
+  button.ghost {
+    background: transparent;
+    color: var(--fg);
+    border: 1px solid var(--line);
+  }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  button:not(:disabled):hover { opacity: 0.9; }
+  .fileinput {
+    display: inline-flex; align-items: center; gap: 4px;
+    font: 500 13px/1 "IBM Plex Mono", ui-monospace, monospace;
+    letter-spacing: 0.03em;
+    color: var(--fg); background: transparent;
+    border: 1px solid var(--line);
+    padding: 9px 13px; border-radius: 4px; cursor: pointer;
+  }
+  .fileinput input { display: none; }
+
+  .progress {
+    height: 4px; width: 100%;
+    background: var(--code-bg);
+    border-radius: 2px; overflow: hidden;
+    margin-top: 10px;
+  }
+  .progress > div {
+    height: 100%; width: 0;
+    background: var(--accent);
+    transition: width 0.15s linear;
+  }
+
+  #log {
+    background: var(--panel);
+    border: 1px solid var(--line-2);
+    padding: 10px 12px;
+    border-radius: 4px;
+    height: 130px;
+    overflow: auto;
+    font-family: "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--fg-2);
+    margin-top: 14px;
+  }
+  #log .ts { color: var(--muted); }
+  #log .err { color: var(--err-fg); }
+  #log .ok  { color: var(--ok-fg); }
+
+  .fallback {
+    margin: 24px 0 0;
+    padding: 12px 14px;
+    border: 1px dashed var(--line);
+    border-radius: 4px;
+    font-size: 13px; color: var(--muted);
+  }
+
+  footer.legal {
+    margin-top: 40px;
+    padding-top: 20px;
+    border-top: 1px solid var(--line-2);
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.55;
+  }
+  footer.legal p { margin: 6px 0; color: var(--muted); }
+
+  @media (max-width: 900px) {
+    .shell { grid-template-columns: 1fr; }
+    aside.brand {
+      position: static; height: auto;
+      padding: 28px 22px 24px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-areas: "id art" "specs specs" "foot foot";
+      gap: 16px 20px;
+    }
+    aside.brand .id     { grid-area: id; }
+    aside.brand .art    { grid-area: art; margin: 0; }
+    aside.brand .art svg { width: 100px; }
+    aside.brand .specs  { grid-area: specs; }
+    aside.brand .foot   { grid-area: foot; }
+    aside.brand h1.wordmark { font-size: 32px; }
+    main.content { padding: 28px 22px 60px; max-width: none; }
+    .step { grid-template-columns: 24px 1fr; grid-template-rows: auto auto; }
+    .step .act { grid-column: 1 / -1; justify-content: flex-start; margin-top: 6px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+<aside class="brand">
+  <div class="id">
+    <p class="mark">Firmware · Flasher · v0-alpha</p>
+    <h1 class="wordmark">RUBBERLESS<span>DUCKY</span></h1>
+  </div>
+
+  <div class="art" aria-hidden="true">
+    <svg viewBox="0 0 200 240" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="1.5">
+      <rect x="72" y="10" width="56" height="28"/>
+      <rect x="80" y="18" width="14" height="6"/>
+      <rect x="106" y="18" width="14" height="6"/>
+      <line x1="100" y1="10" x2="100" y2="38"/>
+      <rect x="80" y="38" width="40" height="10"/>
+      <rect x="52" y="48" width="96" height="150" rx="3"/>
+      <rect x="62" y="60" width="76" height="130" stroke-dasharray="2 3" opacity="0.6"/>
+      <rect x="76" y="80" width="48" height="30"/>
+      <text x="100" y="99" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="8" fill="currentColor" stroke="none">AT32UC3B1</text>
+      <line x1="76" y1="87" x2="72" y2="87"/><line x1="76" y1="93" x2="72" y2="93"/><line x1="76" y1="99" x2="72" y2="99"/><line x1="76" y1="105" x2="72" y2="105"/>
+      <line x1="124" y1="87" x2="128" y2="87"/><line x1="124" y1="93" x2="128" y2="93"/><line x1="124" y1="99" x2="128" y2="99"/><line x1="124" y1="105" x2="128" y2="105"/>
+      <rect x="42" y="130" width="14" height="24"/>
+      <line x1="46" y1="136" x2="46" y2="148"/><line x1="50" y1="136" x2="50" y2="148"/><line x1="54" y1="136" x2="54" y2="148"/>
+      <text x="30" y="145" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="7" fill="currentColor" stroke="none">SD</text>
+      <circle cx="154" cy="140" r="6"/>
+      <text x="172" y="143" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="7" fill="currentColor" stroke="none">BTN</text>
+      <circle cx="100" cy="170" r="4"/>
+      <text x="100" y="188" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="7" fill="currentColor" stroke="none">LED</text>
+    </svg>
+  </div>
+
+  <div class="specs">
+    <div><b>MCU</b>AT32UC3B1</div>
+    <div><b>Core</b>AVR32 UC3B1256</div>
+    <div><b>App PID</b>05AC / 021E</div>
+    <div><b>DFU PID</b>03EB / 2FF6</div>
+  </div>
+
+  <div class="foot">
+    <span>QWavey</span>
+    <a href="https://github.com/QWavey/Rubberless-Ducky" target="_blank" rel="noopener">github &#8599;</a>
+  </div>
+</aside>
+
+<main class="content">
+
+<div class="warn">
+  <b>Alpha</b>
+  Don&#39;t flash a working device. The firmware is unfinished, and stock firmware can&#39;t be restored from here. Only for reviving bricked hardware or running open firmware on purpose.
+</div>
+
+<h2>Downloads</h2>
+<div class="downloads">
+  <a class="dl" href="./firmware.hex" download><b>firmware.hex</b><span>Prebuilt image.</span></a>
+  <a class="dl" href="https://raw.githubusercontent.com/QWavey/Rubberless-Ducky/version-8/tools/dfu-programmer.exe" download><b>dfu-programmer.exe</b><span>Windows CLI flasher.</span></a>
+  <a class="dl" href="https://zadig.akeo.ie/downloads/zadig-2.9.exe" download><b>Zadig 2.9</b><span>Installs the WinUSB driver.</span></a>
+  <a class="dl" href="https://github.com/QWavey/Rubberless-Ducky/tree/version-8/tools" target="_blank" rel="noopener"><b>Atmel tools</b><span>Toolchain, sources, libusb.</span></a>
+</div>
+
+<h2>Flash</h2>
+<div class="wizard" id="wizard">
+  <div class="step" id="s1">
+    <div class="status" aria-hidden="true">
+      <svg viewBox="0 0 12 12"><path d="M2 6 L5 9 L10 3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="body">
+      <span class="n">Step 01</span>
+      <h4>Enter DFU mode</h4>
+      <p>Hold the <code>BOOT</code> button while plugging the device in.</p>
+    </div>
+    <div class="act"></div>
+  </div>
+
+  <div class="step" id="s2">
+    <div class="status" aria-hidden="true">
+      <svg viewBox="0 0 12 12"><path d="M2 6 L5 9 L10 3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="body">
+      <span class="n">Step 02</span>
+      <h4>Connect</h4>
+      <p>Pick the device in the browser prompt.</p>
+    </div>
+    <div class="act"><button id="btnConnect" class="primary">Connect</button></div>
+  </div>
+
+  <div class="step" id="s3">
+    <div class="status" aria-hidden="true">
+      <svg viewBox="0 0 12 12"><path d="M2 6 L5 9 L10 3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </div>
+    <div class="body">
+      <span class="n">Step 03</span>
+      <h4>Flash</h4>
+      <p>Erase, program, and launch. Uses the bundled firmware unless you pick a file.</p>
+    </div>
+    <div class="act">
+      <label class="fileinput">.hex<input id="fileHex" type="file" accept=".hex"></label>
+      <button id="btnFlash" class="primary" disabled>Flash</button>
+    </div>
+  </div>
+</div>
+
+<div class="progress"><div id="bar"></div></div>
+<div id="log"><span class="ts">[ready]</span> waiting for device.</div>
+
+<div class="fallback">
+  Web flasher not seeing the device? Use the CLI: <a href="https://github.com/QWavey/Rubberless-Ducky#flash-it" target="_blank" rel="noopener">manual dfu-programmer commands</a>.
+</div>
+
+<footer class="legal">
+  <p>Clean-room reimplementation. No Hak5 code, firmware, or artwork is distributed here. &quot;Hak5&quot;, &quot;USB Rubber Ducky&quot;, and &quot;DuckyScript&quot; are trademarks of their respective owners; used here only to describe compatibility. Not endorsed by or affiliated with Hak5 LLC.</p>
+  <p>If Hak5 requests deletion of this repository, we will comply on written notice. Open an issue or contact the maintainers. Full note in the <a href="https://github.com/QWavey/Rubberless-Ducky#legal" target="_blank" rel="noopener">README</a>.</p>
+</footer>
+
+</main>
+</div>
+
+<script>
+// ---- Minimal Atmel AVR32 DFU flasher over WebUSB ----
+const $ = id => document.getElementById(id);
+const pad2 = n => String(n).padStart(2, '0');
+function tsNow() {
+  const d = new Date();
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+function log(msg, cls) {
+  const el = $('log');
+  const line = document.createElement('div');
+  const t = document.createElement('span'); t.className = 'ts'; t.textContent = `[${tsNow()}] `;
+  const b = document.createElement('span'); if (cls) b.className = cls; b.textContent = msg;
+  line.appendChild(t); line.appendChild(b);
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+function bar(pct) { $('bar').style.width = Math.max(0, Math.min(100, pct)) + '%'; }
+function setStep(id, state) {
+  const el = document.getElementById(id);
+  el.classList.remove('active', 'done', 'error');
+  if (state) el.classList.add(state);
+}
+
+const VID = 0x03EB;
+const DFU_PIDS = [0x2FF6, 0x2FF7, 0x2FF8, 0x2FF1, 0x2FFA, 0x2FFB];
+const DFU_DNLOAD    = 0x01;
+const DFU_GETSTATUS = 0x03;
+const DFU_CLRSTATUS = 0x04;
+
+let device = null;
+let iface  = 0;
+let hexBytes = null;
+let hexBase  = null;
+
+function parseHex(text) {
+  const lines = text.split(/\r?\n/);
+  let ext = 0, seg = 0;
+  const map = new Map();
+  for (const raw of lines) {
+    if (!raw || raw[0] !== ':') continue;
+    const len = parseInt(raw.substr(1, 2), 16);
+    const addr = parseInt(raw.substr(3, 4), 16);
+    const type = parseInt(raw.substr(7, 2), 16);
+    const data = [];
+    for (let i = 0; i < len; i++) data.push(parseInt(raw.substr(9 + i*2, 2), 16));
+    if (type === 0x00) {
+      const base = (ext << 16) + seg;
+      for (let i = 0; i < len; i++) map.set(base + addr + i, data[i]);
+    } else if (type === 0x04) {
+      ext = (data[0] << 8) | data[1];
+    } else if (type === 0x02) {
+      seg = ((data[0] << 8) | data[1]) << 4;
+    } else if (type === 0x01) {
+      break;
+    }
+  }
+  if (map.size === 0) throw new Error("hex file contains no data");
+  const addrs = [...map.keys()].sort((a,b)=>a-b);
+  const base = addrs[0];
+  const end  = addrs[addrs.length - 1];
+  const bytes = new Uint8Array(end - base + 1).fill(0xFF);
+  for (const [a, b] of map) bytes[a - base] = b;
+  return { base, bytes };
+}
+
+async function control(setup, data) {
+  const req = { requestType: 'class', recipient: 'interface',
+                request: setup.bRequest, value: setup.wValue, index: iface };
+  if (data) return device.controlTransferOut(req, data);
+  return device.controlTransferIn(req, setup.wLength);
+}
+async function dfuGetStatus() {
+  const r = await control({ bRequest: DFU_GETSTATUS, wValue: 0, wLength: 6 });
+  const v = new Uint8Array(r.data.buffer);
+  return { status: v[0], pollTimeout: v[1] | (v[2] << 8) | (v[3] << 16), state: v[4] };
+}
+async function dfuClrStatus() { await control({ bRequest: DFU_CLRSTATUS, wValue: 0 }, new Uint8Array()); }
+async function waitIdle() {
+  for (let i = 0; i < 100; i++) {
+    const s = await dfuGetStatus();
+    if (s.status !== 0) throw new Error("DFU error status " + s.status);
+    if (s.state === 2 || s.state === 5) return s;
+    await new Promise(r => setTimeout(r, Math.max(5, s.pollTimeout)));
+  }
+  throw new Error("DFU did not reach idle state");
+}
+async function atmelWrite(bytes) {
+  await control({ bRequest: DFU_DNLOAD, wValue: 0 }, bytes);
+  await waitIdle();
+}
+async function chipErase() {
+  log("erase: whole chip");
+  await atmelWrite(new Uint8Array([0x04, 0x00, 0xFF]));
+  log("erase: done", "ok");
+}
+async function selectRegion(region) { await atmelWrite(new Uint8Array([0x06, 0x03, region])); }
+async function setBasePage(page16k) {
+  const hi = (page16k >> 8) & 0xFF, lo = page16k & 0xFF;
+  await atmelWrite(new Uint8Array([0x06, 0x03, hi, lo]));
+}
+async function programBlock(startOffset, payload) {
+  const end = startOffset + payload.length - 1;
+  const header = new Uint8Array([0x01, 0x00,
+    (startOffset >> 8) & 0xFF, startOffset & 0xFF,
+    (end >> 8) & 0xFF,          end & 0xFF ]);
+  const buf = new Uint8Array(header.length + payload.length);
+  buf.set(header, 0); buf.set(payload, header.length);
+  await atmelWrite(buf);
+}
+async function programAll(bytes, base) {
+  await selectRegion(0x00);
+  const PAGE = 512;
+  const total = bytes.length;
+  let done = 0;
+  const flashBase = base - 0x80000000;
+  let curPage16k = -1;
+  for (let off = 0; off < total; off += PAGE) {
+    const abs = flashBase + off;
+    const page16k = abs >> 16;
+    if (page16k !== curPage16k) { await setBasePage(page16k); curPage16k = page16k; }
+    const chunk = bytes.subarray(off, Math.min(off + PAGE, total));
+    const inPage = abs & 0xFFFF;
+    await programBlock(inPage, chunk);
+    done += chunk.length;
+    bar(100 * done / total);
+    if ((off / PAGE) % 8 === 0) log(`program: ${done}/${total} bytes`);
+  }
+  log(`program: ${total} bytes done`, "ok");
+}
+async function launchDevice() {
+  await control({ bRequest: DFU_DNLOAD, wValue: 0 }, new Uint8Array());
+  log("launch: reset sent", "ok");
+}
+
+async function loadBundled() {
+  const r = await fetch('./firmware.hex');
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const text = await r.text();
+  const parsed = parseHex(text);
+  hexBytes = parsed.bytes; hexBase = parsed.base;
+  log(`firmware: bundled, ${hexBytes.length} bytes at 0x${hexBase.toString(16)}`, "ok");
+}
+
+setStep('s2', 'active');
+
+$('btnConnect').onclick = async () => {
+  try {
+    setStep('s2', 'active');
+    device = await navigator.usb.requestDevice({
+      filters: DFU_PIDS.map(p => ({ vendorId: VID, productId: p }))
+    });
+    await device.open();
+    if (device.configuration === null) await device.selectConfiguration(1);
+    for (const c of device.configurations) {
+      for (const i of c.interfaces) {
+        for (const a of i.alternates) {
+          if (a.interfaceClass === 0xFE && a.interfaceSubclass === 0x01) { iface = i.interfaceNumber; }
+        }
+      }
+    }
+    await device.claimInterface(iface);
+    log(`connect: VID 0x${device.vendorId.toString(16)} PID 0x${device.productId.toString(16)}`, "ok");
+    try { const s = await dfuGetStatus(); if (s.status !== 0) await dfuClrStatus(); } catch(e){}
+    setStep('s1', 'done');
+    setStep('s2', 'done');
+    setStep('s3', 'active');
+    $('btnFlash').disabled = false;
+    $('btnConnect').disabled = true;
+    if (!hexBytes) { try { await loadBundled(); } catch(e){ log("bundled firmware: " + e.message, "err"); } }
+  } catch (e) {
+    log("connect: " + e.message, "err");
+    setStep('s2', 'error');
+  }
+};
+
+$('fileHex').onchange = async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  const text = await f.text();
+  try {
+    const parsed = parseHex(text);
+    hexBytes = parsed.bytes; hexBase = parsed.base;
+    log(`firmware: ${f.name}, ${hexBytes.length} bytes at 0x${hexBase.toString(16)}`, "ok");
+  } catch (e) { log("parse: " + e.message, "err"); }
+};
+
+$('btnFlash').onclick = async () => {
+  if (!device) { log("flash: connect first", "err"); return; }
+  if (!hexBytes) { try { await loadBundled(); } catch(e){ log("bundled firmware: " + e.message, "err"); return; } }
+  try {
+    $('btnFlash').disabled = true;
+    setStep('s3', 'active');
+    await chipErase();
+    await programAll(hexBytes, hexBase);
+    await launchDevice();
+    setStep('s3', 'done');
+    log("done. device will re-enumerate as HID keyboard.", "ok");
+  } catch (e) {
+    log("flash: " + e.message, "err");
+    setStep('s3', 'error');
+    $('btnFlash').disabled = false;
+  }
+};
+
+if (!('usb' in navigator)) {
+  log("no WebUSB in this browser. use Chrome/Edge, or the manual dfu-programmer path.", "err");
+  $('btnConnect').disabled = true;
+  setStep('s2', 'error');
+}
+</script>
+
+</body>
+</html>

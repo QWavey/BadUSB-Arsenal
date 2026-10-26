@@ -1,0 +1,23 @@
+REM ================================================================
+REM MODIFIER ISOLATION TEST - German layout, Shift + AltGr.
+REM Label lines use only unshifted chars (always readable). The
+REM CONTENT lines below each label are what must come out exactly.
+REM Opens Notepad itself. Compile on the German (de) layout.
+REM ================================================================
+DELAY 2000
+GUI r
+DELAY 600
+STRINGLN notepad
+DELAY 1600
+
+STRINGLN line1 shift symbols must read:  colon-quote-dollar-percent
+STRINGLN :"$%&/()=?!
+STRINGLN line2 capitals must read A to J:
+STRINGLN ABCDEFGHIJ
+STRINGLN line3 altgr must read at-brackets-braces-pipe-tilde:
+STRINGLN @[]{}|~
+STRINGLN line4 mixed shift and plain:
+STRINGLN (A)1! (b)5% (C)7/
+STRINGLN line5 lower then UPPER repeated:
+STRINGLN abcABCabcABC
+STRINGLN done

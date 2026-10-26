@@ -1,0 +1,255 @@
+diff -Naurp ./configure.ac ./configure.ac
+--- ./configure.ac	2011-03-29 16:42:05.000000000 -0500
++++ ./configure.ac	2011-03-29 16:42:45.000000000 -0500
+@@ -955,6 +955,9 @@ AM_CONDITIONAL(HAS_avrxmega6, test "x$HA
+ CHECK_AVR_DEVICE(atxmega128a3)
+ AM_CONDITIONAL(HAS_atxmega128a3, test "x$HAS_atxmega128a3" = "xyes")
+ 
++CHECK_AVR_DEVICE(atxmega128b1)
++AM_CONDITIONAL(HAS_atxmega128b1, test "x$HAS_atxmega128b1" = "xyes")
++
+ CHECK_AVR_DEVICE(atxmega128d3)
+ AM_CONDITIONAL(HAS_atxmega128d3, test "x$HAS_atxmega128d3" = "xyes")
+ 
+@@ -1297,6 +1300,7 @@ AC_CONFIG_FILES([
+ AC_CONFIG_FILES([
+ 	avr/lib/avrxmega6/Makefile
+ 	avr/lib/avrxmega6/atxmega128a3/Makefile
++	avr/lib/avrxmega6/atxmega128b1/Makefile
+ 	avr/lib/avrxmega6/atxmega128d3/Makefile
+ 	avr/lib/avrxmega6/atxmega192a3/Makefile
+ 	avr/lib/avrxmega6/atxmega192d3/Makefile
+diff -Naurp ./devtools/gen-avr-lib-tree.sh ./devtools/gen-avr-lib-tree.sh
+--- ./devtools/gen-avr-lib-tree.sh	2011-03-29 16:42:05.000000000 -0500
++++ ./devtools/gen-avr-lib-tree.sh	2011-03-29 16:42:45.000000000 -0500
+@@ -280,6 +280,7 @@ atxmega64a1u:crtx64a1u.o:${DEV_DEFS}:${C
+ 
+ AVRXMEGA6_DEV_INFO="\
+ atxmega128a3:crtx128a3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
++atxmega128b1:crtx128b1.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+ atxmega128d3:crtx128d3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+ atxmega192a3:crtx192a3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+ atxmega192d3:crtx192d3.o:${DEV_DEFS}:${CFLAGS_BIG_MEMORY}:${DEV_ASFLAGS};\
+diff -Naurp ./doc/api/main_page.dox ./doc/api/main_page.dox
+--- ./doc/api/main_page.dox	2011-02-16 14:46:06.000000000 -0600
++++ ./doc/api/main_page.dox	2011-03-29 16:42:45.000000000 -0500
+@@ -272,6 +272,7 @@ compile-time.
+ - atxmega128a1
+ - atxmega128a1u
+ - atxmega128a3
++- atxmega128b1
+ - atxmega128d3
+ - atxmega192a3
+ - atxmega192d3
+diff -Naurp ./doc/api/using-tools.dox ./doc/api/using-tools.dox
+--- ./doc/api/using-tools.dox	2011-02-16 14:46:06.000000000 -0600
++++ ./doc/api/using-tools.dox	2011-03-29 16:42:45.000000000 -0500
+@@ -392,6 +392,7 @@ AVR will be defined as well when using t
+   <tr><td>avrxmega5</td><td>atxmega64a1u</td><td>__AVR_ATxmega64A1U__</td></tr>
+ 
+   <tr><td>avrxmega6</td><td>atxmega128a3</td><td>__AVR_ATxmega128A3__</td></tr>
++  <tr><td>avrxmega6</td><td>atxmega128b1</td><td>__AVR_ATxmega128B1__</td></tr>
+   <tr><td>avrxmega6</td><td>atxmega128d3</td><td>__AVR_ATxmega128D3__</td></tr>
+   <tr><td>avrxmega6</td><td>atxmega192a3</td><td>__AVR_ATxmega192A3__</td></tr>
+   <tr><td>avrxmega6</td><td>atxmega192d3</td><td>__AVR_ATxmega192D3__</td></tr>
+diff -Naurp ./include/avr/eeprom.h ./include/avr/eeprom.h
+--- ./include/avr/eeprom.h	2011-03-29 16:42:05.000000000 -0500
++++ ./include/avr/eeprom.h	2011-03-29 16:42:45.000000000 -0500
+@@ -373,6 +373,8 @@
+ # define _EEPROM_SUFFIX   _x128a1u
+ #elif defined (__AVR_ATxmega128A3__)
+ # define _EEPROM_SUFFIX   _x128a3
++#elif defined (__AVR_ATxmega128B1__)
++# define _EEPROM_SUFFIX   _x128b1
+ #elif defined (__AVR_ATxmega128D3__)
+ # define _EEPROM_SUFFIX   _x128d3
+ #elif defined (__AVR_ATxmega192A3__)
+diff -Naurp ./include/avr/io.h ./include/avr/io.h
+--- ./include/avr/io.h	2011-03-29 16:42:05.000000000 -0500
++++ ./include/avr/io.h	2011-03-29 16:42:45.000000000 -0500
+@@ -398,6 +398,8 @@
+ #  include <avr/iox128a1u.h>
+ #elif defined (__AVR_ATxmega128A3__)
+ #  include <avr/iox128a3.h>
++#elif defined (__AVR_ATxmega128B1__)
++#  include <avr/iox128b1.h>
+ #elif defined (__AVR_ATxmega128D3__)
+ #  include <avr/iox128d3.h>
+ #elif defined (__AVR_ATxmega192A3__)
+diff -Naurp ./include/avr/iox128b1.h ./include/avr/iox128b1.h
+--- ./include/avr/iox128b1.h	1969-12-31 18:00:00.000000000 -0600
++++ ./include/avr/iox128b1.h	2011-03-29 16:43:23.000000000 -0500
+@@ -0,0 +1,2 @@
++#define _VECTORS_SIZE 0
++#define EIND 0
+diff -Naurp ./include/avr/Makefile.am ./include/avr/Makefile.am
+--- ./include/avr/Makefile.am	2011-03-29 16:42:05.000000000 -0500
++++ ./include/avr/Makefile.am	2011-03-29 16:42:45.000000000 -0500
+@@ -194,6 +194,7 @@ avr_HEADERS = \
+     iox128a1.h \
+     iox128a1u.h \
+     iox128a3.h \
++    iox128b1.h \
+     iox128d3.h \
+     iox16a4.h \
+     iox16d4.h \
+diff -Naurp ./include/avr/power.h ./include/avr/power.h
+--- ./include/avr/power.h	2011-03-29 16:42:05.000000000 -0500
++++ ./include/avr/power.h	2011-03-29 16:42:45.000000000 -0500
+@@ -86,13 +86,13 @@ find out which macros are applicable to 
+   <tr>
+     <td>power_lcd_enable()</td>
+     <td>Enable the LCD module.</td>
+-    <td>ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490</td>
++    <td>ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490, ATxmega128B1</td>
+   </tr>
+ 
+   <tr>
+     <td>power_lcd_disable().</td>
+     <td>Disable the LCD module.</td>
+-    <td>ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490</td>
++    <td>ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490, ATxmega128B1</td>
+   </tr>
+ 
+   <tr>
+@@ -302,13 +302,13 @@ find out which macros are applicable to 
+   <tr>
+     <td>power_usb_enable()</td>
+     <td>Enable the USB module.</td>
+-    <td>AT90USB646, AT90USB647, AT90USB1286, AT90USB1287</td>
++    <td>AT90USB646, AT90USB647, AT90USB1286, AT90USB1287, ATxmega128B1</td>
+   </tr>
+ 
+   <tr>
+     <td>power_usb_disable()</td>
+     <td>Disable the USB module.</td>
+-    <td>AT90USB646, AT90USB647, AT90USB1286, AT90USB1287</td>
++    <td>AT90USB646, AT90USB647, AT90USB1286, AT90USB1287, ATxmega128B1</td>
+   </tr>
+ 
+   <tr>
+@@ -338,13 +338,13 @@ find out which macros are applicable to 
+   <tr>
+     <td>power_all_enable()</td>
+     <td>Enable all modules.</td>
+-    <td>ATxmega6A4, ATxmega32A4, ATxmega64A1, ATxmega64A1U, ATxmega64A3, ATxmegaA1, ATxmegaA1U, ATxmega128A3, ATxmega192A3, ATxmega256A3, ATxmegaA3B, ATxmega16D4, ATxmega32D4, ATxmega64D3, ATxmega128D3, ATxmega192D3, ATmega640, ATmega1280, ATmega1281, ATmega128RFA1, ATmega2560, ATmega2561, AT90USB646, AT90USB647, AT90USB1286, AT90USB1287, AT90PWM1, AT90PWM2, AT90PWM2B, AT90PWM3, AT90PWM3B, AT90PWM216, AT90PWM316, ATmega165, ATmega165P, ATmega325, ATmega325A, ATmega3250, ATmega325A, ATmega645, ATmega6450, ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490, ATmega164P, ATmega324P, ATmega644, ATmega406, ATmega48, ATmega88, ATmega168, ATtiny24, ATtiny44, ATtiny84, ATtiny84A, ATtiny25, ATtiny45, ATtiny85, ATtiny261, ATtiny461, ATtiny861</td>
++    <td>ATxmega6A4, ATxmega32A4, ATxmega64A1, ATxmega64A1U, ATxmega64A3, ATxmegaA1, ATxmegaA1U, ATxmega128A3, ATxmega192A3, ATxmega256A3, ATxmegaA3B, ATxmega16D4, ATxmega32D4, ATxmega64D3, ATxmega128D3, ATxmega192D3, ATmega640, ATmega1280, ATmega1281, ATmega128RFA1, ATmega2560, ATmega2561, AT90USB646, AT90USB647, AT90USB1286, AT90USB1287, AT90PWM1, AT90PWM2, AT90PWM2B, AT90PWM3, AT90PWM3B, AT90PWM216, AT90PWM316, ATmega165, ATmega165P, ATmega325, ATmega325A, ATmega3250, ATmega325A, ATmega645, ATmega6450, ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490, ATmega164P, ATmega324P, ATmega644, ATmega406, ATmega48, ATmega88, ATmega168, ATtiny24, ATtiny44, ATtiny84, ATtiny84A, ATtiny25, ATtiny45, ATtiny85, ATtiny261, ATtiny461, ATtiny861, ATxmega128B1</td>
+   </tr>
+ 
+   <tr>
+     <td>power_all_disable()</td>
+     <td>Disable all modules.</td>
+-    <td>ATxmega6A4, ATxmega32A4, ATxmega64A1, ATxmega64A1U, ATxmega64A3, ATxmegaA1, ATxmegaA1U, ATxmega128A3, ATxmega192A3, ATxmega256A3, ATxmegaA3B, ATxmega16D4, ATxmega32D4, ATxmega64D3, ATxmega128D3,ATxmega192D3, ATmega640, ATmega1280, ATmega1281, ATmega128RFA1, ATmega2560, ATmega2561, AT90USB646, AT90USB647, AT90USB1286, AT90USB1287, AT90PWM1, AT90PWM2, AT90PWM2B, AT90PWM3, AT90PWM3B, AT90PWM216, AT90PWM316, ATmega165, ATmega165P, ATmega325, ATmega325A, ATmega3250, ATmega325A, ATmega645, ATmega6450, ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490, ATmega164P, ATmega324P, ATmega644, ATmega406, ATmega48, ATmega88, ATmega168, ATtiny24, ATtiny44, ATtiny84, ATtiny84A, ATtiny25, ATtiny45, ATtiny85, ATtiny261, ATtiny461, ATtiny861</td>
++    <td>ATxmega6A4, ATxmega32A4, ATxmega64A1, ATxmega64A1U, ATxmega64A3, ATxmegaA1, ATxmegaA1U, ATxmega128A3, ATxmega192A3, ATxmega256A3, ATxmegaA3B, ATxmega16D4, ATxmega32D4, ATxmega64D3, ATxmega128D3,ATxmega192D3, ATmega640, ATmega1280, ATmega1281, ATmega128RFA1, ATmega2560, ATmega2561, AT90USB646, AT90USB647, AT90USB1286, AT90USB1287, AT90PWM1, AT90PWM2, AT90PWM2B, AT90PWM3, AT90PWM3B, AT90PWM216, AT90PWM316, ATmega165, ATmega165P, ATmega325, ATmega325A, ATmega3250, ATmega3250A, ATmega645, ATmega6450, ATmega169, ATmega169P, ATmega329, ATmega329A, ATmega3290, ATmega3290A, ATmega649, ATmega6490, ATmega164P, ATmega324P, ATmega644, ATmega406, ATmega48, ATmega88, ATmega168, ATtiny24, ATtiny44, ATtiny84, ATtiny84A, ATtiny25, ATtiny45, ATtiny85, ATtiny261, ATtiny461, ATtiny861, ATxmega128B1</td>
+   </tr>
+ </table>
+ </center>
+@@ -534,6 +534,86 @@ do { \
+ 
+ #endif
+ 
++#if defined (__AVR_ATxmega128B1__)
++#define power_lcd_enable()  (PR_PRGEN &= (uint8_t)~(PR_LCD_bm))
++#define power_lcd_disable() (PR_PRGEN |= (uint8_t)PR_LCD_bm)
++
++#define power_usb_enable()  (PR_PRGEN &= (uint8_t)~(PR_USB_bm))
++#define power_usb_disable() (PR_PRGEN |= (uint8_t)PR_USB_bm)
++
++#define power_aes_enable()  (PR_PRGEN &= (uint8_t)~(PR_AES_bm))
++#define power_aes_disable() (PR_PRGEN |= (uint8_t)PR_AES_bm)
++
++#define power_rtc_enable()  (PR_PRGEN &= (uint8_t)~(PR_RTC_bm))
++#define power_rtc_disable() (PR_PRGEN |= (uint8_t)PR_RTC_bm)
++
++#define power_evsys_enable()    (PR_PRGEN &= (uint8_t)~(PR_EVSYS_bm))
++#define power_evsys_disable()   (PR_PRGEN |= (uint8_t)PR_EVSYS_bm)
++
++#define power_dma_enable()    (PR_PRGEN &= (uint8_t)~(PR_DMA_bm))
++#define power_dma_disable()   (PR_PRGEN |= (uint8_t)PR_DMA_bm)
++
++#define power_adca_enable()     (PR_PRPA &= (uint8_t)~(PR_ADC_bm))
++#define power_adca_disable()    (PR_PRPA |= (uint8_t)PR_ADC_bm)
++#define power_adcb_enable()     (PR_PRPB &= (uint8_t)~(PR_ADC_bm))
++#define power_adcb_disable()    (PR_PRPB |= (uint8_t)PR_ADC_bm)
++
++#define power_aca_enable()      (PR_PRPA &= (uint8_t)~(PR_AC_bm))
++#define power_aca_disable()     (PR_PRPA |= (uint8_t)PR_AC_bm)
++#define power_acb_enable()      (PR_PRPB &= (uint8_t)~(PR_AC_bm))
++#define power_acb_disable()     (PR_PRPB |= (uint8_t)PR_AC_bm)
++
++#define power_twic_enable()     (PR_PRPC &= (uint8_t)~(PR_TWI_bm))
++#define power_twic_disable()    (PR_PRPC |= (uint8_t)PR_TWI_bm)
++#define power_twid_enable()     (PR_PRPD &= (uint8_t)~(PR_TWI_bm))
++#define power_twid_disable()    (PR_PRPD |= (uint8_t)PR_TWI_bm)
++#define power_twie_enable()     (PR_PRPE &= (uint8_t)~(PR_TWI_bm))
++#define power_twie_disable()    (PR_PRPE |= (uint8_t)PR_TWI_bm)
++#define power_twif_enable()     (PR_PRPF &= (uint8_t)~(PR_TWI_bm))
++#define power_twif_disable()    (PR_PRPF |= (uint8_t)PR_TWI_bm)
++
++#define power_usartc1_enable()  (PR_PRPC &= (uint8_t)~(PR_USART1_bm))
++#define power_usartc1_disable() (PR_PRPC |= (uint8_t)PR_USART1_bm)
++#define power_usartd1_enable()  (PR_PRPD &= (uint8_t)~(PR_USART1_bm))
++#define power_usartd1_disable() (PR_PRPD |= (uint8_t)PR_USART1_bm)
++#define power_usarte1_enable()  (PR_PRPE &= (uint8_t)~(PR_USART1_bm))
++#define power_usarte1_disable() (PR_PRPE |= (uint8_t)PR_USART1_bm)
++#define power_usartf1_enable()  (PR_PRPF &= (uint8_t)~(PR_USART1_bm))
++#define power_usartf1_disable() (PR_PRPF |= (uint8_t)PR_USART1_bm)
++
++#define power_usartc0_enable()  (PR_PRPC &= (uint8_t)~(PR_USART0_bm))
++#define power_usartc0_disable() (PR_PRPC |= (uint8_t)PR_USART0_bm)
++#define power_usartd0_enable()  (PR_PRPD &= (uint8_t)~(PR_USART0_bm))
++#define power_usartd0_disable() (PR_PRPD |= (uint8_t)PR_USART0_bm)
++#define power_usarte0_enable()  (PR_PRPE &= (uint8_t)~(PR_USART0_bm))
++#define power_usarte0_disable() (PR_PRPE |= (uint8_t)PR_USART0_bm)
++#define power_usartf0_enable()  (PR_PRPF &= (uint8_t)~(PR_USART0_bm))
++#define power_usartf0_disable() (PR_PRPF |= (uint8_t)PR_USART0_bm)
++
++#define power_all_enable() \
++do { \
++    PR_PRGEN &= (uint8_t)~(PR_LCD_bm|PR_USB_bm|PR_AES_bm|PR_RTC_bm|PR_EVSYS_bm|PR_DMA_bm); \
++    PR_PRPA &= (uint8_t)~(PR_ADC_bm|PR_AC_bm); \
++    PR_PRPB &= (uint8_t)~(PR_ADC_bm|PR_AC_bm); \
++    PR_PRPC &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPD &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPE &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPF &= (uint8_t)~(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    } while(0)
++
++#define power_all_disable() \
++do { \
++    PR_PRGEN |= (uint8_t)(PR_LCD_bm|PR_USB_bm|PR_AES_bm|PR_RTC_bm|PR_EVSYS_bm|PR_DMA_bm); \
++    PR_PRPA |= (uint8_t)(PR_ADC_bm|PR_AC_bm); \
++    PR_PRPB |= (uint8_t)(PR_ADC_bm|PR_AC_bm); \
++    PR_PRPC |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPD |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPE |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    PR_PRPF |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++    } while(0)
++
++#endif
++
+ #elif defined(__AVR_ATmega640__) \
+ || defined(__AVR_ATmega1280__) \
+ || defined(__AVR_ATmega1281__) \
+diff -Naurp ./include/avr/sleep.h ./include/avr/sleep.h
+--- ./include/avr/sleep.h	2011-03-29 16:42:05.000000000 -0500
++++ ./include/avr/sleep.h	2011-03-29 16:42:45.000000000 -0500
+@@ -438,6 +438,7 @@
+ || defined(__AVR_ATxmega128A1__) \
+ || defined(__AVR_ATxmega128A1U__) \
+ || defined(__AVR_ATxmega128A3__) \
++|| defined(__AVR_ATxmega128B1__) \
+ || defined(__AVR_ATxmega128D3__) \
+ || defined(__AVR_ATxmega192A3__) \
+ || defined(__AVR_ATxmega192D3__) \
+diff -Naurp ./include/avr/wdt.h ./include/avr/wdt.h
+--- ./include/avr/wdt.h	2011-03-29 16:42:05.000000000 -0500
++++ ./include/avr/wdt.h	2011-03-29 16:42:45.000000000 -0500
+@@ -141,6 +141,7 @@
+ || defined(__AVR_ATxmega128A1__) \
+ || defined(__AVR_ATxmega128A1U__) \
+ || defined(__AVR_ATxmega128A3__) \
++|| defined(__AVR_ATxmega128B1__) \
+ || defined(__AVR_ATxmega128D3__) \
+ || defined(__AVR_ATxmega192A3__) \
+ || defined(__AVR_ATxmega192D3__) \

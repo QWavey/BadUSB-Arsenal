@@ -1,0 +1,20 @@
+--- include/avr/power.h	2011-03-29 14:02:59.000000000 -0500
++++ include/avr/power.h	2011-03-29 14:08:58.000000000 -0500
+@@ -410,6 +410,8 @@ do { \
+     PR_PRPD |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
+     PR_PRPE |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
+     PR_PRPF |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
++} while(0)
++
+ #endif
+ 
+ #if defined(__AVR_ATxmega16A4__) \
+@@ -612,8 +614,6 @@ do { \
+     PR_PRPF |= (uint8_t)(PR_TWI_bm|PR_USART1_bm|PR_USART0_bm|PR_SPI_bm|PR_HIRES_bm|PR_TC1_bm|PR_TC0_bm); \
+     } while(0)
+ 
+-#endif
+-
+ #elif defined(__AVR_ATmega640__) \
+ || defined(__AVR_ATmega1280__) \
+ || defined(__AVR_ATmega1281__) \

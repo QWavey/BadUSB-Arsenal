@@ -1,0 +1,107 @@
+diff -Naurp ./configure.ac ./configure.ac
+--- ./configure.ac	2011-02-16 14:53:25.000000000 -0600
++++ ./configure.ac	2011-03-29 16:23:02.000000000 -0500
+@@ -922,6 +922,9 @@ AM_CONDITIONAL(HAS_atxmega32a4, test "x$
+ CHECK_AVR_DEVICE(atxmega32d4)
+ AM_CONDITIONAL(HAS_atxmega32d4, test "x$HAS_atxmega32d4" = "xyes")
+ 
++CHECK_AVR_DEVICE(atxmega32x1)
++AM_CONDITIONAL(HAS_atxmega32x1, test "x$HAS_atxmega32x1" = "xyes")
++
+ 
+ # avrxmega4
+ CHECK_AVR_DEVICE(avrxmega4)
+@@ -1273,6 +1276,7 @@ AC_CONFIG_FILES([
+ 	avr/lib/avrxmega2/atxmega16d4/Makefile
+ 	avr/lib/avrxmega2/atxmega32a4/Makefile
+ 	avr/lib/avrxmega2/atxmega32d4/Makefile
++	avr/lib/avrxmega2/atxmega32x1/Makefile
+ ])
+ 
+ # avrxmega4
+diff -Naurp ./devtools/gen-avr-lib-tree.sh ./devtools/gen-avr-lib-tree.sh
+--- ./devtools/gen-avr-lib-tree.sh	2011-02-16 14:46:06.000000000 -0600
++++ ./devtools/gen-avr-lib-tree.sh	2011-03-29 16:23:02.000000000 -0500
+@@ -264,7 +264,8 @@ AVRXMEGA2_DEV_INFO="\
+ atxmega16a4:crtx16a4.o:${DEV_DEFS}:${CFLAGS_SPACE}:${DEV_ASFLAGS};\
+ atxmega16d4:crtx16d4.o:${DEV_DEFS}:${CFLAGS_SPACE}:${DEV_ASFLAGS};\
+ atxmega32a4:crtx32a4.o:${DEV_DEFS}:${CFLAGS_SPACE}:${DEV_ASFLAGS};\
+-atxmega32d4:crtx32d4.o:${DEV_DEFS}:${CFLAGS_SPACE}:${DEV_ASFLAGS}\
++atxmega32d4:crtx32d4.o:${DEV_DEFS}:${CFLAGS_SPACE}:${DEV_ASFLAGS};\
++atxmega32x1:crtx32x1.o:${DEV_DEFS}:${CFLAGS_SPACE}:${DEV_ASFLAGS}\
+ "
+ 
+ AVRXMEGA4_DEV_INFO="\
+diff -Naurp ./include/avr/eeprom.h ./include/avr/eeprom.h
+--- ./include/avr/eeprom.h	2011-02-16 14:46:06.000000000 -0600
++++ ./include/avr/eeprom.h	2011-03-29 16:23:02.000000000 -0500
+@@ -357,6 +357,8 @@
+ # define _EEPROM_SUFFIX   _x32a4
+ #elif defined (__AVR_ATxmega32D4__)
+ # define _EEPROM_SUFFIX   _x32d4
++#elif defined (__AVR_ATxmega32X1__)
++# define _EEPROM_SUFFIX   _x32x1
+ #elif defined (__AVR_ATxmega64A1__)
+ # define _EEPROM_SUFFIX   _x64a1
+ #elif defined (__AVR_ATxmega64A1U__)
+diff -Naurp ./include/avr/io.h ./include/avr/io.h
+--- ./include/avr/io.h	2011-02-16 14:46:06.000000000 -0600
++++ ./include/avr/io.h	2011-03-29 16:23:02.000000000 -0500
+@@ -382,6 +382,8 @@
+ #  include <avr/iox32a4.h>
+ #elif defined (__AVR_ATxmega32D4__)
+ #  include <avr/iox32d4.h>
++#elif defined (__AVR_ATxmega32X1__)
++#  include <avr/iox32x1.h>
+ #elif defined (__AVR_ATxmega64A1__)
+ #  include <avr/iox64a1.h>
+ #elif defined (__AVR_ATxmega64A1U__)
+diff -Naurp ./include/avr/iox32x1.h ./include/avr/iox32x1.h
+--- ./include/avr/iox32x1.h	1969-12-31 18:00:00.000000000 -0600
++++ ./include/avr/iox32x1.h	2011-03-29 16:28:36.000000000 -0500
+@@ -0,0 +1 @@
++#define _VECTORS_SIZE 0
+diff -Naurp ./include/avr/Makefile.am ./include/avr/Makefile.am
+--- ./include/avr/Makefile.am	2011-02-16 14:46:06.000000000 -0600
++++ ./include/avr/Makefile.am	2011-03-29 16:23:02.000000000 -0500
+@@ -204,6 +204,7 @@ avr_HEADERS = \
+     iox256d3.h \
+     iox32a4.h \
+     iox32d4.h \
++    iox32x1.h \
+     iox64a1.h \
+     iox64a1u.h \
+     iox64a3.h \
+diff -Naurp ./include/avr/power.h ./include/avr/power.h
+--- ./include/avr/power.h	2011-02-16 14:46:06.000000000 -0600
++++ ./include/avr/power.h	2011-03-29 16:23:02.000000000 -0500
+@@ -416,6 +416,7 @@ do { \
+ || defined(__AVR_ATxmega16D4__) \
+ || defined(__AVR_ATxmega32A4__) \
+ || defined(__AVR_ATxmega32D4__) \
++|| defined(__AVR_ATxmega32X1__) \
+ || defined(__AVR_ATxmega64A1__) \
+ || defined(__AVR_ATxmega64A1U__) \
+ || defined(__AVR_ATxmega64A3__) \
+diff -Naurp ./include/avr/sleep.h ./include/avr/sleep.h
+--- ./include/avr/sleep.h	2011-02-16 14:46:06.000000000 -0600
++++ ./include/avr/sleep.h	2011-03-29 16:23:02.000000000 -0500
+@@ -430,6 +430,7 @@
+ || defined(__AVR_ATxmega16D4__) \
+ || defined(__AVR_ATxmega32A4__) \
+ || defined(__AVR_ATxmega32D4__) \
++|| defined(__AVR_ATxmega32X1__) \
+ || defined(__AVR_ATxmega64A1__) \
+ || defined(__AVR_ATxmega64A1U__) \
+ || defined(__AVR_ATxmega64A3__) \
+diff -Naurp ./include/avr/wdt.h ./include/avr/wdt.h
+--- ./include/avr/wdt.h	2011-02-16 14:46:06.000000000 -0600
++++ ./include/avr/wdt.h	2011-03-29 16:23:02.000000000 -0500
+@@ -134,6 +134,7 @@
+ || defined(__AVR_ATxmega16D4__) \
+ || defined(__AVR_ATxmega32A4__) \
+ || defined(__AVR_ATxmega32D4__) \
++|| defined(__AVR_ATxmega32X1__) \
+ || defined(__AVR_ATxmega64A1U__) \
+ || defined(__AVR_ATxmega64A3__) \
+ || defined(__AVR_ATxmega64D3__) \

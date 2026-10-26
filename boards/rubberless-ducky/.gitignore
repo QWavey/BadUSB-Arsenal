@@ -1,0 +1,10 @@
+build/
+*.o
+*.elf
+*.hex
+*.map
+*.bin
+temp_backup/
+scripts_dump.txt
+scripts_dump2.txt
+hak5website.pdf

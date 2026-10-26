@@ -1,0 +1,26 @@
+REM ============================================================
+REM HW TEST 2 - NUMERIC LITERAL FIX (constant-pool byte-swap)
+REM A literal is routed through a VARIABLE, then used as a DELAY.
+REM   $d = 300  -> "marker B" must appear ~0.3 s after "marker A".
+REM If the 256x literal bug were still present, $d would be 76800
+REM and marker B would appear ~77 SECONDS later.
+REM Open Notepad and give focus before running.
+REM ============================================================
+ATTACKMODE HID
+DELAY 1500
+
+VAR $d = 300
+STRING marker A
+ENTER
+DELAY $d
+STRING marker B  (should be ~0.3s after A, NOT ~77s)
+ENTER
+
+REM Second check: plain literal math must be exact.
+VAR $x = 40
+VAR $y = 2
+VAR $z = ($x + $y)
+STRING 40 + 2 =
+STRING $z
+STRING   (must read 42)
+ENTER

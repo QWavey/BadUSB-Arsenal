@@ -1,0 +1,184 @@
+## How Firmware Interprets the Compiled Commands
+
+
+
+### 1. The inject.bin Structure
+
+The compiled file is just a **sequence of bytes**. For a simple "Hello World" payload:
+
+```
+Raw bytes (hex): 0b 02 08 00 0f 00 0f 00 12 00 28 00
+```
+
+Divided into 2-byte instructions (little-endian on most devices):
+
+| Address | Bytes | Value (uint16) | Decoded Meaning |
+|---------|-------|----------------|-----------------|
+| 0x00 | `0b 02` | `0x020B` | Keycode `0x0B` (H) + Modifier `0x02` (Shift) |
+| 0x02 | `08 00` | `0x0008` | Keycode `0x08` (e) + No modifier |
+| 0x04 | `0f 00` | `0x000F` | Keycode `0x0F` (l) + No modifier |
+| 0x06 | `0f 00` | `0x000F` | Keycode `0x0F` (l) + No modifier |
+| 0x08 | `12 00` | `0x0012` | Keycode `0x12` (o) + No modifier |
+| 0x0A | `28 00` | `0x0028` | Keycode `0x28` (Enter) + No modifier |
+
+### 2. Firmware Main Loop (Pseudocode)
+
+The firmware runs a simple interpreter:
+
+```c
+// Rubber Ducky firmware - simplified
+void main() {
+    uint16_t* payload = (uint16_t*)LOAD_ADDRESS;  // Points to inject.bin in flash
+    uint16_t instruction;
+    int index = 0;
+    
+    while (1) {
+        instruction = payload[index++];  // Read 2 bytes from payload
+        
+        uint8_t keycode = instruction & 0x00FF;      // Low byte
+        uint8_t modifier = (instruction >> 8) & 0x00FF;  // High byte
+        
+        if (keycode == 0x00 && modifier == 0x00) {
+            // NOP - do nothing
+            continue;
+        }
+        else if (keycode == 0xF8 && modifier == 0xF8) {
+            // Special: GOTO instruction
+            uint16_t target = payload[index++];  // Next word is address
+            index = target;  // Jump to that address
+        }
+        else if (keycode == 0x00 && modifier == 0xFF) {
+            // DELAY instruction
+            uint16_t delay_ms = payload[index++];  // Next word is delay value
+            delay(delay_ms);
+        }
+        else {
+            // Standard HID key injection
+            usb_hid_send(modifier, keycode);
+            delay(5);  // Small debounce delay
+            usb_hid_send(0x00, 0x00);  // Release all keys
+        }
+    }
+}
+```
+
+### 3. USB HID Report Format
+
+When the firmware calls `usb_hid_send(modifier, keycode)`, it constructs this 8-byte report:
+
+```
+Byte 0: Modifier keys (Shift, Ctrl, Alt, GUI)
+Byte 1: Reserved (always 0)
+Byte 2: Keycode 1
+Byte 3: Keycode 2  
+Byte 4: Keycode 3
+Byte 5: Keycode 4
+Byte 6: Keycode 5
+Byte 7: Keycode 6
+```
+
+**Modifier byte bits:**
+| Bit | Key |
+|-----|-----|
+| 0 | Left Ctrl |
+| 1 | Left Shift |
+| 2 | Left Alt |
+| 3 | Left GUI (Win/Cmd) |
+| 4 | Right Ctrl |
+| 5 | Right Shift |
+| 6 | Right Alt |
+| 7 | Right GUI |
+
+### 4. Example Execution Trace
+
+For `STRING Hello` → `0b 02 08 00 0f 00 0f 00 12 00`:
+
+```
+Step 1: instruction = 0x020B
+        modifier = 0x02 (Left Shift)
+        keycode = 0x0B (H)
+        → USB report: [0x02, 0x00, 0x0B, 0x00, 0x00, 0x00, 0x00, 0x00]
+        → PC receives: Shift + H key = "H"
+
+Step 2: instruction = 0x0008
+        modifier = 0x00
+        keycode = 0x08 (e)
+        → USB report: [0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00]
+        → PC receives: "e"
+
+Step 3: instruction = 0x000F
+        modifier = 0x00
+        keycode = 0x0F (l)
+        → USB report: [0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00]
+        → PC receives: "l"
+
+Step 4: instruction = 0x000F
+        modifier = 0x00
+        keycode = 0x0F (l)
+        → USB report: [0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0x00, 0x00]
+        → PC receives: "l"
+
+Step 5: instruction = 0x0012
+        modifier = 0x00
+        keycode = 0x12 (o)
+        → USB report: [0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00]
+        → PC receives: "o"
+
+Result: "Hello" appears on screen!
+```
+
+### 5. Special Commands in Firmware
+
+The firmware recognizes certain magic values:
+
+| Value (high,low) | Command | What it Does |
+|------------------|---------|---------------|
+| `0xF8,0xF8` | GOTO | Jump to address specified in next 2 bytes |
+| `0xF7,0xF7` | CALL | Call function at address |
+| `0xFD,0xFD` | RETURN | Return from function |
+| `0x00,0xFF` | DELAY | Wait X ms (X in next 2 bytes) |
+| `0xEE,0xEE` | IF | Conditional execution |
+| `0xE8,0xE8` | REGISTERS | Declare variable registers |
+| `0x01,0xE8` | ASSIGN | Assign value to variable |
+| `0xE9,0xE6` | INJECT_MOD | Send modifier combination |
+
+### 6. How the Firmware Handles Conditional Logic
+
+For an IF statement that compiled to:
+
+```
+Bytes: EE EE 04 00 01 E8 05 00 F8 F8 00 00
+```
+
+Firmware interpretation:
+
+```c
+case 0xEEEE:  // IF token
+    uint16_t condition_addr = payload[index++];
+    uint16_t result = evaluate_at_address(condition_addr);
+    if (!result) {
+        // Skip to ELSE or END_IF (next word is jump address)
+        index = payload[index];
+    }
+    break;
+```
+
+### Summary: The Execution Pipeline
+
+```
+inject.bin (bytes)
+    ↓
+Firmware reads 2-byte instructions
+    ↓
+Decodes: [keycode, modifier] or [special, command]
+    ↓
+For key injection: builds USB HID report
+    ↓
+Sends report via USB hardware
+    ↓
+Host OS receives and processes as keyboard input
+    ↓
+Characters appear on screen
+```
+
+**Key insight:** The Rubber Ducky firmware is essentially a **USB HID keyboard emulator** with a built-in bytecode interpreter. It doesn't need to know about languages, strings, or even DuckyScript - it just executes a instruction set that tells it (example): "send this keycode with these modifiers, then wait X milliseconds."

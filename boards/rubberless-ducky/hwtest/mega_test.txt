@@ -1,0 +1,129 @@
+REM ================================================================
+REM MEGA TEST - opens Notepad and types a SELF-CHECKING report.
+REM Every line says what to EXPECT; compare it to what was typed.
+REM Covers this session's fixes: operators, literals, IF/WHILE,
+REM FUNCTION, multi-key HELD modifier, INJECT_MOD, RANDOM, jitter, LEDs.
+REM
+REM Syntax rules honored: STRINGLN always has text (ENTER for blank
+REM lines); expressions only in REASSIGNMENT ($x = (...)), never in a
+REM VAR declaration; DELAY always >= 16; no BACKSPACE.
+REM
+REM Just plug the Ducky into a Windows machine - it opens Notepad itself.
+REM ================================================================
+DELAY 2000
+GUI r
+DELAY 600
+STRINGLN notepad
+DELAY 1600
+
+STRINGLN =============================================
+STRINGLN   DUCKY FIRMWARE MEGA TEST
+STRINGLN   Check each [n]: expect vs what was typed
+STRINGLN =============================================
+ENTER
+
+REM Step variable. This compiler rejects a raw number as an operand
+REM inside an expression, so increments use a variable: ($i + $one).
+VAR $one = 1
+
+REM ---- [1] STRING + named keys (TAB, ENTER) ----
+STRING [1] STRING/TAB/ENTER (expect A then tab then B):
+STRING A
+TAB
+STRINGLN B
+ENTER
+
+REM ---- [2] Operators: (2*3)+1 must print 7 stars ----
+VAR $x = 2
+VAR $y = 3
+VAR $n = 0
+$n = ($x * $y)
+$n = ($n + $one)
+VAR $i = 0
+STRING [2] MATH 2*3+1 (expect 7 stars):
+WHILE ($i < $n)
+    STRING *
+    $i = ($i + $one)
+END_WHILE
+ENTER
+
+REM ---- [3] Constant-pool literal: loop EXACTLY 5 from a literal ----
+REM (if the 256x literal bug were back this would print ~1280 hashes)
+VAR $five = 5
+VAR $j = 0
+STRING [3] LITERAL 5 (expect 5 hashes):
+WHILE ($j < $five)
+    STRING #
+    $j = ($j + $one)
+END_WHILE
+ENTER
+
+REM ---- [4] Comparisons via IF/ELSE ----
+VAR $a = 10
+VAR $b = 3
+STRING [4a] 10>3 (expect PASS):
+IF ($a > $b) THEN
+STRINGLN PASS
+ELSE
+STRINGLN FAIL-BUG
+END_IF
+STRING [4b] 10==3 (expect NEQ-OK):
+IF ($a == $b) THEN
+STRINGLN WRONG-BUG
+ELSE
+STRINGLN NEQ-OK
+END_IF
+VAR $d = 0
+$d = ($a - $b)
+VAR $k = 0
+STRING [4c] 10-3 subtract (expect 7 dots):
+WHILE ($k < $d)
+    STRING .
+    $k = ($k + $one)
+END_WHILE
+ENTER
+
+REM ---- [5] FUNCTION (body must run exactly ONCE, only when called) ----
+FUNCTION SAYHI()
+    STRINGLN [5] FUNCTION ran (expect this ONE line)
+END_FUNCTION
+SAYHI()
+ENTER
+
+REM ---- [6] Multi-key / HELD modifier: SHIFT held across abc -> ABC ----
+REM (the fixed HOLD keeps the modifier down across typed keys)
+STRING [6] HELD SHIFT over abc then def (expect ABCdef):
+INJECT_MOD
+HOLD SHIFT
+STRING abc
+RELEASE SHIFT
+STRINGLN def
+ENTER
+
+REM ---- [7] RANDOM generators (5 chars; on GERMAN host y/z may swap) ----
+STRING [7] RANDOM (expect 5 random chars):
+RANDOM_LETTER
+RANDOM_NUMBER
+RANDOM_UPPERCASE_LETTER
+RANDOM_SPECIAL
+RANDOM_CHAR
+ENTER
+ENTER
+
+REM ---- [8] Jitter (jitter_max=20 from a literal; line must still be correct) ----
+$_JITTER_ENABLED = TRUE
+$_JITTER_MAX = 20
+STRINGLN [8] JITTER on - this line types with irregular gaps but correct
+$_JITTER_ENABLED = FALSE
+ENTER
+
+REM ---- [9] LEDs (watch the DEVICE, not the screen) ----
+STRINGLN [9] Watch the DEVICE LED now: RED ~1s then GREEN
+LED_R
+DELAY 1000
+LED_G
+ENTER
+
+STRINGLN =============================================
+STRINGLN   TEST COMPLETE - all [n] above should match
+STRINGLN =============================================

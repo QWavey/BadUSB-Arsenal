@@ -1,0 +1,19 @@
+REM ============================================================
+REM HW TEST 1 - JITTER
+REM Expect: line 1 types at a slightly IRREGULAR but sane cadence
+REM         (each key held +0..15 ms).  Line 2 types at the steady
+REM         fast rate.  If jitter were reading the raw literal
+REM         (256x bug) each key would hang ~seconds - it must NOT.
+REM Open Notepad (or any text field) and give focus before running.
+REM ============================================================
+ATTACKMODE HID
+DELAY 1500
+
+$_JITTER_ENABLED = TRUE
+$_JITTER_MAX = 15
+STRING JITTER ON  - the quick brown fox jumps over the lazy dog 1234567890
+ENTER
+
+$_JITTER_ENABLED = FALSE
+STRING JITTER OFF - the quick brown fox jumps over the lazy dog 1234567890
+ENTER

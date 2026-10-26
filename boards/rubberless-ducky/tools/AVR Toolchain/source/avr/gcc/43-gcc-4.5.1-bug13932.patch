@@ -1,0 +1,12 @@
+diff -Naurp ./gcc/config/avr/avr-devices.c ./gcc/config/avr/avr-devices.c
+--- ./gcc/config/avr/avr-devices.c	2011-03-29 17:56:18.000000000 -0500
++++ ./gcc/config/avr/avr-devices.c	2011-03-29 17:59:14.000000000 -0500
+@@ -195,7 +195,7 @@ const struct mcu_type_s avr_mcu_types[] 
+   { "m3001b",               ARCH_AVR51, "__AVR_M3001B__",           0, 0x1000, "m3000f" },
+     /* 3-Byte PC.  */
+   { "avr6",                 ARCH_AVR6, NULL,                        0, 0x0200, "m2561" },
+-  { "atmega2560",           ARCH_AVR6, "__AVR_ATmega2560__",        0, 0x0200, "m2561" },
++  { "atmega2560",           ARCH_AVR6, "__AVR_ATmega2560__",        0, 0x0200, "m2560" },
+   { "atmega2561",           ARCH_AVR6, "__AVR_ATmega2561__",        0, 0x0200, "m2561" },
+     /* Enhanced, == 256K.  */
+     /* Xmega, <= 8K FLASH.  */

@@ -1,0 +1,19 @@
+
+
+ATTACKMODE HID STORAGE
+REM Initialize the infinite loop
+DELAY 500
+WHILE TRUE
+    STRING This is a test messaage. Make sure this message types out correctly and if not, fix the code! We will now type random chars. !"="§=$§%($)(%"§)!
+    ENTER
+    
+    REM Halt and wait for the physical button press
+    WAIT_FOR_BUTTON_PRESS
+    
+    STRING The button was pressed!
+    ENTER
+    REM Optional: Add a small delay so it doesn't immediately loop back too aggressively
+    DELAY 1000
+END_WHILE
+
+

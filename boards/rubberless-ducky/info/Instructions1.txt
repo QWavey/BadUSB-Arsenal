@@ -1,0 +1,149 @@
+This is a est messaage. Make sure this message types out correctly and if not, fix the code! We will now type random Chars. !"="§=$§%($)(%"§)! 
+
+This is a test messaage. Make sure this essage types out correctly and if not, fix the code! We will now type random Chars. !"="§=$§%($)(%"§)! 
+
+This is a test messaage. Make sure this mesge types out correctly and if not, fix he code! We will now type random Chars. !"="§=$§%($)(%"§)!
+
+ This is a test messaage. Make sure this message types out correctly and if not, fix the code! We will now type random Chars. !"="§=$§%($)(%"§)!
+
+ This is a test messaage. Make sure this message types out correctly and if not, fix he ode! We will now type random Chars. !"="§=$§%($)(%"§)!
+
+ The button was pressed!
+ The button was pressed!
+
+ As you can see the start STRING stuff has some issues while it wrote it.
+
+ can you fix that and see where the issue lays? While we pressed the button and after it wrote the button was pressed this happened: this Website opened: https://m365.cloud.microsoft/?from=NG&origindomain=microsoft365
+
+
+maybe a  Strg + Shift + Alt + Win bug????
+
+
+ 2ndly, we have another bug. the usb rubberducky Exits the loop (WHILE LOOP) and doesnt continue. 
+
+3rd bug: We have a button ignore delay type stuff, i press it and it ignores the button press for like 3-4 seconds. could be more or less because i dont know the specific delay. 
+
+THE CODE WAS THIS:
+
+
+ATTACKMODE HID STORAGE
+REM Initialize the infinite loop
+DELAY 500
+WHILE TRUE
+    STRING This is a test messaage. Make sure this message types out correctly and if not, fix the code! We will now type random chars. !"="§=$§%($)(%"§)!
+    ENTER
+    
+    REM Halt and wait for the physical button press
+    WAIT_FOR_BUTTON_PRESS
+    
+    STRING The button was pressed!
+    ENTER
+    REM Optional: Add a small delay so it doesn't immediately loop back too aggressively
+    DELAY 1000
+END_WHILE
+
+
+HOW PAYLOADSTUDIO WORKS NORMALLY:
+
+The compiler translates human-readable DuckyScript commands (like ENTER, STRING Hello, CTRL ALT t) into binary USB HID keycodes that the USB Rubber Ducky (or other Hak5 device) can understand and inject.
+
+Lookup Table (IDE_CONFIG['ducky_lang']): The core of this translation is a large JavaScript object (defaultUSKbdLayout in the code) that maps a string (e.g., 'a', 'ENTER', 'CTRL') to a keycode in the format "modifier, reserved, keycode".
+
+Example: 'a': '00,00,04'
+
+Example: 'ENTER': '00,00,28'
+
+Example: 'CTRL': '01,00,00'
+
+The lookupAndAppend Function: This is the primary function called by commands like STRING and single modifiers. It looks up the string in the language table.
+
+getBytesForKey(k, fullwidth): This helper function is called by lookupAndAppend. It looks up k in the IDE_CONFIG['ducky_lang'] map, parses the string (e.g., "00,00,04"), and returns a byte array.
+
+For a standard key like 'a', it returns ['04'] (the keycode).
+
+For a key with a modifier (if the language table entry has a non-zero modifier), it returns [keycode, modifier].
+
+For a modifier key alone (like 'CTRL'), it returns ['01'].
+
+appendHexStringArray(hexStringArray): The final byte(s) from getBytesForKey are passed to this function, which pushes them into the global output buffer array oBB. This buffer is eventually joined and saved as inject.bin.
+
+Delay Insertion: After processing a line (and its resulting keycodes), the doDelayCheck() function is called. If DEFAULT_DELAY or DEFAULTDELAY was set and no explicit DELAY was on the current line, it builds and appends the delay bytes (00, XX).
+
+Keycodes for Common Commands (from defaultUSKbdLayout)
+These are the raw keycode bytes (the third byte in the language table entry) that get injected.
+
+DuckyScript Command	Raw Keycode Byte	Injected as [keycode, 00]
+ENTER	28	['28', '00']
+a	04	['04', '00']
+A	04 + 02 (Shift)	['04', '02']
+SPACE / 	2c	['2c', '00']
+CTRL	01 (Modifier)	['01'] (alone)
+SHIFT	02 (Modifier)	['02'] (alone)
+ALT	04 (Modifier)	['04'] (alone)
+GUI / WINDOWS	08 (Modifier)	['08'] (alone)
+F1	3a	['3a', '00']
+F2	3b	['3b', '00']
+...	...	...
+F12	45	['45', '00']
+UPARROW / UP	52	['52', '00']
+DOWNARROW / DOWN	51	['51', '00']
+LEFTARROW / LEFT	50	['50', '00']
+RIGHTARROW / RIGHT	4f	['4f', '00']
+TAB	2b	['2b', '00']
+BACKSPACE	2a	['2a', '00']
+DELETE / DEL	4c	['4c', '00']
+HOME	4a	['4a', '00']
+END	4d	['4d', '00']
+PAGEUP	4b	['4b', '00']
+PAGEDOWN	4e	['4e', '00']
+CAPSLOCK	39	['39', '00']
+NUMLOCK	53	['53', '00']
+SCROLLLOCK	47	['47', '00']
+PAUSE / BREAK	48	['48', '00']
+PRINTSCREEN	46	['46', '00']
+INSERT	49	['49', '00']
+MENU / APP	65	['65', '00']
+ESC / ESCAPE	29	['29', '00']
+How a Modifier+Key Combo Works (e.g., CTRL ALT t)
+The compiler is smart enough to handle combinations like CTRL ALT t by OR-ing the modifier bits together.
+
+Lookup individual parts:
+
+CTRL -> 01 (Modifier bit)
+
+ALT -> 04 (Modifier bit)
+
+t -> 17 (Keycode), 00 (no modifier on its own)
+
+Combine Modifiers: The modifier bits are OR-ed together: 01 | 04 = 05. (Byte 05 means CTRL + ALT).
+
+Final Injection: The injected payload for CTRL ALT t would be the combined modifier byte 05 and the keycode 17.
+
+Result: ['17', '05']
+
+(Note: For commands like CTRL-ALT in the language table, it's already defined, so lookupAndAppend would handle it in one go.)
+
+How a STRING Command is Compiled (e.g., STRING Hello)
+The handleString function iterates through each character of the string.
+
+'H' -> Looks up 'H' in the table: '02,00,04'. Injects ['04', '02'] (keycode '04' + shift modifier '02').
+
+'e' -> Looks up 'e': '00,00,08'. Injects ['08', '00'].
+
+'l' -> Injects ['0f', '00'].
+
+'l' -> Injects ['0f', '00'].
+
+'o' -> Injects ['12', '00'].
+
+The final output for STRING Hello would be a sequence of these byte pairs: 04 02 08 00 0f 00 0f 00 12 00.
+
+
+
+
+
+THE DIR IS THIS: C:\Users\flori\Downloads\newest\BACKUP
+
+ANALYZE THE DIR YOU HAVE ACCES THROUGH THE FILESYSTEM CONNECTOR!
+
+MAKE SURE YOU MAKE EDITS AND DONT REWRITE FILES FROM SCRATCH!

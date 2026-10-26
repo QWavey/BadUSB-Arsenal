@@ -1,0 +1,51 @@
+REM ============================================================
+REM  ULTIMATE TEST PAYLOAD
+REM  Compile in PayloadStudio (German layout) -> INJECT.BIN on SD root.
+REM  Exercises every fix from this session. Expected results in [ ].
+REM ============================================================
+
+ATTACKMODE HID
+REM [LED: green blinking = processing, from here on]
+DELAY 3000
+REM [startup warm-up window; first pass must still be clean]
+
+REM ---- Test A: one-time GUI (Windows-key) combo ----
+REM [GUI r must OPEN the Run dialog - proves GUI combos are not stripped]
+GUI r
+DELAY 900
+STRING GUI r combo works - closing this dialog now
+DELAY 900
+ESCAPE
+DELAY 600
+
+WHILE TRUE
+    REM ---- Test B: all character classes on one line ----
+    REM [caps, lowercase, digits, and the SHIFTED German symbol row.
+    REM  Every capital and every symbol must be correct - no dropped
+    REM  chars, no lost Shift (symbols must NOT degrade to bare digits)]
+    STRING The Quick Brown Fox JUMPS 1234567890 !"§$%&/()=? ABCabc
+    ENTER
+    STRING Umlauts and sharp-s: Aeiou AEIOU test complete.
+    ENTER
+
+    REM ---- Test C: button + idle LED ----
+    REM [LED must go SOLID green here = Idle, until you press the button]
+    STRING Now waiting for the button (LED should be SOLID green)...
+    ENTER
+    WAIT_FOR_BUTTON_PRESS
+    REM [one press = one fire; it must NOT repeat while held]
+    STRING Button press received - looping again.
+    ENTER
+
+    DELAY 1500
+END_WHILE
+
+REM ============================================================
+REM  PASS CRITERIA
+REM   1. First pass types cleanly (warm-up ramp).
+REM   2. Capitals + shifted symbols correct (NBUSYBK send fix).
+REM   3. GUI r opened the Run dialog (GUI-combo restore).
+REM   4. LED: blinking while typing, SOLID green while waiting,
+REM      RED if you pull the SD card.
+REM   5. Button fires once per press; WHILE loops forever.
+REM ============================================================
