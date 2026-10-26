@@ -1,0 +1,30 @@
+name: Build Webbee (GhostLink)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the Luckfox cross toolchain
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/LuckfoxTECH/luckfox-pico.git "$RUNNER_TEMP/luckfox-pico"
+          git -C "$RUNNER_TEMP/luckfox-pico" sparse-checkout set tools/linux/toolchain
+          echo "$RUNNER_TEMP/luckfox-pico/tools/linux/toolchain/arm-rockchip830-linux-uclibcgnueabihf/bin" >> "$GITHUB_PATH"
+
+      - name: Build GhostLink and the SD overlay
+        working-directory: boards/luckfox-webbee
+        run: |
+          ./scripts/build.sh
+          make pack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webbee-build
+          path: |
+            boards/luckfox-webbee/out/ghostlink
+            boards/luckfox-webbee/dist/ghostlink-sd.zip
+          if-no-files-found: error
