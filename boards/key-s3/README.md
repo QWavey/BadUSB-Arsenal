@@ -4,11 +4,24 @@ BadUSB firmware for the **ESP32-S3-Dongle / ESP32-S3-Key**: a USB-A stick board 
 
 ![ESP32-S3-Dongle hardware: USB-A key form factor, SD-card slot on the back, GPIO0 push-button at top centre.](docs/hardware.jpg)
 
+## SD card pins
+
+The `sd` header in `docs/sd-card-pins/` defines the SD card SPI pins (full notes: [docs/sd-card-pins](docs/sd-card-pins/README.md)):
+
+| Signal | Macro         | GPIO |
+|--------|---------------|------|
+| CS     | `SD_CS_PIN`   | 34   |
+| MOSI   | `SD_MOSI_PIN` | 35   |
+| MISO   | `SD_MISO_PIN` | 37   |
+| SCK    | `SD_SCK_PIN`  | 36   |
+
+These pins are for the ESP32-S3 only. Check the module datasheet first, because ESP32-S3 modules with octal PSRAM use GPIO33-37 internally.
+
 ## Flash it in your browser
 
 No toolchain or command line needed. The web flasher writes the latest release image to the chip over WebSerial. Everything happens locally, and nothing is uploaded.
 
-### → https://qwavey.github.io/ESP-S3-Key-BadUSB/
+### → https://qwavey.github.io/flashers/ (open the ESP32-S3 Key tab)
 
 Use Chrome or Edge. The page also takes a raw `.bin` or an `.espkg` bundle, and it can flash several devices in one session. It is part of the [QWavey flashers hub](https://qwavey.github.io/flashers/).
 
