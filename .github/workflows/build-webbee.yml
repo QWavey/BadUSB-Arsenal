@@ -18,7 +18,7 @@ jobs:
       - name: Build GhostLink and the SD overlay
         working-directory: boards/luckfox-webbee
         run: |
-          ./scripts/build.sh
+          bash scripts/build.sh
           make pack
 
       - uses: actions/upload-artifact@v4
