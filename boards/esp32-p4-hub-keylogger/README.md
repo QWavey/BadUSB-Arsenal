@@ -11,7 +11,7 @@ composite). Every keystroke you make on the wired keyboard shows up in
 Notepad / your terminal / anywhere the PC treats keyboard input as text.
 
 **Keyboard layouts**: the decoder ships with US ANSI, German QWERTZ, and UK
-layouts (`firmware/main/kb_layouts.{h,c}`). Default is DE. Change
+layouts (`p4/main/kb_layouts.{h,c}`). Default is DE. Change
 `s_layout = KL_DE` in `kb_layouts.c` for another. The HID Usage tables are
 what the keyboard sends; the layout tells us how to render each Usage as a
 glyph (y↔z, ä/ö/ü/ß, £, etc.).
@@ -37,7 +37,7 @@ http://192.168.4.1. Keystrokes travel from the P4 to the C6 over the SDIO bus
 that's already wired on the M-EXT (GPIO 14-19 + reset on GPIO54, no jumper
 needed), so the UI shows a live stream, records to SPIFFS, rotating at
 800 KB per file, and offers download / delete / start / stop / auto-download
-controls. See `c6-firmware/` for the source.
+controls. See `c6/` for the source.
 
 ## Web flasher (not yet published)
 
@@ -56,9 +56,9 @@ Once it is, the flow for a new user should be:
 Two artifacts are produced by the CI / local build and need to be uploaded to
 the flasher page:
 
-- `firmware/build/hid_passthrough.bin`: flashed to the P4 at 0x10000 (plus
+- `p4/build/hid_passthrough.bin`: flashed to the P4 at 0x10000 (plus
   the bootloader at 0x2000 and partition table at 0x8000)
-- `c6-firmware/build/p4_keylogger_c6_ui.bin`: flashed to the C6 at 0x10000
+- `c6/build/p4_keylogger_c6_ui.bin`: flashed to the C6 at 0x10000
   (plus bootloader at 0x0 and partition table at 0x8000, with a custom
   `partitions.csv` that includes a 2 MB SPIFFS `storage` region)
 
@@ -182,7 +182,7 @@ ESP-IDF v5.5.5 the same files live under `components/hal/`. Manually port:
 esp32-p4-hub-keylogger/
 ├── README.md                     ← this file
 ├── fs-force.patch                ← FSLSSupp HAL patch (upstream not merged)
-├── firmware/                     ← ESP32-P4 firmware (HID passthrough)
+├── p4/                          ← ESP32-P4 firmware (HID passthrough)
 │   ├── CMakeLists.txt
 │   ├── sdkconfig.defaults
 │   └── main/
@@ -191,7 +191,7 @@ esp32-p4-hub-keylogger/
 │       ├── hid_host_task.c       ← USB Host + HID host
 │       ├── usb_probe.c           ← diagnostic firmware (not built by default)
 │       └── device_only_test.c    ← test firmware (not built by default)
-├── c6-firmware/                  ← ESP32-C6 firmware (Wi-Fi + web UI)
+├── c6/                          ← ESP32-C6 firmware (Wi-Fi + web UI)
 │   ├── CMakeLists.txt
 │   ├── sdkconfig.defaults
 │   └── main/
@@ -214,7 +214,7 @@ not there.
 2. **Plug U1 into your PC**. Windows shows a new COM port (call it COMyy).
 3. Build and flash:
    ```bash
-   cd c6-firmware
+   cd c6
    idf.py set-target esp32c6
    idf.py -p COMyy build flash
    ```

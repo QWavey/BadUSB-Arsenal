@@ -12,7 +12,7 @@
 
 #include <stdint.h>
 
-// IDs mirror c6-firmware/main/main.c LED_MODE_* -- must stay in sync.
+// IDs mirror c6/main/main.c LED_MODE_* -- must stay in sync.
 typedef enum {
     LED_MODE_OFF        = 0,   // dark
     LED_MODE_GREEN_ONLY = 1,   // steady green, no flash

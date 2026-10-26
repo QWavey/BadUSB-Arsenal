@@ -65,7 +65,7 @@ static const char *TAG = "c6ui";
 #define NVS_K_LEDMODE    "ledm"
 #define NVS_K_APPASS     "appass"
 
-// LED modes must match firmware/main/led.h
+// LED modes must match p4/main/led.h
 #define LED_MODE_OFF       0
 #define LED_MODE_GREEN     1
 #define LED_MODE_KEYFLASH  2

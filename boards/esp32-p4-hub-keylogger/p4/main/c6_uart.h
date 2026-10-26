@@ -1,6 +1,6 @@
 #pragma once
 // Line-based UART framing sent from the P4 to the C6 for the web UI.
-// See c6-firmware/main/main.c uart_task() for the parser.
+// See c6/main/main.c uart_task() for the parser.
 //
 // Frames (each terminated by '\n'):
 //   KEY <text>            printable characters (may include spaces, tabs)
