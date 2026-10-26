@@ -1,0 +1,40 @@
+# v1.1.0+: fires on every tag push (vX.Y.Z). Creates a GitHub Release
+# marked as `latest` with the release notes taken from the tag annotation.
+# GitHub automatically attaches Source code (zip / tar.gz) tarballs.
+#
+# The .espkg firmware bundle is uploaded by tools/release.sh from a
+# workstation right after `git push`, since it requires a local build
+# with arduino-cli + the ESP32 board pack.
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Extract release notes from tag
+        id: notes
+        run: |
+          {
+            echo 'body<<EOF'
+            git tag -n99 --format='%(contents)' "$GITHUB_REF_NAME"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - name: Create or update release
+        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --latest --notes "${{ steps.notes.outputs.body }}"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Version ${GITHUB_REF_NAME#v}" \
+              --notes "${{ steps.notes.outputs.body }}" \
+              --latest
+          fi

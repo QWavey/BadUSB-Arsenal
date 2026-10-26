@@ -1,0 +1,988 @@
+/* ==========================================================================
+   Rubberless-Ducky WebFlasher
+   Direction: instrument panel. One box on a black field, white type, and a
+   single orange that only ever means "live". Nothing scrolls: the box is sized
+   to the viewport and the wizard swaps one view at a time inside it.
+   Every literal below belongs to the system documented in DESIGN.md.
+   ========================================================================== */
+
+@property --fill {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+
+:root {
+  /* --- Surface ---------------------------------------------------------- */
+  --black:     #000000;   /* page. True black, the way hardware pages are lit */
+  --surface-1: #0A0A0B;   /* the box */
+  --surface-2: #101013;   /* left slab, drawers */
+  --surface-3: #17171B;   /* wells: meter track, code */
+  --line-1:    #1F1F23;   /* hairline, at rest */
+  --line-2:    #34343B;   /* hairline, hover or focus */
+
+  /* --- Type colour ------------------------------------------------------ */
+  --white:  #F5F5F7;      /* primary. Not #fff: halation on true black */
+  --gray-1: #A1A1A6;      /* secondary prose          8.1:1 on black */
+  --gray-2: #8A8A8F;      /* meta, labels, dimensions 6.1:1 on black */
+
+  /* --- State ------------------------------------------------------------ */
+  --accent: #FF6A13;      /* live only: progress, current step   7.3:1 */
+  --ok:     #30D158;      /* 10.4:1 */
+  --err:    #FF453A;      /* 6.2:1 */
+
+  /* --- Shape ------------------------------------------------------------ */
+  --r-1: 3px;      /* code, pips */
+  --r-cell: 5px;   /* page-map cells */
+  --r-2: 8px;   /* controls, rows */
+  --r-3: 16px;  /* the box */
+
+  /* --- Space ------------------------------------------------------------ */
+  --s-1: 4px;  --s-2: 8px;  --s-3: 12px; --s-4: 16px;
+  --s-5: 24px; --s-6: 32px; --s-7: 48px;
+
+  /* --- Motion ----------------------------------------------------------- */
+  --e-out:   cubic-bezier(0.22, 0.61, 0.36, 1);
+  --e-apple: cubic-bezier(0.28, 0.11, 0.32, 1);
+  --d-1: 160ms; --d-2: 300ms; --d-3: 520ms; --d-4: 820ms;
+
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--black);
+  color: var(--white);
+  font-family: "Archivo", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection { background: var(--accent); color: #120600; }
+a { color: inherit; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: var(--r-1); }
+
+/* goTo() moves focus to the new view's heading so screen readers land there.
+   It is not an interactive control, so it must not draw a focus ring. */
+.view h1:focus, .view h1:focus-visible { outline: none; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+code {
+  font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.875em; font-weight: 500;
+  background: var(--surface-3); color: var(--white);
+  padding: 0.14em 0.4em; border-radius: var(--r-1);
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+   Stage: one screen, no page scroll
+   ========================================================================== */
+
+.stage {
+  height: 100svh;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: var(--s-4);
+  padding: var(--s-5);
+}
+
+.legal {
+  flex: none;
+  max-width: 74ch; margin: 0;
+  text-align: center;
+  font-size: 12px; line-height: 1.6;
+  color: var(--gray-2);
+}
+.legal a { color: var(--gray-2); text-underline-offset: 2px; }
+.legal a:hover { color: var(--white); }
+
+/* ==========================================================================
+   The box
+   ========================================================================== */
+
+.box {
+  position: relative;
+  width: 100%;
+  max-width: 1040px;
+  flex: 1 1 auto;
+  max-height: 660px;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--surface-1);
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-3);
+  /* clip, not hidden: the closed drawers sit at translateY(100%), and a
+     transformed child still contributes scrollable overflow. With `hidden`
+     the box becomes a scroll container and a focus() can shove it out of
+     alignment. `clip` crops the same pixels without one. */
+  overflow: hidden;
+  overflow: clip;
+  animation: boxIn var(--d-4) var(--e-apple) both;
+}
+
+@keyframes boxIn {
+  from { opacity: 0; transform: translateY(14px) scale(0.988); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* --- top strip ---------------------------------------------------------- */
+
+.box-top {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s-4);
+  padding: var(--s-3) var(--s-5);
+  border-bottom: 1px solid var(--line-1);
+}
+.box-lead { display: flex; align-items: baseline; gap: var(--s-4); min-width: 0; }
+.backlink {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-2);
+  background: var(--surface-2);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; font-weight: 500; letter-spacing: 0.02em;
+  color: var(--gray-1); text-decoration: none; white-space: nowrap; flex: none;
+  transition: color var(--d-1) var(--e-out), border-color var(--d-1) var(--e-out), background var(--d-1) var(--e-out);
+}
+.backlink:hover { color: var(--white); border-color: var(--line-2); background: var(--surface-3, #17171B); }
+.backlink .bl-arrow { font-size: 14px; line-height: 1; transition: transform var(--d-2) var(--e-out); }
+.backlink:hover .bl-arrow { transform: translateX(-3px); }
+/* on a narrow header, drop the version tag to make room rather than hiding the button */
+@media (max-width: 640px) { .brandline .ver { display: none; } }
+
+.brandline {
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px; font-weight: 600; letter-spacing: 0.07em;
+}
+/* A quiet separator, not an accent. Orange is reserved for live state; a
+   coloured dot in the wordmark is exactly the decorative accent to avoid. */
+.brandline .sep { color: var(--gray-2); font-weight: 400; }
+.brandline .ver {
+  color: var(--gray-2); font-weight: 400; letter-spacing: 0.04em;
+  margin-left: var(--s-3);
+}
+
+.status {
+  display: flex; align-items: center; gap: var(--s-2); margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--gray-2);
+  white-space: nowrap;
+}
+.status .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--line-2);
+  transition: background var(--d-2) var(--e-out);
+}
+.status[data-state="live"]  { color: var(--accent); } .status[data-state="live"]  .dot { background: var(--accent); }
+.status[data-state="ok"]    { color: var(--ok); }     .status[data-state="ok"]    .dot { background: var(--ok); }
+.status[data-state="error"] { color: var(--err); }    .status[data-state="error"] .dot { background: var(--err); }
+
+/* --- body --------------------------------------------------------------- */
+
+.box-body {
+  display: grid;
+  grid-template-columns: 380px minmax(0, 1fr);
+  min-height: 0;
+}
+
+/* ==========================================================================
+   Left slab: the drawing and the four figures worth knowing
+   ========================================================================== */
+
+.slab {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  border-right: 1px solid var(--line-1);
+  background: var(--surface-2);
+  min-height: 0;
+}
+
+.fig {
+  margin: 0;
+  min-height: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: var(--s-3);
+  padding: var(--s-4) var(--s-4) 0;
+}
+
+.device {
+  height: 100%;
+  max-height: 300px;   /* the figure supports the wizard, it does not compete */
+  width: auto; max-width: 100%; display: block;
+}
+
+.fig figcaption {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; letter-spacing: 0.05em; color: var(--gray-2);
+}
+
+/* Line hierarchy: shell and board read first, parts second, annotation last. */
+.device .shell,
+.device .board,
+.device .part {
+  fill: none; stroke: var(--white);
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.device .shell { stroke-width: 1.5; }
+.device .board { stroke-width: 1.5; }
+.device .part  { stroke-width: 1.1; stroke: var(--gray-1); }
+.device .card  { fill: none; stroke: var(--line-2); }
+.device .card path { fill: none; stroke: var(--line-2); stroke-width: 1; }
+.device .card .sd, .device .sd {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 22px; font-weight: 600; fill: var(--line-2); text-anchor: middle; stroke: none;
+}
+.device .fillpin { fill: var(--gray-2); stroke: none; }
+.device .pins  { stroke: var(--gray-2); stroke-width: 0.9; }
+.device .trace { fill: none; stroke: var(--line-2); stroke-width: 0.9; }
+.device .passive { fill: none; stroke: var(--line-2); stroke-width: 1; }
+.device .silk  { fill: none; stroke: var(--line-1); stroke-width: 1; stroke-dasharray: 3 4; }
+.device .ink   { fill: var(--gray-2); stroke: none; }
+.device .drill { fill: var(--surface-2); }
+
+/* Hidden-line convention: the microcontroller is on the reverse of the board,
+   so it is drawn dashed rather than invented onto the side you can see. */
+.device .ghost {
+  fill: none;
+  stroke: var(--line-2);
+  stroke-width: 1;
+  stroke-dasharray: 5 4;
+}
+
+.device .callout { fill: none; stroke: var(--line-2); stroke-width: 0.7; }
+.device .callout circle { fill: var(--gray-2); stroke: none; }
+.device .callout circle.ledpin { fill: var(--led, #0A84FF); }
+.device .callout text {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 23px; font-weight: 500; letter-spacing: 0.02em;
+  fill: var(--gray-2); stroke: none;
+}
+.device .callout.end text { text-anchor: end; }
+.device .callout text.sub { font-size: 20px; fill: var(--gray-2); }
+
+/* The drawing strokes itself on once, then stays put. The dash values are set
+   per shape from js/flasher.js: putting the animation on the <g> looks right
+   in source but does nothing, because an animated value on a parent is not
+   inherited by its children. */
+
+/* Step 02 highlights the button the instructions are talking about. */
+.device .boot rect,
+.device .boot circle,
+.device .boot path { transition: stroke var(--d-2) var(--e-out); }
+body[data-step="1"] .device .boot rect,
+body[data-step="1"] .device .boot circle,
+body[data-step="1"] .device .boot path { stroke: var(--accent); }
+
+/* The LED reads the flash state, because on the real board it does too. */
+/* The board's status LED is a fixed hardware colour, not a UI signal. It only
+   blinks while data is actually moving (flashing), the way the real one does. */
+.device .led { fill: var(--led, #0A84FF); }
+body[data-state="live"] .device .led { animation: ledBlink 0.5s steps(1, end) infinite; }
+@keyframes ledBlink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0.25; } }
+
+.spec {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin: 0;
+  border-top: 1px solid var(--line-1);
+}
+.spec > div {
+  display: flex; align-items: baseline; justify-content: space-between; gap: var(--s-3);
+  padding: var(--s-2) var(--s-4);
+  min-width: 0;
+}
+.spec > div:nth-child(odd)  { border-right: 1px solid var(--line-1); }
+.spec > div:nth-child(n+3)  { border-top: 1px solid var(--line-1); }
+.spec dt { font-size: 13px; color: var(--gray-2); }
+.spec dd {
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px; font-weight: 500; color: var(--white);
+}
+
+/* ==========================================================================
+   Wizard panel
+   ========================================================================== */
+
+.panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+}
+
+/* --- step rail ---------------------------------------------------------- */
+/* One continuous track with the pips sitting on top of it, rather than
+   separate segments running into each pip. The track is drawn per step from
+   this pip's centre to the next one's, which lands flush across the column
+   boundary and needs no measuring; the pips are opaque and stack above it, so
+   the line passes behind them instead of through them. */
+
+.rail {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  list-style: none;
+  margin: 0;
+  padding: var(--s-4) var(--s-6) var(--s-3);
+  border-bottom: 1px solid var(--line-1);
+}
+
+.rail li {
+  position: relative;
+  color: var(--gray-2);
+}
+
+.rail li::after {
+  content: "";
+  position: absolute;
+  left: 8px;            /* this pip's centre */
+  right: -8px;          /* the next pip's centre, one column over */
+  top: 8px;
+  height: 6px;
+  transform: translateY(-50%);
+  border-radius: 3px;
+  background-color: var(--line-1);
+  background-image: linear-gradient(var(--white), var(--white));
+  background-repeat: no-repeat;
+  background-size: 0% 100%;
+  transition: background-size var(--d-3) var(--e-apple);
+  z-index: 0;
+}
+.rail li.done::after { background-size: 100% 100%; }
+.rail li:last-child::after { display: none; }
+
+.railbtn {
+  position: relative;
+  z-index: 1;
+  display: flex; flex-direction: column; align-items: flex-start;
+  gap: var(--s-2);
+  padding: 0 var(--s-2) 6px 0;
+  margin: 0 0 -6px;
+  background: none; border: 0; border-radius: var(--r-1);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase;
+  color: inherit;
+  cursor: default;
+  transition: color var(--d-2) var(--e-out);
+}
+/* A finished step can be revisited; the one you are on and the ones ahead
+   cannot be jumped to. */
+.rail li.done .railbtn { cursor: pointer; }
+.rail li.done .railbtn:hover { color: var(--white); }
+.railbtn b { font-weight: 500; }
+
+/* Every pip is the same clockwise dial, filled by --fill (a registered
+   <number>, so the arc sweeps instead of snapping). The opaque --surface-1
+   base sits over the track so the line never shows through the empty part. */
+.pip {
+  width: 16px; height: 16px; flex: none;
+  border-radius: 50%;
+  background:
+    conic-gradient(var(--white) calc(var(--fill, 0) * 1%), rgba(0, 0, 0, 0) 0),
+    var(--surface-1);
+  box-shadow: inset 0 0 0 2px var(--line-2);
+}
+
+/* The pip fills as the connector reaches it: the line runs first (no delay,
+   above), the fill follows on a delay so it lands just as the line arrives —
+   "the line fills the circle only when the line is there". --fill carries the
+   dial fractions too (25/50/75/100), set per step in js/flasher.js. */
+.rail li { transition: --fill var(--d-2) var(--e-apple) var(--d-3); }
+
+.rail li.on   { color: var(--accent); }
+.rail li.done { color: var(--white); }
+
+/* --- views -------------------------------------------------------------- */
+
+.views {
+  position: relative;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+.views::-webkit-scrollbar { width: 6px; }
+.views::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 3px; }
+.views::-webkit-scrollbar-track { background: transparent; }
+
+.view {
+  position: absolute; inset: 0;
+  padding: var(--s-6);
+  display: flex; flex-direction: column;
+  opacity: 0;
+  visibility: hidden;
+  transform: translate3d(18px, 0, 0);
+  transition:
+    opacity    var(--d-2) var(--e-apple),
+    transform  var(--d-2) var(--e-apple),
+    visibility 0s linear var(--d-2);
+}
+.view.is-on {
+  opacity: 1;
+  visibility: visible;
+  transform: none;
+  transition:
+    opacity   var(--d-3) var(--e-apple) 60ms,
+    transform var(--d-3) var(--e-apple) 60ms,
+    visibility 0s;
+}
+.view.is-out { transform: translate3d(-18px, 0, 0); }
+
+.view .kicker {
+  margin: 0 0 var(--s-3);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--gray-2);
+}
+.view .kicker.done-k { color: var(--ok); }
+
+.view h1 {
+  margin: 0 0 var(--s-4);
+  font-size: clamp(30px, 3.4vw, 42px);
+  font-weight: 700; line-height: 1.05; letter-spacing: -0.03em;
+}
+
+.view p {
+  max-width: 54ch;
+  margin: 0 0 var(--s-3);
+  font-size: 15px;
+  color: var(--gray-1);
+}
+.view a { color: var(--white); text-underline-offset: 3px; }
+
+.view .warn {
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid rgba(255, 106, 19, 0.35);
+  border-radius: var(--r-2);
+  background: rgba(255, 106, 19, 0.06);
+  color: #FFC79B;
+}
+
+.acts {
+  display: flex; flex-wrap: wrap; gap: var(--s-2);
+  margin-top: auto;
+  padding-top: var(--s-4);
+}
+
+/* ==========================================================================
+   Flash view: page map
+   One cell per 512-byte page, so the readout is the operation itself rather
+   than a bar standing in for it. Where it stops is where the write stopped.
+   ========================================================================== */
+
+.pagemap {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(17px, 1fr));
+  gap: 5px;
+  margin: var(--s-2) 0 var(--s-3);
+}
+.pagemap i {
+  aspect-ratio: 1;
+  border-radius: var(--r-cell);
+  box-shadow: inset 0 0 0 1px var(--line-1);
+  transition: background var(--d-1) var(--e-out),
+              box-shadow var(--d-1) var(--e-out);
+}
+.pagemap i.on {
+  background: var(--white);
+  box-shadow: inset 0 0 0 1px var(--white);
+  animation: cellOn var(--d-2) var(--e-apple);
+}
+@keyframes cellOn { from { transform: scale(0.55); } to { transform: scale(1); } }
+
+/* The write head: the page currently going out. Outline only, no pulse. */
+.pagemap i.next { box-shadow: inset 0 0 0 2px var(--accent); }
+
+/* On success the green sweeps across in write order rather than snapping. */
+.pagemap.is-done i.on {
+  animation: none;
+  transition-delay: calc(var(--i) * 5ms);
+}
+.pagemap i.fail    { background: var(--err);    box-shadow: inset 0 0 0 1px var(--err); }
+.pagemap.is-done i.on { background: var(--ok);  box-shadow: inset 0 0 0 1px var(--ok); }
+
+/* Chip erase reports no position, so the map sweeps rather than pretending
+   to one. Opacity only. */
+.pagemap.is-erasing i {
+  box-shadow: inset 0 0 0 1px var(--accent);
+  animation: sweep 1.2s linear infinite;
+  animation-delay: calc(var(--i) * 9ms);
+}
+@keyframes sweep { 0%, 100% { opacity: 0.22; } 50% { opacity: 1; } }
+
+.view .readout {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s-2) var(--s-5);
+  max-width: none;
+  margin: 0 0 var(--s-3);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--gray-2);
+}
+.view .readout b {
+  font-size: 19px; font-weight: 600; letter-spacing: -0.01em;
+  color: var(--white);
+}
+.view .readout .ph {
+  margin-left: auto;
+  letter-spacing: 0.1em; text-transform: uppercase;
+}
+body[data-state="live"]  .view .readout .ph { color: var(--accent); }
+body[data-state="ok"]    .view .readout .ph { color: var(--ok); }
+body[data-state="error"] .view .readout .ph { color: var(--err); }
+
+.mini { margin: 0; }
+.mini > div {
+  display: flex; align-items: baseline; gap: var(--s-4);
+  padding: 2px 0;
+}
+.mini dt {
+  min-width: 7ch;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--gray-2);
+}
+.mini dd {
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px; color: var(--white);
+  font-variant-numeric: tabular-nums;
+}
+
+.view .inline-err {
+  max-width: none;
+  margin: var(--s-3) 0 0;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid rgba(255, 69, 58, 0.4);
+  border-radius: var(--r-2);
+  background: rgba(255, 69, 58, 0.08);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px;
+  color: #FFB4AE;
+}
+.view .inline-err[hidden] { display: none; }
+
+.noscript {
+  max-width: 62ch;
+  margin: var(--s-5) auto 0;
+  padding: var(--s-3) var(--s-4);
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-2);
+  font-size: 14px;
+  color: var(--gray-1);
+  text-align: center;
+}
+
+/* ==========================================================================
+   Controls
+   ========================================================================== */
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--s-2);
+  padding: 11px 20px;
+  border: 1px solid transparent;
+  border-radius: var(--r-2);
+  font: inherit; font-size: 14px; font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background var(--d-1) var(--e-out),
+              border-color var(--d-1) var(--e-out),
+              color var(--d-1) var(--e-out),
+              opacity var(--d-1) var(--e-out),
+              transform 90ms var(--e-out);
+}
+.btn.solid { background: var(--white); color: var(--black); }
+.btn.solid:not(:disabled):hover { background: #fff; }
+.btn.ghost { background: transparent; color: var(--white); border-color: var(--line-2); }
+.btn.ghost:hover { border-color: var(--white); }
+.btn:not(:disabled):active { transform: scale(0.972); }
+.filebtn:active { transform: scale(0.972); }
+.btn, .filebtn { transform: scale(1); }
+.btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.filebtn { position: relative; }
+.filebtn input {
+  position: absolute;
+  width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  clip-path: inset(50%);
+  overflow: hidden; white-space: nowrap;
+}
+.filebtn:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-color: var(--white);
+}
+
+/* A ring, not a dashed spinner: same language as the gauge. */
+.btn.hold { position: relative; overflow: hidden; }
+.btn.hold .hold-fill {
+  position: absolute; inset: 0;
+  background: var(--accent);
+  transform: scaleX(var(--hold, 0));
+  transform-origin: left;
+  transition: transform var(--hold-dur, 140ms) linear,
+              opacity var(--d-2) var(--e-out);
+  pointer-events: none;
+}
+.btn.hold .hold-label { position: relative; z-index: 1; }
+.btn.hold.is-armed .hold-fill { opacity: 0; }
+
+.ring-sm {
+  width: 14px; height: 14px; display: none; flex: none;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: spin 700ms linear infinite;
+}
+.btn.loading .ring-sm { display: block; }
+.btn.loading { pointer-events: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ==========================================================================
+   Bottom strip
+   ========================================================================== */
+
+.box-bot {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--s-4);
+  padding: var(--s-3) var(--s-5);
+  border-top: 1px solid var(--line-1);
+}
+
+.footstat {
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--gray-2);
+}
+
+.botbtns { display: flex; gap: var(--s-1); }
+.tabbtn {
+  padding: 6px 12px;
+  background: transparent; border: 1px solid transparent; border-radius: var(--r-2);
+  font: inherit; font-size: 13px; color: var(--gray-2);
+  text-decoration: none; cursor: pointer;
+  transition: color var(--d-1) var(--e-out), border-color var(--d-1) var(--e-out);
+}
+.tabbtn:hover { color: var(--white); }
+.tabbtn[aria-expanded="true"] { color: var(--white); border-color: var(--line-2); }
+
+/* ==========================================================================
+   Drawers: slide up over the box, never resize it
+   ========================================================================== */
+
+.drawer {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  z-index: 5;
+  max-height: 68%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--surface-2);
+  border-top: 1px solid var(--line-2);
+  transform: translateY(100%);
+  visibility: hidden;
+  transition: transform var(--d-2) var(--e-apple),
+              visibility 0s linear var(--d-2);
+}
+.drawer.is-open {
+  transform: none;
+  visibility: visible;
+  transition: transform var(--d-2) var(--e-apple), visibility 0s;
+}
+
+.drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: var(--s-3) var(--s-5);
+  border-bottom: 1px solid var(--line-1);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--gray-2);
+}
+.drawer-head .x {
+  width: 26px; height: 26px;
+  background: transparent; border: 0; border-radius: var(--r-1);
+  color: var(--gray-2); font-size: 18px; line-height: 1; cursor: pointer;
+  transition: color var(--d-1) var(--e-out);
+}
+.drawer-head .x:hover { color: var(--white); }
+
+.drawer-log {
+  overflow: auto; overscroll-behavior: contain;
+  padding: var(--s-3) var(--s-5) var(--s-4);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px; line-height: 1.6;
+  color: var(--gray-1);
+  white-space: pre-wrap; word-break: break-word;
+}
+.drawer-log .ts  { color: var(--gray-2); }
+.drawer-log .err { color: var(--err); }
+.drawer-log .ok  { color: var(--ok); }
+
+.dl-list {
+  list-style: none; margin: 0; padding: 0;
+  overflow: auto; overscroll-behavior: contain;
+}
+.dl-list li + li { border-top: 1px solid var(--line-1); }
+.dl-list a {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s-2) var(--s-5);
+  padding: var(--s-3) var(--s-5);
+  text-decoration: none;
+  transition: background var(--d-1) var(--e-out);
+}
+.dl-list a:hover { background: var(--surface-3); }
+.dl-list b {
+  min-width: 19ch;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 14px; font-weight: 600;
+}
+.dl-list span { font-size: 14px; color: var(--gray-1); }
+
+/* ==========================================================================
+   Narrow and short viewports
+   ========================================================================== */
+
+@media (max-width: 860px) {
+  .box { max-height: 720px; }
+  .box-body { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .slab {
+    border-right: 0; border-bottom: 1px solid var(--line-1);
+    grid-template-rows: none;
+    grid-template-columns: 1fr 1fr;
+    align-items: center;
+  }
+  /* The figure is a desktop affordance. Squeezed into this band its labels
+     land at about 4px, which is worse than not showing them, and the viewBox
+     reserves their width whether they are drawn or not. The spec list is the
+     part that still reads, so it takes the whole band. */
+  .fig { display: none; }
+  .spec { grid-column: 1 / -1; border-top: 0; }
+  .spec > div { padding: var(--s-2) var(--s-4); }
+  .spec > div:nth-child(odd) { border-right: 1px solid var(--line-1); }
+  .spec > div:nth-child(n+3) { border-top: 1px solid var(--line-1); }
+  .spec dt, .spec dd { font-size: 13px; }
+  .view { padding: var(--s-5); }
+  .pagemap { grid-template-columns: repeat(auto-fill, minmax(14px, 1fr)); gap: 4px; }
+  .view .readout b { font-size: 17px; }
+  .legal { font-size: 11px; }
+}
+
+@media (max-width: 560px) {
+  .stage { padding: var(--s-3); }
+  .rail { padding: var(--s-3) var(--s-4); }
+  .rail li b { display: none; }
+  /* With the labels gone the button is just the pip, which falls under the
+     24px touch minimum. The negative margin cancels the padding, so the pip
+     does not move and the track needs no compensation. */
+  .railbtn { padding: 5px var(--s-2) 5px 0; margin: -5px 0; }
+  .box-bot { flex-wrap: wrap; }
+  .view .readout .ph { margin-left: 0; }
+}
+
+/* Short viewports: tighten the chrome so the wizard still fits without the
+   panel having to scroll. Density step, not a different layout. */
+@media (max-height: 700px) {
+  .box-top, .box-bot { padding-top: var(--s-2); padding-bottom: var(--s-2); }
+  .rail { padding: var(--s-3) var(--s-6); }
+  .view { padding: var(--s-4) var(--s-6); }
+  .view h1 { font-size: 30px; margin-bottom: var(--s-3); }
+  .fig { padding: var(--s-3) var(--s-4) 0; }
+}
+
+@media (max-height: 560px) {
+  .stage { padding: var(--s-3); }
+  .legal { display: none; }
+  .box { max-height: none; }
+}
+
+/* ==========================================================================
+   Reduced motion: state still reads, nothing slides
+   ========================================================================== */
+
+/* ==========================================================================
+   Figure state FX
+   The left figure reacts to where you are: it zooms to the button to press,
+   shows a check and seats into a port when connected, and runs data down the
+   USB pair to the chip while flashing. Driven by body[data-step]/[data-state],
+   transform/opacity only, no requestAnimationFrame.
+   --boot-origin is the button's position in the figure, as % of the viewBox,
+   so the same rules work on both boards by setting it per page.
+   ========================================================================== */
+
+.fig { overflow: hidden; }   /* crop the boot zoom cleanly */
+
+.device { transition: transform 1.2s var(--e-apple); transform-origin: var(--boot-origin, 52% 55%); }
+body[data-step="1"] .device { transform: scale(2.3); }
+
+.device .callout { transition: opacity var(--d-3) var(--e-out); }
+body:not([data-step="0"]) .device .callout { opacity: 0; }
+
+.fx > * { opacity: 0; }
+
+/* data flow while flashing: discrete packets run up the USB pair to the chip */
+.fx-data .fx-trace { fill: none; stroke: var(--line-2); stroke-width: 2; }
+.fx-pk { fill: var(--white); opacity: 0; filter: drop-shadow(0 0 3px var(--accent)); }
+.fx-pk.l { offset-path: path("M132 470 V438"); }
+.fx-pk.r { offset-path: path("M168 470 V450 Q168 442 160 440 V438"); }
+body[data-state="live"] .fx-data { opacity: 1; }
+body[data-state="live"] .fx-pk    { animation: fxpk 0.85s linear infinite; }
+.fx-pk.d2 { animation-delay: 0.28s; }
+.fx-pk.d3 { animation-delay: 0.56s; }
+@keyframes fxpk { 0% { offset-distance: 0%; opacity: 0; } 12% { opacity: 1; } 88% { opacity: 1; } 100% { offset-distance: 100%; opacity: 0; } }
+.fx-sink { fill: var(--accent); }
+body[data-state="live"] .fx-sink { animation: fxsink 0.85s ease-in-out infinite; }
+@keyframes fxsink { 0%, 100% { opacity: 0; } 55% { opacity: 0.2; } }
+
+/* press hint on the boot button */
+.fx-press .fx-arrow { fill: none; stroke: var(--white); stroke-width: 2.6; stroke-linecap: round; stroke-linejoin: round; }
+.fx-press .fx-ring  { fill: none; stroke: var(--white); stroke-width: 2; }
+.fx-press .fx-arrow, .fx-press .fx-ring { transform-box: fill-box; transform-origin: center; }
+body[data-step="1"] .fx-press { opacity: 1; }
+body[data-step="1"] .fx-press .fx-arrow { animation: fxpress 1.5s var(--e-apple) infinite; }
+body[data-step="1"] .fx-press .fx-ring  { animation: fxring 1.5s var(--e-apple) infinite; }
+@keyframes fxpress { 0%, 100% { transform: translateY(0);   opacity: 0.4; } 50% { transform: translateY(5px); opacity: 1; } }
+@keyframes fxring  { 0% { transform: scale(0.65); opacity: 0.9; } 70%, 100% { transform: scale(1.3); opacity: 0; } }
+
+/* connected check badge */
+.fx-check circle   { fill: none; stroke: var(--ok); stroke-width: 2.5; }
+.fx-check .fx-tick { fill: none; stroke: var(--ok); stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 44; stroke-dashoffset: 44; }
+body[data-state="ok"] .fx-check { opacity: 1; }
+body[data-state="ok"] .fx-check .fx-tick { animation: fxtick 0.5s var(--e-apple) forwards; }
+@keyframes fxtick { to { stroke-dashoffset: 0; } }
+
+/* port collar seats over the plug when connected */
+.fx-port .fx-shroud { fill: none; stroke: var(--gray-2); stroke-width: 1.5; }
+.fx-port path       { stroke: var(--gray-2); stroke-width: 1.5; }
+body[data-state="ok"] .fx-port { opacity: 1; animation: fxseat 0.5s var(--e-apple); }
+@keyframes fxseat { from { transform: translateY(10px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-step="1"] .device { transform: none; }
+  .fx-data, .fx-pk, .fx-press, .fx-port { display: none; }
+
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    transition-delay: 0ms !important;
+  }
+  .device .shell *, .device .board *, .device .part *,
+  .device .trace *, .device .passive * {
+    stroke-dasharray: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+}
+
+
+/* ---- ESP32-S3 flasher: board-specific figure bits ---------------------- */
+:root { --boot-origin: 43% 69%; --led: #0A84FF; }   /* BOOT near USB; blue status LED */
+
+.device .mod {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 20px; font-weight: 600; letter-spacing: 0.04em;
+  fill: var(--gray-2); text-anchor: middle;
+}
+.device .mod.sub2 { font-size: 15px; fill: var(--line-2); letter-spacing: 0.08em; }
+
+/* data packets run the ESP's longer USB pair up to the module */
+.fx-pk.l { offset-path: path("M132 470 V336"); }
+.fx-pk.r { offset-path: path("M168 470 V360 Q168 350 158 348 V336"); }
+
+/* flash-view: "flash many" checkbox + Stop (danger) button */
+.view .chk {
+  display: flex; align-items: center; gap: var(--s-2);
+  margin-top: var(--s-3);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px; color: var(--gray-1); cursor: pointer; user-select: none;
+}
+.view .chk input { width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+.view .chk span { color: var(--gray-2); }
+.btn.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 45%, var(--line-2)); }
+.btn.danger:hover { border-color: var(--err); background: color-mix(in srgb, var(--err) 12%, transparent); }
+
+/* ---- traced device figure (generated by flasher_figure.py) ---- */
+.device .fig-body .case   { fill:none; stroke:var(--white);  stroke-width:3.20; stroke-linecap:round; stroke-linejoin:round; }
+.device .fig-body .chip   { fill:none; stroke:var(--white);  stroke-width:2.60; stroke-linecap:round; stroke-linejoin:round; }
+.device .fig-body .edge   { fill:none; stroke:var(--white);  stroke-width:2.10; stroke-linecap:round; stroke-linejoin:round; }
+.device .fig-body .detail { fill:none; stroke:var(--white);  stroke-width:1.40; stroke-linecap:round; stroke-linejoin:round; }
+.device .fig-body .fine   { fill:none; stroke:var(--gray-1); stroke-width:1.00; stroke-linecap:round; stroke-linejoin:round; }
+.device .fig-mod {
+  font-family:"IBM Plex Mono",ui-monospace,monospace; font-weight:600;
+  font-size:40px; letter-spacing:0.04em; fill:var(--white); text-anchor:start;
+}
+.device .fig-mod.sub { font-size:28px; fill:var(--gray-1); }
+
+.device { transition: transform 1.2s var(--e-apple); transform-origin: 44% 54%; }
+body[data-step="1"] .device { transform: scale(2.0); }
+
+.device .led { fill: var(--led, #0A84FF); }
+body[data-state="ok"]   .device .led { animation: ledBlink 1.4s steps(1, end) infinite; }
+body[data-state="live"] .device .led { animation: ledBlink 0.5s steps(1, end) infinite; }
+@keyframes ledBlink { 0%,50% { opacity:1; } 51%,100% { opacity:0.25; } }
+
+/* cue layer (hidden until its state) */
+.fx > * { opacity: 0; }
+.fx-data .fx-trace { fill:none; stroke:var(--line-2); stroke-width:5.30; }
+.fx-pk { fill:var(--white); opacity:0; filter:drop-shadow(0 0 8px var(--accent)); }
+.fx-pk.l { offset-path: path("M526 1006 V490"); }
+.fx-pk.r { offset-path: path("M594 1006 V516 Q594 498 574 496 V490"); }
+body[data-state="live"] .fx-data { opacity:1; }
+body[data-state="live"] .fx-pk { animation: fxpk 0.85s linear infinite; }
+.fx-pk.d2 { animation-delay:0.28s; } .fx-pk.d3 { animation-delay:0.56s; }
+@keyframes fxpk { 0%{offset-distance:0%;opacity:0} 12%{opacity:1} 88%{opacity:1} 100%{offset-distance:100%;opacity:0} }
+
+.fx-sink { fill:var(--accent); }
+body[data-state="live"] .fx-sink { animation: fxsink 0.85s ease-in-out infinite; }
+@keyframes fxsink { 0%,100%{opacity:0} 50%{opacity:0.16} }
+
+.fx-press .fx-btn   { fill:none; stroke:var(--white); stroke-width:7.50; }
+.fx-press .fx-arrow { fill:none; stroke:var(--accent); stroke-width:7.00; stroke-linecap:round; stroke-linejoin:round; }
+.fx-press .fx-ring  { fill:none; stroke:var(--accent); stroke-width:5.30; }
+.fx-press .fx-arrow, .fx-press .fx-ring { transform-box: fill-box; transform-origin: center; }
+.device .fig-body { transition: opacity var(--d-3, 520ms) var(--e-out); }
+/* Step 2 greys the board down and lights the one button the copy is about. */
+body[data-step="1"] .device .fig-body { opacity:0.26; }
+body[data-step="1"] .fx-press { opacity:1; }
+body[data-step="1"] .fx-press .fx-arrow { animation: fxpress 1.5s var(--e-apple) infinite; }
+body[data-step="1"] .fx-press .fx-ring  { animation: fxring 1.3s var(--e-apple) infinite; }
+@keyframes fxpress { 0%,100%{transform:translateY(0);opacity:0.55} 50%{transform:translateY(-9px);opacity:1} }
+@keyframes fxring  { 0%{transform:scale(1);opacity:0.95} 70%,100%{transform:scale(1.75);opacity:0} }
+
+.dim .dim-line, .dim .dim-tick { fill:none; stroke:var(--gray-2); stroke-width:2.40; stroke-linecap:round; }
+.dim .dim-ext { fill:none; stroke:var(--line-2); stroke-width:1.80; }
+.dim .dim-txt { fill:var(--gray-1); font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:30px; letter-spacing:0.04em; text-anchor:middle; }
+body:not([data-step="0"]) .dim { opacity:0; transition: opacity var(--d-2,300ms); }
+
+.fx-check circle { fill:none; stroke:var(--ok); stroke-width:6.50; }
+.fx-check .fx-tick { fill:none; stroke:var(--ok); stroke-width:8.00; stroke-linecap:round; stroke-linejoin:round; stroke-dasharray:120; stroke-dashoffset:120; }
+body[data-state="ok"] .fx-check { opacity:1; }
+body[data-state="ok"] .fx-check .fx-tick { animation: fxtick 0.5s var(--e-apple) forwards; }
+@keyframes fxtick { to { stroke-dashoffset:0; } }
+
+.fx-port .fx-shroud { fill:none; stroke:var(--gray-2); stroke-width:4.00; }
+.fx-port path { stroke:var(--gray-2); stroke-width:4.00; fill:none; }
+body[data-state="ok"] .fx-port { opacity:1; }
+body[data-state="ok"] .fx-port > * { animation: fxseat 0.5s var(--e-apple); }
+@keyframes fxseat { from { transform: translateY(-14px); opacity:0; } to { transform:none; opacity:1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  body[data-step="1"] .device { transform:none; }
+  .fx-data, .fx-pk, .fx-press, .fx-port { display:none; }
+}

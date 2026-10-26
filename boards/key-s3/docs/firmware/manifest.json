@@ -1,0 +1,28 @@
+{
+  "name": "ESP32-S3 Key BadUSB",
+  "version": "master-fcffc5e",
+  "chip": "ESP32-S3",
+  "flashSize": "8MB",
+  "parts": [
+    {
+      "path": "bootloader.bin",
+      "offset": 0,
+      "size": 19968
+    },
+    {
+      "path": "partitions.bin",
+      "offset": 32768,
+      "size": 3072
+    },
+    {
+      "path": "boot_app0.bin",
+      "offset": 57344,
+      "size": 8192
+    },
+    {
+      "path": "firmware.bin",
+      "offset": 65536,
+      "size": 1678880
+    }
+  ]
+}

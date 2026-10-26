@@ -1,0 +1,11 @@
+build/
+*.bin
+*.elf
+*.map
+.DS_Store
+ESP-BadUSB-S3-Key/build/
+# build artifacts and upstream reference bundle
+dist/
+extensions.zip
+# unzipped Hak5 reference corpus (upstream-owned)
+/extensions/
