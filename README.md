@@ -1,6 +1,6 @@
 # BadUSB-Arsenal
 
-One home for every QWavey BadUSB and passthrough firmware: one folder per board, one shared display library, one set of release packages.
+One home for every BadUSB and passthrough firmware. One folder per board, one shared display library, one set of release packages.
 
 | Folder | Board | What it is |
 |---|---|---|
