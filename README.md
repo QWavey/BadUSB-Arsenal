@@ -21,3 +21,5 @@ Each ESP32 board has a release with `bootloader.bin`, `boot_app0.bin`, `partitio
 ## Responsible use
 
 For authorized security research, education and testing on hardware you own. Do not use these tools against systems or networks you do not have permission to test.
+
+By using any of my code, you take full responsibility for what happens with it. That includes system failures, data loss, and unintended damage. I'm not liable for consequences of using it. If you're unsure what you're doing, stop, cancel the project, and ask a professional or me first.
