@@ -62,7 +62,15 @@ second is the HID keycode.
   configured `PAYLOAD_SWITCHn`.
 - `HID_TRIGGER=WEBUI`  — click Fire in the Web UI, or `POST /api/hid` with
   the path.
-- `HID_TRIGGER=WEBHOOK` — `/api/hid` with an API token header, same effect.
+- `HID_TRIGGER=WEBHOOK` — `/api/hid`, same effect. **Correction:** there is
+  no API-token mechanism in the Python build that actually runs on this
+  device (confirmed: no `API_TOKEN`/token-header code anywhere in
+  `onboard/`; see `docs/CONFIG.md`'s Python-build table, which says so
+  explicitly). `/api/hid` had no authentication at all until a 2026-10-31
+  bug-hunt fix added the same session-based `_require_admin()` gate every
+  other admin endpoint uses (enforced only when `WEBUI_REQUIRE_AUTH=TRUE`,
+  or automatically once a LAN IP is bound). If a token-header scheme is
+  wanted for webhook-style triggering, it does not exist yet.
 
 ## Cron
 

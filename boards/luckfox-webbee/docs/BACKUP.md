@@ -29,10 +29,13 @@ Device state is stored at:
 - `/root/ghostlink/payloads/`          — user payloads
 - `/root/ghostlink/extensions/`        — user extension library
 - `/root/ghostlink/layouts/`           — vendored Hak5 layouts
+- `/root/ghostlink/records/`           — captured pcap files (large: back up what you need)
+- `/root/ghostlink/verdicts/`          — verdict stream (jsonl)
+- `/root/ghostlink/identity.env`       — clone identity override, if set
 - `/etc/init.d/S50usbdevice`           — stock init with our one-time
                                           sed patch (sources identity.env)
 - `/etc/init.d/S50usbdevice.bak.ghostlink` — original stock pin for restore
 
 To rescue a bricked device: flash the stock Luckfox update.img via
-SocToolKit, then `adb push` the latest `onboard/` and run
+SocToolKit, then `adb push` the latest `onboard/` to `/tmp/onboard` and run
 `cd /tmp/onboard && sh ./install.sh`.

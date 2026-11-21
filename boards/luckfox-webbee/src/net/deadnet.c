@@ -41,6 +41,7 @@
 
 static volatile int g_run = 0;
 static pthread_t    g_t4, g_t6;
+static int          g_t4_on = 0, g_t6_on = 0;   /* 1 = worker thread was really created */
 
 /* ARP packet layout */
 struct arp_pkt {
@@ -86,6 +87,10 @@ static int in_list(uint32_t ip, const char *list) {
     char *tok, *save = NULL;
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
         struct in_addr a;
+        /* trim leading and trailing spaces and tabs around each entry */
+        while (*tok == ' ' || *tok == '\t') tok++;
+        size_t tl = strlen(tok);
+        while (tl > 0 && (tok[tl-1] == ' ' || tok[tl-1] == '\t')) tok[--tl] = 0;
         if (inet_aton(tok, &a) && a.s_addr == ip) return 1;
     }
     return 0;
@@ -99,6 +104,7 @@ static void *v4_worker(void *arg) {
 
     int ifi; uint8_t mac[6]; uint32_t our_ip;
     if (get_if_info(ifn, &ifi, mac, &our_ip) < 0) { LOGE("deadnet", "if %s: %s", ifn, strerror(errno)); return NULL; }
+    if (our_ip == 0) { LOGE("deadnet", "if %s: no IPv4 address, not arming", ifn); return NULL; }
 
     int s = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ARP));
     if (s < 0) { LOGE("deadnet", "AF_PACKET: %s", strerror(errno)); return NULL; }
@@ -177,6 +183,7 @@ static void *v6_worker(void *arg) {
     setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops));
 
     unsigned ifidx = if_nametoindex(ifn);
+    if (ifidx == 0) { LOGE("deadnet", "v6 if %s: no ifindex, not arming", ifn); close(s); return NULL; }
     setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifidx, sizeof(ifidx));
 
     struct sockaddr_in6 dst;
@@ -200,15 +207,24 @@ static void *v6_worker(void *arg) {
 
 int deadnet_start(void) {
     if (!g_cfg.deadnet) { LOGI("deadnet", "disabled"); return 0; }
+    if (g_t4_on || g_t6_on) return 0;   /* a worker is already running */
     g_run = 1;
-    if (g_cfg.deadnet_ipv4) pthread_create(&g_t4, NULL, v4_worker, NULL);
-    if (g_cfg.deadnet_ipv6) pthread_create(&g_t6, NULL, v6_worker, NULL);
+    if (g_cfg.deadnet_ipv4) {
+        int rc = pthread_create(&g_t4, NULL, v4_worker, NULL);
+        if (rc == 0) g_t4_on = 1;
+        else LOGE("deadnet", "v4 pthread_create: %s", strerror(rc));
+    }
+    if (g_cfg.deadnet_ipv6) {
+        int rc = pthread_create(&g_t6, NULL, v6_worker, NULL);
+        if (rc == 0) g_t6_on = 1;
+        else LOGE("deadnet", "v6 pthread_create: %s", strerror(rc));
+    }
     return 0;
 }
 
 int deadnet_stop(void) {
     g_run = 0;
-    if (g_cfg.deadnet_ipv4) pthread_join(g_t4, NULL);
-    if (g_cfg.deadnet_ipv6) pthread_join(g_t6, NULL);
+    if (g_t4_on) { pthread_join(g_t4, NULL); g_t4_on = 0; }
+    if (g_t6_on) { pthread_join(g_t6, NULL); g_t6_on = 0; }
     return 0;
 }

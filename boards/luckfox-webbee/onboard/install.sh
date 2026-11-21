@@ -23,7 +23,9 @@ fi
 for f in *.py *.sh; do
     [ -f "$f" ] || continue
     [ "$f" = "install.sh" ] && continue   # we re-exec'd ourselves above
-    tr -d '\r' < "$f" > "$DEST/$f"
+    # Write a new file and rename it. A running shell script (the supervisor) reads itself by
+    # offset, so rewriting it in place while it runs can make it execute mixed old and new text.
+    tr -d '\r' < "$f" > "$DEST/$f.new" && mv "$DEST/$f.new" "$DEST/$f"
 done
 cp layouts/*.json "$DEST/layouts/" 2>/dev/null || true
 # vendored web assets (xterm.js etc.) served from /xterm.js, /xterm.css, ...
@@ -66,13 +68,23 @@ if [ -f "$S50" ] && ! grep -q 'ghostlink identity.env' "$S50"; then
     # swap the four hardcoded USB_* writes for ${…:-stock} fallback form
     sed -i -E \
       -e 's|^(\s*echo )0x2207(.*idVendor)|\1${USB_VID:-0x2207}\2|' \
-      -e 's|^(\s*echo \$\{?PID\}?.*idProduct)|\1|' \
+      -e 's|^(\s*echo )\$\{?PID\}?( *> *\$\{USB_CONFIGFS_DIR\}/idProduct)|\1${USB_PID:-$PID}\2|' \
+      -e 's|^(\s*echo )\$SERIAL( *> *\$\{USB_STRINGS_DIR\}/serialnumber)|\1${USB_SER:-$SERIAL}\2|' \
       -e 's|^(\s*echo ")rockchip(".*manufacturer)|\1${USB_MFR:-rockchip}\2|' \
       -e 's|^(\s*echo ")rk3xxx(".*product)|\1${USB_PROD:-rk3xxx}\2|' \
       "$S50.new"
     mv "$S50.new" "$S50"
     chmod +x "$S50"
     echo "patched $S50 (backup at $S50.bak.ghostlink)"
+fi
+
+# Boot-time HID decision: S49ghost-hid is pushed next to this script, and hid_boot_patch.sh adds
+# the one line in the stock S50usbdevice that reads its flag. Both are safe to run again.
+if [ -f S49ghost-hid ]; then
+    install -m 0755 S49ghost-hid /etc/init.d/S49ghost-hid
+fi
+if [ -f hid_boot_patch.sh ]; then
+    sh hid_boot_patch.sh || echo "WARN: hid_boot_patch.sh did not patch S50usbdevice (see its output)"
 fi
 
 echo "GhostLink installed to $DEST. Start now with:"

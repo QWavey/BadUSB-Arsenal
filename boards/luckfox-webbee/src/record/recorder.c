@@ -114,35 +114,44 @@ static int consume_matching_verdict(uint64_t frame, char *rule, char *verdict, c
 }
 
 static void prune_oldest(int max_files) {
-    /* list Records/*.pcap, sort by mtime, delete oldest until <= max_files */
+    /* list the .pcap files in RECORDS_DIR, drop the lowest rec_NNNNNN index until <= max_files. By index, not
+     * mtime: a clock step must not make a new capture the "oldest" one. */
+    enum { RING_MAX = 1024 };   /* scan limit; a larger RECORD_RING_FILES is capped */
+    if (max_files > RING_MAX - 1) max_files = RING_MAX - 1;
     DIR *d = opendir(RECORDS_DIR);
     if (!d) return;
     struct dirent *e;
-    struct { char name[64]; time_t t; } files[256];
+    static struct { char name[256]; int idx; } files[RING_MAX];
     int n = 0;
-    while ((e = readdir(d)) && n < 256) {
-        if (strstr(e->d_name, ".pcap") == NULL) continue;
-        char full[256];
+    while ((e = readdir(d)) && n < RING_MAX) {
+        size_t nl = strlen(e->d_name);   /* exact ".pcap" suffix only */
+        if (nl < 5 || strcmp(e->d_name + nl - 5, ".pcap") != 0) continue;
+        char full[300];
         snprintf(full, sizeof(full), RECORDS_DIR "/%s", e->d_name);
         struct stat st;
         if (stat(full, &st) == 0) {
+            int idx = 0;
+            if (sscanf(e->d_name, "rec_%d.", &idx) != 1) idx = 0x7fffffff;   /* other names go last */
             strncpy(files[n].name, e->d_name, sizeof(files[n].name)-1);
             files[n].name[sizeof(files[n].name)-1] = 0;
-            files[n].t = st.st_mtime;
+            files[n].idx = idx;
             n++;
         }
     }
     closedir(d);
     while (n > max_files) {
         int oldest = 0;
-        for (int i = 1; i < n; i++) if (files[i].t < files[oldest].t) oldest = i;
+        for (int i = 1; i < n; i++) if (files[i].idx < files[oldest].idx) oldest = i;
         char p1[300], p2[300];
         snprintf(p1, sizeof(p1), RECORDS_DIR "/%s", files[oldest].name);
+        if (unlink(p1) != 0) {
+            LOGE("rec", "cannot prune %s: %s", files[oldest].name, strerror(errno));
+            break;   /* the capture is still on disk: stop here and do not count it as removed */
+        }
+        LOGI("rec", "pruned %s", files[oldest].name);
         strcpy(p2, p1);
         char *dot = strrchr(p2, '.');
-        if (dot) { strcpy(dot, ".jsonl"); unlink(p2); }
-        unlink(p1);
-        LOGI("rec", "pruned %s", files[oldest].name);
+        if (dot) { strcpy(dot, ".jsonl"); unlink(p2); }   /* companion, removed only after the capture */
         files[oldest] = files[n-1];
         n--;
     }
@@ -169,24 +178,38 @@ static uint64_t last_frame_on_disk(int idx) {
     snprintf(p, sizeof(p), RECORDS_DIR "/rec_%06d.jsonl", idx);
     FILE *f = fopen(p, "rb");
     if (!f) return 0;
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
     long size = ftell(f);
-    fseek(f, size > 4096 ? size - 4096 : 0, SEEK_SET);
+    if (size < 0 || fseek(f, size > 4096 ? size - 4096 : 0, SEEK_SET) != 0) { fclose(f); return 0; }
     char tail[4097];
     size_t got = fread(tail, 1, sizeof(tail) - 1, f);
     fclose(f);
     tail[got] = 0;
     const char *last = NULL;
-    for (const char *q = tail; (q = strstr(q, "\"f\":")) != NULL; q += 4) last = q;
+    /* only a complete "f":N, field counts: a line cut by a power loss can end in a partial number */
+    for (const char *q = tail; (q = strstr(q, "\"f\":")) != NULL; q += 4) {
+        const char *d = q + 4;
+        while (*d >= '0' && *d <= '9') d++;
+        if (d > q + 4 && *d == ',') last = q;
+    }
     return last ? (uint64_t)strtoull(last + 4, NULL, 10) : 0;
 }
 
+static int sd_mounted(void);
+
 static int rotate(void) {
+    /* never create a capture unless the card is mounted (see sd_mounted) */
+    if (!sd_mounted()) {
+        LOGE("rec", "%s is not a mounted SD card; rotation skipped", SD_ROOT);
+        return -1;
+    }
     if (g_pcap) { fclose(g_pcap); g_pcap = NULL; }
     if (g_verd) { fclose(g_verd); g_verd = NULL; }
     g_bytes = 0;
 
     mkdir(RECORDS_DIR, 0755);
+    /* Prune before the new pair exists, so the ring can never delete the capture being written. */
+    prune_oldest((g_cfg.record_ring_files > 0 ? g_cfg.record_ring_files : 32) - 1);
     g_idx++;
     char pcap_path[320], verd_path[320];
     snprintf(pcap_path, sizeof(pcap_path), RECORDS_DIR "/rec_%06d.pcap", g_idx);
@@ -194,11 +217,19 @@ static int rotate(void) {
 
     /* O_EXCL: an existing capture is never truncated. */
     int pfd = open(pcap_path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    int pcap_errno = errno;   /* saved right after the open: access() and fopen() below can overwrite errno */
+    int created_pcap = (pfd >= 0);
     g_pcap = (pfd >= 0) ? fdopen(pfd, "wb") : NULL;
     if (pfd >= 0 && !g_pcap) close(pfd);
+    int verd_existed = (access(verd_path, F_OK) == 0);
     g_verd = fopen(verd_path, "ab");
     if (!g_pcap || !g_verd) {
-        LOGE("rec", "open rotation files failed: %s", strerror(errno));
+        LOGE("rec", "open rotation files failed: %s", strerror(pcap_errno));
+        /* close whichever half opened, and remove only the files this call created */
+        if (g_pcap) { fclose(g_pcap); g_pcap = NULL; }
+        if (g_verd) { fclose(g_verd); g_verd = NULL; }
+        if (created_pcap) unlink(pcap_path);
+        if (!verd_existed) unlink(verd_path);
         return -1;
     }
     setvbuf(g_pcap, NULL, _IOFBF, 32 * 1024);
@@ -209,12 +240,22 @@ static int rotate(void) {
         .thiszone = 0, .sigfigs = 0,
         .snaplen = 65535, .network = 1 /* DLT_EN10MB */
     };
-    fwrite(&h, sizeof(h), 1, g_pcap);
-    fflush(g_pcap);
-
-    prune_oldest(g_cfg.record_ring_files > 0 ? g_cfg.record_ring_files : 32);
+    if (fwrite(&h, sizeof(h), 1, g_pcap) != 1 || fflush(g_pcap) != 0) {
+        LOGE("rec", "pcap header write failed: %s", strerror(errno));
+        fclose(g_pcap); g_pcap = NULL;
+        fclose(g_verd); g_verd = NULL;
+        unlink(pcap_path);
+        if (!verd_existed) unlink(verd_path);
+        return -1;
+    }
     LOGI("rec", "rotated to rec_%06d.{pcap,jsonl}", g_idx);
     return 0;
+}
+
+/* Logs the first failed verdict write; later failures stay quiet. */
+static void verdict_write_failed(void) {
+    static int warned;
+    if (!warned) { warned = 1; LOGE("rec", "verdict write failed: %s", strerror(errno)); }
 }
 
 static void write_verdict_json(uint64_t frame, uint32_t ts_sec, uint32_t ts_us,
@@ -228,12 +269,16 @@ static void write_verdict_json(uint64_t frame, uint32_t ts_sec, uint32_t ts_us,
     if (caplen >= 14 && eth[12] == 0x08 && eth[13] == 0x00 && caplen >= 34) {
         const struct iphdr *ip = (const struct iphdr *)(eth + 14);
         flow = ip->saddr ^ ip->daddr;
-        if (ip->protocol == IPPROTO_TCP && caplen >= 54) {
-            const struct tcphdr *t = (const struct tcphdr *)((uint8_t *)ip + ip->ihl * 4);
-            flow ^= (uint32_t)t->source ^ ((uint32_t)t->dest << 16);
-        } else if (ip->protocol == IPPROTO_UDP && caplen >= 42) {
-            const struct udphdr *u = (const struct udphdr *)((uint8_t *)ip + ip->ihl * 4);
-            flow ^= (uint32_t)u->source ^ ((uint32_t)u->dest << 16);
+        /* ports are the first 4 bytes of the L4 header, which starts at 14 + IHL*4 */
+        size_t l4 = 14 + (size_t)ip->ihl * 4;
+        if (ip->ihl >= 5 && caplen >= l4 + 4) {
+            if (ip->protocol == IPPROTO_TCP) {
+                const struct tcphdr *t = (const struct tcphdr *)(eth + l4);
+                flow ^= (uint32_t)t->source ^ ((uint32_t)t->dest << 16);
+            } else if (ip->protocol == IPPROTO_UDP) {
+                const struct udphdr *u = (const struct udphdr *)(eth + l4);
+                flow ^= (uint32_t)u->source ^ ((uint32_t)u->dest << 16);
+            }
         }
     }
 
@@ -249,9 +294,22 @@ static void write_verdict_json(uint64_t frame, uint32_t ts_sec, uint32_t ts_us,
             "{\"f\":%llu,\"t\":%u.%06u,\"sz\":%u,\"flow\":\"%08x\"}\n",
             (unsigned long long)frame, ts_sec, ts_us, caplen, flow);
     }
+    if (ferror(g_verd)) verdict_write_failed();
 }
 
-static void *rec_worker(void *arg) {
+/* Set by the recorder thread; recorder_start() waits for g_ready. */
+static pthread_mutex_t g_ctl_mu = PTHREAD_MUTEX_INITIALIZER;   /* serializes recorder start and stop */
+static int g_joinable = 0;   /* a worker was created and has not been joined yet */
+static int g_ready = 0;      /* the worker has its socket and its first file */
+
+/* Monotonic seconds for the retry gate: a wall-clock step must not stretch or cut the 10 s wait. */
+static time_t mono_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
+static void *rec_worker_body(void *arg) {
     (void)arg;
 
     const char *ifn = "br0";
@@ -264,6 +322,8 @@ static void *rec_worker(void *arg) {
     sa.sll_family   = AF_PACKET;
     sa.sll_protocol = htons(ETH_P_ALL);
     sa.sll_ifindex  = if_nametoindex(ifn);
+    /* index 0 would bind to every interface, so refuse it instead */
+    if (sa.sll_ifindex == 0) { LOGE("rec", "no capture interface %s", ifn); close(s); return NULL; }
     if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         LOGE("rec", "bind %s: %s", ifn, strerror(errno));
         close(s); return NULL;
@@ -277,18 +337,28 @@ static void *rec_worker(void *arg) {
     memset(&mr, 0, sizeof(mr));
     mr.mr_ifindex = sa.sll_ifindex;
     mr.mr_type    = PACKET_MR_PROMISC;
-    setsockopt(s, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr, sizeof(mr));
+    if (setsockopt(s, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mr, sizeof(mr)) != 0)
+        LOGW("rec", "promiscuous mode on %s: %s", ifn, strerror(errno));
 
     /* Continue the file index and frame numbers from what is already on the SD card. */
     g_idx = highest_index_on_disk();
     __atomic_store_n(&g_frame, last_frame_on_disk(g_idx), __ATOMIC_RELAXED);
 
     if (rotate() < 0) { close(s); return NULL; }
+    __atomic_store_n(&g_ready, 1, __ATOMIC_RELEASE);   /* recorder_start() may report success now */
 
     uint8_t buf[65536];
+    time_t last_try = 0;
     while (g_run) {
-        ssize_t n = recv(s, buf, sizeof(buf), 0);
+        /* A failed rotate() leaves no capture open: retry every 10 s, on every pass,
+         * including the idle passes where recv() times out. */
+        if (!g_pcap) {
+            time_t now = mono_seconds();
+            if (now - last_try >= 10) { last_try = now; rotate(); }
+        }
+        ssize_t n = recv(s, buf, sizeof(buf), MSG_TRUNC);   /* MSG_TRUNC: n is the real frame length */
         if (n <= 0) continue;
+        size_t cap = (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf);
 
         struct timeval tv;
         gettimeofday(&tv, NULL);
@@ -298,20 +368,25 @@ static void *rec_worker(void *arg) {
         struct pcap_rec r;
         r.ts_sec  = (uint32_t)tv.tv_sec;
         r.ts_usec = (uint32_t)tv.tv_usec;
-        r.caplen  = (uint32_t)n;
+        r.caplen  = (uint32_t)cap;
         r.len     = (uint32_t)n;
-        /* A failed rotate() leaves g_pcap NULL: drop frames instead of writing to it. */
-        if (!g_pcap) continue;
-        fwrite(&r, sizeof(r), 1, g_pcap);
-        fwrite(buf, (size_t)n, 1, g_pcap);
-        g_bytes += sizeof(r) + (size_t)n;
+        if (!g_pcap) continue;   /* no capture open: the frame is dropped */
+        if (fwrite(&r, sizeof(r), 1, g_pcap) != 1 || fwrite(buf, cap, 1, g_pcap) != 1) {
+            /* card full or removed: log once. Close the pair, so a half-written record ends its file. */
+            static int warned;
+            if (!warned) { warned = 1; LOGE("rec", "pcap write failed: %s", strerror(errno)); }
+            fclose(g_pcap); g_pcap = NULL;
+            if (g_verd) { fclose(g_verd); g_verd = NULL; }
+            continue;
+        }
+        g_bytes += sizeof(r) + cap;
 
         write_verdict_json(fr, r.ts_sec, r.ts_usec, r.caplen, buf);
 
         size_t rot = (size_t)g_cfg.record_rotate_mb * 1024 * 1024;
         if (rot && g_bytes >= rot) {
             fflush(g_pcap);
-            if (rotate() < 0) LOGE("rec", "rotation failed: pcap writes stopped until restart");
+            if (rotate() < 0) LOGE("rec", "rotation failed, will retry");
         }
     }
     close(s);
@@ -322,21 +397,80 @@ static void *rec_worker(void *arg) {
 
 static int g_started = 0;   /* set only while a worker thread exists */
 
-int recorder_start(void) {
+/* The thread clears g_started on every exit, including the early ones, so a
+ * worker that dies at start (a failed rotate on a read-only card, say) no
+ * longer makes the recorder look running. */
+static void *rec_worker(void *arg) {
+    void *r = rec_worker_body(arg);
+    __atomic_store_n(&g_started, 0, __ATOMIC_RELEASE);
+    return r;
+}
+
+/* True only when the SD card is mounted at SD_ROOT. Without this, captures
+ * land on the root filesystem and fill it. */
+static int sd_mounted(void) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return 0;
+    char dev[128], mnt[256];
+    int found = 0;
+    while (!found && fscanf(f, "%127s %255s %*[^\n]", dev, mnt) == 2) {
+        if (strcmp(mnt, SD_ROOT) == 0) found = 1;
+    }
+    fclose(f);
+    return found;
+}
+
+static void stop_worker_locked(void);
+
+static int recorder_start_locked(void) {
     if (!g_cfg.log_to_sd) { LOGI("rec", "disabled"); return 0; }
-    if (g_started) return 0;
+    if (__atomic_load_n(&g_started, __ATOMIC_ACQUIRE)) return 0;
+    if (!sd_mounted()) {
+        LOGE("rec", "%s is not a mounted SD card; recording not started", SD_ROOT);
+        return -1;
+    }
+    if (g_joinable) { pthread_join(g_t, NULL); g_joinable = 0; }   /* reap the previous worker first */
     mkdir(SD_ROOT, 0755);
     mkdir(RECORDS_DIR, 0755);
     g_run = 1;
-    if (pthread_create(&g_t, NULL, rec_worker, NULL) != 0) { g_run = 0; return -1; }
-    g_started = 1;
+    __atomic_store_n(&g_ready, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_started, 1, __ATOMIC_RELEASE);   /* set before the thread can run and clear it */
+    if (pthread_create(&g_t, NULL, rec_worker, NULL) != 0) {
+        __atomic_store_n(&g_started, 0, __ATOMIC_RELEASE);
+        g_run = 0;
+        return -1;
+    }
+    g_joinable = 1;
+    /* success once the worker has its socket and first file; a worker that exits first is a failure */
+    for (int i = 0; i < 300 && __atomic_load_n(&g_started, __ATOMIC_ACQUIRE) &&
+                    !__atomic_load_n(&g_ready, __ATOMIC_ACQUIRE); i++)
+        usleep(10 * 1000);
+    if (!__atomic_load_n(&g_ready, __ATOMIC_ACQUIRE)) {
+        stop_worker_locked();
+        LOGE("rec", "recording did not start (see the lines above)");
+        return -1;
+    }
     return 0;
 }
 
-int recorder_stop(void) {
-    if (!g_started) return 0;   /* never join a thread that was not created */
+/* Stops the worker and joins it. The caller holds g_ctl_mu. */
+static void stop_worker_locked(void) {
     g_run = 0;
-    pthread_join(g_t, NULL);
-    g_started = 0;
+    if (g_joinable) { pthread_join(g_t, NULL); g_joinable = 0; }   /* join only a thread that was created */
+    __atomic_store_n(&g_started, 0, __ATOMIC_RELEASE);
+}
+
+int recorder_stop(void) {
+    pthread_mutex_lock(&g_ctl_mu);
+    stop_worker_locked();
+    pthread_mutex_unlock(&g_ctl_mu);
     return 0;
+}
+
+/* The supervisor and the PANIC path both start and stop the recorder; g_ctl_mu makes them take turns. */
+int recorder_start(void) {
+    pthread_mutex_lock(&g_ctl_mu);
+    int rc = recorder_start_locked();
+    pthread_mutex_unlock(&g_ctl_mu);
+    return rc;
 }

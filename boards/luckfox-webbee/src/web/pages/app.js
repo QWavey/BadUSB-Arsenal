@@ -14,7 +14,7 @@ async function refreshStatus() {
   const s = await api('/api/status');
   if (typeof s === 'string') { $('#status').textContent = s; return; }
   $('#status').innerHTML = `
-    <div><b>${esc(s.name)}</b> &nbsp;·&nbsp; host <code>${esc(s.hostname)}</code> &nbsp;·&nbsp; cfg-gen ${s.cfg_gen}</div>
+    <div><b>${esc(s.name)}</b> &nbsp;·&nbsp; host <code>${esc(s.hostname)}</code> &nbsp;·&nbsp; cfg-gen ${esc(s.cfg_gen)}</div>
     <div style="margin-top:10px">
       netmode: <b>${esc(s.netmode)}</b> · usb: <b>${esc(s.usb_mode)}</b>
       · passthrough: ${s.passthrough ? '✔' : '✘'}
@@ -42,16 +42,31 @@ async function refreshRecords() {
     <th style="text-align:left">file</th><th>size</th><th>last change</th></tr>${rows}</table>`;
 }
 
-async function loadCfg() {
-  const t = await api('/api/config');
-  $('#cfg').value = typeof t === 'string' ? t : JSON.stringify(t);
+// Reads config.txt. Throws on an error reply, so no error text ends up in the editor.
+// A 404 counts as an empty file only when missingOk is set, so a toggle never rewrites a file it could not read.
+async function configText(missingOk = false) {
+  const r = await fetch('/api/config');
+  if (r.status === 404 && missingOk) return '';   // a missing config.txt loads as an empty editor
+  if (!r.ok) throw new Error('GET /api/config ' + r.status);
+  // fatal: an invalid byte throws instead of being silently replaced
+  const buf = await r.arrayBuffer();
+  return new TextDecoder('utf-8', { fatal: true }).decode(buf);
 }
 
-async function saveCfg() {
-  const body = $('#cfg').value;
-  const r = await api('/api/config', { method: 'POST', body });
-  if (r.ok) { refreshStatus(); flash('config saved', 'ok'); }
-  else      { flash('save failed', 'danger'); }
+function loadCfg() {
+  return enqueue(async () => {
+    try { $('#cfg').value = await configText(true); }
+    catch (e) { flash('config.txt could not be read', 'danger'); }
+  });
+}
+
+function saveCfg() {
+  return enqueue(async () => {
+    const body = $('#cfg').value;
+    const r = await api('/api/config', { method: 'POST', body });
+    if (r && r.ok === true) { refreshStatus(); flash('config saved', 'ok'); }
+    else                    { flash('save failed', 'danger'); }
+  });
 }
 
 async function runQuery() {
@@ -72,27 +87,50 @@ async function runHid() {
 // Booleans follow the firmware rules: TRUE, YES, ON or 1, in any case.
 const TRUTHY = ['TRUE', 'YES', 'ON', '1'];
 
-async function toggleKey(key) {
-  const t = await api('/api/config');
-  if (typeof t !== 'string') return;
+// Config reads and writes run one at a time, so a reload, a save and a toggle never overlap.
+let configQueue = Promise.resolve();
+function enqueue(fn) {
+  configQueue = configQueue.then(() => {
+    // a stalled request must not block the queue forever: the job is raced against a 10 s timer that rejects
+    // the timer starts when the job starts, not while it waits in the queue
+    let timer;
+    const limit = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 10000); });
+    return Promise.race([fn(), limit]).finally(() => clearTimeout(timer));
+  }).catch(() => flash('config request failed', 'danger'));
+  return configQueue;
+}
+
+// Documented defaults of the toggles. A missing, blank or unknown value means the default.
+const DEFAULT_ON = { LOG_TO_SD: true };
+const FALSY = ['FALSE', 'NO', 'OFF', '0'];
+
+function toggleKey(key) { return enqueue(() => toggleKeyNow(key)); }
+
+async function toggleKeyNow(key) {
+  const t = await configText();
   const eol = t.includes('\r\n') ? '\r\n' : '\n';   // keep the file's line endings
   const lines = t.split(/\r?\n/);
-  const keyRe = new RegExp('^\\s*' + key + '\\s*=');
+  const keyRe = new RegExp('^\\s*' + key + '\\s*=', 'i');   // the firmware matches keys in any case
   let idx = -1;                                      // the last assignment wins
   lines.forEach((ln, i) => { if (keyRe.test(ln)) idx = i; });
   if (idx < 0) {
-    lines.push(`${key}=TRUE`);
+    lines.push(`${key}=${DEFAULT_ON[key] ? 'FALSE' : 'TRUE'}`);
   } else {
     const ln = lines[idx];
     const rest = ln.slice(ln.indexOf('=') + 1);
     // '#' starts a comment only at the start of the value or after whitespace
     const cut = rest.match(/(^|\s+)#/);
     const value = (cut ? rest.slice(0, cut.index) : rest).trim().toUpperCase();
-    const on = TRUTHY.includes(value);
+    const on = TRUTHY.includes(value) || (!FALSY.includes(value) && !!DEFAULT_ON[key]);
     const tail = !cut ? '' : (cut.index === 0 ? ' ' + rest : rest.slice(cut.index));
     lines[idx] = `${key}=${on ? 'FALSE' : 'TRUE'}${tail}`;
   }
-  await api('/api/config', { method: 'POST', body: lines.join(eol) });
+  const next = lines.join(eol);
+  const r = await api('/api/config', { method: 'POST', body: next });
+  if (!r || r.ok !== true) throw new Error('POST /api/config failed');
+  // the textarea holds LF line endings: compare and update in that form, and never overwrite unsaved edits
+  const lf = s => s.replace(/\r\n/g, '\n');
+  if ($('#cfg').value === lf(t)) $('#cfg').value = lf(next);
   refreshStatus();
 }
 

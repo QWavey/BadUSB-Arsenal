@@ -171,8 +171,10 @@ int gadget_start(void) {
 
         char link[320], target[320];
         snprintf(link, sizeof(link),   GROOT "/configs/c.1/%s", fname);
-        snprintf(target, sizeof(target), "../functions/%s", fname);
-        symlink(target, link);
+        snprintf(target, sizeof(target), GROOT "/functions/%s", fname);
+        if (symlink(target, link) != 0 && errno != EEXIST) {
+            LOGE("gadget", "symlink %s into c.1: %s", fname, strerror(errno));
+        }
     }
 
     /* --- HID keyboard --- */
@@ -183,7 +185,9 @@ int gadget_start(void) {
         wfprintf(GROOT "/functions/hid.usb0/report_length", "8");
         write_binary(GROOT "/functions/hid.usb0/report_desc",
                      HID_KEYBOARD_DESC, sizeof(HID_KEYBOARD_DESC));
-        symlink("../functions/hid.usb0", GROOT "/configs/c.1/hid.usb0");
+        if (symlink(GROOT "/functions/hid.usb0", GROOT "/configs/c.1/hid.usb0") != 0 && errno != EEXIST) {
+            LOGE("gadget", "symlink hid.usb0 into c.1: %s", strerror(errno));
+        }
     }
 
     /* --- Mass storage --- */
@@ -192,7 +196,9 @@ int gadget_start(void) {
         wf(GROOT "/functions/mass_storage.usb0/lun.0/file", "/dev/mmcblk0");
         wf(GROOT "/functions/mass_storage.usb0/lun.0/ro",   "0");
         wf(GROOT "/functions/mass_storage.usb0/lun.0/removable", "1");
-        symlink("../functions/mass_storage.usb0", GROOT "/configs/c.1/mass_storage.usb0");
+        if (symlink(GROOT "/functions/mass_storage.usb0", GROOT "/configs/c.1/mass_storage.usb0") != 0 && errno != EEXIST) {
+            LOGE("gadget", "symlink mass_storage.usb0 into c.1: %s", strerror(errno));
+        }
     }
 
     /* --- Bind UDC --- */

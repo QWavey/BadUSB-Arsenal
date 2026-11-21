@@ -16,13 +16,18 @@
 static svc_t *g_svc[MAX_SVC];
 static int    g_svc_n = 0;
 
+int supervisor_stop_all(void);
+
 int supervisor_init(void) {
+    supervisor_stop_all();   /* a re-init must not orphan running services */
     g_svc_n = 0;
     return 0;
 }
 
 int supervisor_register(svc_t *s) {
     if (g_svc_n >= MAX_SVC) return -1;
+    for (int i = 0; i < g_svc_n; i++)
+        if (g_svc[i] == s) return -1;   /* already registered: a second entry would be counted twice by start_all */
     g_svc[g_svc_n++] = s;
     s->running = 0;
     return 0;
@@ -37,6 +42,7 @@ int supervisor_start_all(void) {
     int ok = 0;
     for (int i = 0; i < g_svc_n; i++) {
         svc_t *s = g_svc[i];
+        if (s->running) { ok++; continue; }   /* already up: a second start_all must not start it twice */
         if (!should_run(s)) continue;
         LOGI("svc", "start %s", s->name);
         int r = s->start ? s->start() : 0;
@@ -59,17 +65,23 @@ int supervisor_stop_all(void) {
 
 int supervisor_reconcile(void) {
     int changes = 0;
-    for (int i = 0; i < g_svc_n; i++) {
+    /* stop first, in reverse registration order as stop_all does; then start, in order */
+    for (int i = g_svc_n - 1; i >= 0; i--) {
         svc_t *s = g_svc[i];
-        int want = should_run(s);
-        if (want && !s->running) {
-            LOGI("svc", "reconcile: starting %s", s->name);
-            if (s->start && s->start() == 0) { s->running = 1; changes++; }
-        } else if (!want && s->running) {
+        if (s->running && !should_run(s)) {
             LOGI("svc", "reconcile: stopping %s", s->name);
             if (s->stop) s->stop();
             s->running = 0;
             changes++;
+        }
+    }
+    for (int i = 0; i < g_svc_n; i++) {
+        svc_t *s = g_svc[i];
+        if (!s->running && should_run(s)) {
+            LOGI("svc", "reconcile: starting %s", s->name);
+            int r = s->start ? s->start() : 0;
+            if (r == 0) { s->running = 1; changes++; }
+            else        LOGE("svc", "%s start failed: %d", s->name, r);
         }
     }
     return changes;

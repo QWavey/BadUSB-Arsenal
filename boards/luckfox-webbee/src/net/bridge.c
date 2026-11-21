@@ -43,9 +43,16 @@ static int ifpresent(const char *name) {
 
 static int ipforward(int on) {
     int fd = open("/proc/sys/net/ipv4/ip_forward", O_WRONLY);
-    if (fd < 0) return -1;
-    write(fd, on ? "1" : "0", 1);
+    if (fd < 0) {
+        LOGW("bridge", "cannot open ip_forward (want %d)", on);
+        return -1;
+    }
+    ssize_t n = write(fd, on ? "1" : "0", 1);
     close(fd);
+    if (n != 1) {
+        LOGW("bridge", "cannot write ip_forward (want %d)", on);
+        return -1;
+    }
     return 0;
 }
 
@@ -117,7 +124,8 @@ int bridge_start(void) {
             sys(c);
         }
     } else {
-        LOGW("bridge", "unknown NETMODE=%s, defaulting to BRIDGE", mode);
+        LOGE("bridge", "NETMODE=%s not implemented, no bridge set up", mode);
+        return -1;
     }
 
     if (g_cfg.assign_ip && ifpresent(lan) &&
@@ -133,9 +141,10 @@ int bridge_start(void) {
                  "udhcpd -S -f /etc/ghostlink/udhcpd.conf >/dev/null 2>&1 &");
         /* generate udhcpd.conf on the fly */
         mkdir("/etc/ghostlink", 0755);
+        int conf_ok = 0;
         FILE *f = fopen("/etc/ghostlink/udhcpd.conf", "w");
         if (f) {
-            fprintf(f,
+            int wr = fprintf(f,
                 "start   %s\n"
                 "end     %s\n"
                 "interface usb0\n"
@@ -146,9 +155,14 @@ int bridge_start(void) {
                 "lease_file /tmp/udhcpd.leases\n", rs, re,
                 g_cfg.gateway_ip,
                 g_cfg.dns_upstream[0] ? g_cfg.dns_upstream : "1.1.1.1");
-            fclose(f);
+            int cl = fclose(f);
+            conf_ok = (wr >= 0 && cl == 0);
         }
-        sys(cmd);
+        if (conf_ok) {
+            sys(cmd);
+        } else {
+            LOGE("bridge", "udhcpd.conf not written, udhcpd not started");
+        }
     }
 
     if (g_cfg.mac_clone && g_cfg.mac_clone_from[0]) {

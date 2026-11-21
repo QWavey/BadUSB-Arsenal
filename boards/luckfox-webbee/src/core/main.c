@@ -43,7 +43,7 @@
 #define SD_MNT   "/mnt/sd"
 #define CFG_PATH SD_MNT "/config.txt"
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 
 static void on_sig(int s) {
     (void)s;
@@ -52,8 +52,6 @@ static void on_sig(int s) {
 
 /* Mount SD. Try FAT first, then ext4. mkdir everything we need. */
 static int mount_sd(void) {
-    mkdir("/mnt", 0755);
-    mkdir(SD_MNT, 0755);
 
     struct stat st;
     if (stat(SD_DEV, &st) != 0) {
@@ -61,6 +59,8 @@ static int mount_sd(void) {
         return -1;
     }
 
+    mkdir("/mnt", 0755);   /* only with a card present, so nothing is created on the root filesystem otherwise */
+    mkdir(SD_MNT, 0755);
     if (mount(SD_DEV, SD_MNT, "vfat", 0, "iocharset=utf8") == 0) {
         LOGI("boot", "SD mounted (vfat)");
         return 0;
@@ -116,14 +116,18 @@ static long now_ms(void) {
 }
 
 static int read_button(void) {
-    static int fd = -2;
-    if (fd == -2) {
-        /* Try a couple of plausible paths */
-        fd = open("/sys/class/gpio/BACK/value", O_RDONLY);
-        if (fd < 0) fd = open("/dev/input/button", O_RDONLY);
-        if (fd < 0) fd = -1;
+    static int fd = -1;
+    static long next_try = 0;
+    if (fd < 0) {
+        /* Try a couple of plausible paths. The node can appear after boot, so retry every 5 s. */
+        long now = now_ms();
+        if (now >= next_try) {
+            next_try = now + 5000;
+            fd = open("/sys/class/gpio/BACK/value", O_RDONLY);
+            if (fd < 0) fd = open("/dev/input/button", O_RDONLY);
+        }
+        if (fd < 0) return 1;
     }
-    if (fd < 0) return 1;
     char c = 1;
     lseek(fd, 0, SEEK_SET);
     read(fd, &c, 1);
@@ -135,6 +139,7 @@ static void *btn_worker(void *arg) {
     int taps = 0;
     long first_tap = 0, last_edge = 0;
     int was_down = 0;
+    int panic_fired = 0;   /* the scrub runs once per press, even if reboot() returns */
     long press_start = 0;
 
     while (g_btn_run) {
@@ -149,18 +154,23 @@ static void *btn_worker(void *arg) {
             last_edge = t;
         } else if (v && was_down) {
             was_down = 0;
+            panic_fired = 0;   /* the next long hold may fire again */
         }
 
         /* long hold -> panic */
-        if (was_down && g_cfg.panic_hold_s > 0 &&
+        if (was_down && !panic_fired && g_cfg.panic_hold_s > 0 &&
             (t - press_start) > (long)g_cfg.panic_hold_s * 1000) {
+            panic_fired = 1;
             LOGW("btn", "PANIC hold — scrub + reboot");
             if (g_cfg.panic_scrub) {
+                recorder_stop();   /* no capture writer may race the scrub */
                 system("find /mnt/sd/Records -type f -exec shred -u -n 1 {} \\; 2>/dev/null");
                 system("rm -rf /mnt/sd/Records /mnt/sd/Loot /mnt/sd/Logs/*.log");
             }
             sync();
             reboot(RB_AUTOBOOT);
+            /* reboot() returned, so it failed: put recording back the way it was */
+            if (g_cfg.log_to_sd) recorder_start();
         }
 
         /* tap window closed -> dispatch */
@@ -208,6 +218,18 @@ static svc_t SVC_DEADNET  = { "deadnet",  deadnet_start,  deadnet_stop,  1, &g_c
 static svc_t SVC_REDIRECT = { "redirect", redirect_start, redirect_stop, 1, &g_cfg.redirect, 0 };
 static svc_t SVC_HID      = { "hid",      hid_start,      hid_stop,      1, &g_cfg.hid_enabled, 0 };
 
+/* LOG_LEVEL and the log file. Runs at boot and after every config change. */
+static void apply_log_settings(void) {
+    log_level_t ll = LL_INFO;
+    if      (!strcasecmp(g_cfg.log_level, "DEBUG")) ll = LL_DEBUG;
+    else if (!strcasecmp(g_cfg.log_level, "WARN"))  ll = LL_WARN;
+    else if (!strcasecmp(g_cfg.log_level, "ERROR")) ll = LL_ERROR;
+
+    char logfile[256];
+    snprintf(logfile, sizeof(logfile), "%s%s", SD_MNT, g_cfg.log_to_sd_file);
+    log_init(ll, logfile, g_cfg.log_to_serial);
+}
+
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
     signal(SIGINT,  on_sig);
@@ -219,20 +241,12 @@ int main(int argc, char **argv) {
     log_init(LL_INFO, NULL, 1);
     LOGI("boot", "GhostLink firmware starting");
 
-    mount_sd();
-    ensure_sd_skeleton();
+    /* the SD card is optional: without one, nothing is created on the root filesystem */
+    if (mount_sd() == 0) ensure_sd_skeleton();
 
+    cfg_set_default(&g_cfg);   /* defaults first, so an unreadable config still leaves usable settings */
     cfg_load(CFG_PATH);
-
-    log_level_t ll = LL_INFO;
-    if      (!strcasecmp(g_cfg.log_level, "DEBUG")) ll = LL_DEBUG;
-    else if (!strcasecmp(g_cfg.log_level, "WARN"))  ll = LL_WARN;
-    else if (!strcasecmp(g_cfg.log_level, "ERROR")) ll = LL_ERROR;
-
-    char logfile[256];
-    snprintf(logfile, sizeof(logfile), "%s%s", SD_MNT, g_cfg.log_to_sd_file);
-    log_close();
-    log_init(ll, logfile, g_cfg.log_to_serial);
+    apply_log_settings();
 
     /* hostname / mdns name */
     if (g_cfg.hostname[0]) sethostname(g_cfg.hostname, strlen(g_cfg.hostname));
@@ -254,7 +268,8 @@ int main(int argc, char **argv) {
 
     /* button */
     g_btn_run = 1;
-    pthread_create(&g_btn_t, NULL, btn_worker, NULL);
+    int btn_rc = pthread_create(&g_btn_t, NULL, btn_worker, NULL);
+    if (btn_rc != 0) LOGE("btn", "button thread not started: %s", strerror(btn_rc));
 
     LOGI("boot", "GhostLink ready in %ldms", now_ms() - t0);
 
@@ -265,6 +280,8 @@ int main(int argc, char **argv) {
         if (g != last_gen) {
             last_gen = g;
             LOGI("boot", "cfg generation %llu — reconcile", (unsigned long long)g);
+            apply_log_settings();   /* LOG_LEVEL and the log file follow the config without a reboot */
+            if (g_cfg.hostname[0]) sethostname(g_cfg.hostname, strlen(g_cfg.hostname));
             supervisor_reconcile();
         }
         sleep(1);
@@ -272,7 +289,7 @@ int main(int argc, char **argv) {
 
     LOGI("boot", "shutting down");
     g_btn_run = 0;
-    pthread_join(g_btn_t, NULL);
+    if (btn_rc == 0) pthread_join(g_btn_t, NULL);   /* joining a thread that never started is undefined */
     supervisor_stop_all();
     bridge_stop();
     gadget_stop();

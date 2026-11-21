@@ -1,0 +1,60 @@
+#!/bin/sh
+# GhostLink: decide HID for this boot, before S50usbdevice builds the USB gadget.
+#
+# HID is on for a boot only when all of these hold:
+#   - ENABLE_HID=TRUE in /root/ghostlink/config.txt
+#   - the SD card is mounted at /mnt/sdcard
+#   - there is no HID_OFF file in the root of the SD card (the recovery switch)
+#
+# Recovery: if HID stops the device from enumerating, power it off, put the SD
+# card in a PC, create an empty file named HID_OFF in the card's root, put the
+# card back and power on. HID stays off for that boot. Pulling the card also
+# leaves HID off, because the card is needed for HID to turn on.
+#
+# The decision is the flag file /tmp/ghost-hid-on. /tmp is a tmpfs, so the flag
+# is recomputed every boot. S50usbdevice sets HID_EN=on when the flag exists
+# (one line, added on the device). No flag means HID stays off, as before.
+
+FLAG=/tmp/ghost-hid-on
+CFG=/root/ghostlink/config.txt
+LOG=/root/ghostlink/logs/ghostlink.log
+SD=/mnt/sdcard
+
+say() {
+    echo "$(date +%H:%M:%S) ghostlink hid-boot: $1" >> "$LOG" 2>/dev/null
+}
+
+case "$1" in
+start)
+    rm -f "$FLAG"
+
+    # The SD card is mounted by S20linkmount; wait a little in case it is late.
+    waited=0
+    while ! grep -q " $SD " /proc/mounts && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! grep -q " $SD " /proc/mounts; then
+        say "SD card not mounted at $SD; HID off for this boot"
+        exit 0
+    fi
+
+    if [ -e "$SD/HID_OFF" ]; then
+        say "recovery switch $SD/HID_OFF present; HID off for this boot"
+        exit 0
+    fi
+
+    want=$(grep -i '^ENABLE_HID=' "$CFG" 2>/dev/null | tail -n 1 | cut -d= -f2 | cut -d'#' -f1 | tr -d ' \r' | tr '[:lower:]' '[:upper:]')
+    case "$want" in
+    TRUE|YES|ON|1)
+        touch "$FLAG"
+        say "ENABLE_HID=TRUE; HID on for this boot (usb_hid_en path)"
+        ;;
+    *)
+        say "ENABLE_HID is not TRUE; HID off for this boot"
+        ;;
+    esac
+    ;;
+esac
+
+exit 0

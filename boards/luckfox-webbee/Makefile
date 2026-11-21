@@ -18,7 +18,7 @@ CC    := gcc
 STRIP := strip
 endif
 
-OUT       := out
+OUT       := $(if $(filter host,$(MAKECMDGOALS)),out-host,out)
 BIN       := $(OUT)/ghostlink
 
 CFLAGS    := -Os -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation \
@@ -50,6 +50,9 @@ all: $(BIN)
 
 host: all
 
+src/web/pages_embed.c: scripts/embed.py scripts/embed.sh $(wildcard src/web/pages/*)
+	sh scripts/embed.sh
+
 $(BIN): $(OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -65,16 +68,16 @@ install: all
 	mkdir -p $(SYSROOT)/usr/sbin
 	cp $(BIN) $(SYSROOT)/usr/sbin/ghostlink
 	mkdir -p $(SYSROOT)/etc/init.d
-	cp overlay/etc/init.d/S99ghost $(SYSROOT)/etc/init.d/
+	tr -d '\r' < overlay/etc/init.d/S99ghost > $(SYSROOT)/etc/init.d/S99ghost
 	chmod +x $(SYSROOT)/etc/init.d/S99ghost
 
 pack: all
 	mkdir -p dist
-	cp -r sdcard-template dist/sd
+	rm -rf dist/sd dist/ghostlink-sd.zip && cp -r sdcard-template dist/sd && find dist/sd -type f -exec sed -i 's/\r$$//' {} +
 	cp $(BIN) dist/sd/ghostlink
 	cd dist && zip -r ghostlink-sd.zip sd && echo "built dist/ghostlink-sd.zip"
 
 clean:
-	rm -rf $(OUT) dist
+	rm -rf out out-host dist
 
 .PHONY: all host install pack clean

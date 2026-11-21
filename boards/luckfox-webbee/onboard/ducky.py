@@ -106,6 +106,8 @@ def load_layout(name):
         if k.startswith("__"): continue
         m, kc = parse_entry(v)
         if m == 0 and kc == 0 and not isinstance(v, (list, str)): continue
+        if not (0 <= m <= 255 and 0 <= kc <= 255):
+            _cfg_log(f"warning: layout {name}: {k}={v!r} outside 0-255, skipped"); continue
         out[k] = (m, kc)
     return out
 
@@ -127,7 +129,8 @@ def press(fd, mod, k1, k2=0, dwell_ms: int = 3):
     on the German layout like the comma "hanging" (the . → , transition
     appeared to drop keys)."""
     global _PRESS_FAIL_LOGGED
-    rep = bytes([mod, 0, k1, k2, 0, 0, 0, 0])
+    try: rep = bytes([mod, 0, k1, k2, 0, 0, 0, 0])
+    except ValueError: _cfg_log(f"press() key out of range mod={mod} k1={k1} k2={k2}"); return
     try:
         os.write(fd, rep)
         if dwell_ms: time.sleep(dwell_ms / 1000.0)
@@ -158,19 +161,44 @@ def _tl_emit(kind, **fields):
         tl.parent.mkdir(parents=True, exist_ok=True)
         rec = {"t": int(time.time()), "ts": time.strftime("%H:%M:%S"), "kind": kind}
         rec.update(fields)
+        if "cmd" in rec: rec["cmd"] = str(rec["cmd"])[:40]   # cap the cmd field
         # same 2MB cap behavior as webui's _timeline
         if tl.exists() and tl.stat().st_size > 2 * 1024 * 1024:
-            try: tl.write_bytes(tl.read_bytes()[-512*1024:])
+            try:
+                kept = tl.read_bytes()[-512*1024:]
+                nl = kept.find(b"\n")   # first newline: everything before it is a cut-off record
+                tl.write_bytes(kept[nl + 1:] if nl >= 0 else b"")   # file starts at a record boundary
             except Exception: pass
         import json as _json
         with open(tl, "a") as f:
-            f.write(_json.dumps(rec)[:1024] + "\n")
+            f.write(_json.dumps(rec) + "\n")   # whole JSON line: never sliced mid-record
     except Exception: pass
 
 
+# Limits that stop a runaway script. A payload that loops forever types forever, and the
+# device has no other way to stop it short of a reboot.
+MAX_STEPS = 100_000   # statements executed in one run
+MAX_DEPTH = 8         # payloads started by payloads (RUN_PAYLOAD, GL_RUN), in a chain
+
+
+class _Budget(BaseException):
+    """The step limit was reached. BaseException, so the line handlers do not swallow it."""
+
+
+class _BadScript(Exception):
+    """The script cannot run as written (unclosed block, runaway expansion)."""
+
+
+def _child_env():
+    """Environment for a payload started by a payload: one level deeper."""
+    env = dict(os.environ)
+    env["GL_DUCKY_DEPTH"] = str(int(os.environ.get("GL_DUCKY_DEPTH", "0") or 0) + 1)
+    return env
+
+
 def _ms(txt, default=0):
-    try: return int(str(txt).strip())
-    except (TypeError, ValueError): return default
+    try: return min(int(float(str(txt).strip())), 3_600_000)   # an hour at most: DELAY, REPEAT
+    except (TypeError, ValueError, OverflowError): return default   # OverflowError: int(float("inf"))
 
 
 # ============================================================================
@@ -186,7 +214,7 @@ def gl_set(key_value: str):
     except Exception: txt = ""
     pat = re.compile(r"^" + re.escape(key) + r"=.*$", re.MULTILINE)
     new_line = f"{key}={val}"
-    if pat.search(txt): txt = pat.sub(new_line, txt)
+    if pat.search(txt): txt = pat.sub(lambda _m: new_line, txt)   # function replacement: backslashes in val stay literal
     else:
         if txt and not txt.endswith("\n"): txt += "\n"
         txt += new_line + "\n"
@@ -201,8 +229,10 @@ def gl_set(key_value: str):
 
 def gl_reload_dnsmasq():
     try:
-        subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
-                       timeout=5, capture_output=True)
+        r = subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
+                           timeout=5, capture_output=True)
+        if r.returncode != 0:
+            _cfg_log(f"GL_RELOAD_DNSMASQ rc={r.returncode}"); return False
         _cfg_log("GL_RELOAD_DNSMASQ"); return True
     except Exception as e:
         _cfg_log(f"GL_RELOAD_DNSMASQ fail {e}"); return False
@@ -217,7 +247,7 @@ def gl_run_script(name: str):
         _cfg_log(f"GL_RUN not found '{name}'"); return False
     try:
         if name.endswith(".sh"): subprocess.Popen(["sh", str(p)])
-        else:                     subprocess.Popen(["python3", str(ROOT/"ducky.py"), str(p)])
+        else:                     subprocess.Popen(["python3", str(ROOT/"ducky.py"), str(p)], env=_child_env())
         _cfg_log(f"GL_RUN {name}"); return True
     except Exception as e:
         _cfg_log(f"GL_RUN fail {e}"); return False
@@ -274,8 +304,24 @@ _EXPR_TRANSLATE = [
     (r"\bFALSE\b", "False"),
     (r"&&",        " and "),
     (r"\|\|",      " or "),
+    (r"!(?!=)",    " not "),
 ]
 _SAFE_EVAL_NAMES = {"__builtins__": {}, "True": True, "False": False}
+_NOT_BUILTIN = object()   # _builtin() result for a name that is not a generated built-in
+
+# Quoted string literals, "..." or '...', with backslash escapes. What is inside
+# them is data, so the _EXPR_TRANSLATE rules must not rewrite it.
+_EXPR_STRING = re.compile(r"""("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')""")
+
+
+def _translate_expr(src):
+    """Apply _EXPR_TRANSLATE to the unquoted pieces of src only. Quoted pieces
+    are joined back unchanged, so "TRUE" or "a && b" keep their exact text."""
+    parts = _EXPR_STRING.split(src)      # even indices unquoted, odd indices quoted
+    for i in range(0, len(parts), 2):
+        for pat, rep in _EXPR_TRANSLATE:
+            parts[i] = re.sub(pat, rep, parts[i])
+    return "".join(parts)
 
 
 def _coerce(x):
@@ -328,6 +374,8 @@ class Interp:
             _cfg_log("extension include depth cap hit"); return
         i = 0
         while i < len(lines):
+            # A self-referencing EXTENSION doubles the output at every level, so bound the size.
+            if len(out) > MAX_STEPS: raise _BadScript("extensions expand past the step limit")
             raw = lines[i]; i += 1
             s = raw.strip()
             u = s.upper()
@@ -401,27 +449,35 @@ class Interp:
             out.append(raw)
 
     # -------- expression evaluation --------------------------------------
+    def _builtin(self, name):
+        """Value of a generated built-in ($_CAPSLOCK_ON, $_RANDOM_*, $_OS) as a
+        Python value, or _NOT_BUILTIN for any other name. _subst_vars and
+        _subst_string both resolve built-ins here, so the two cannot drift."""
+        if name == "_CAPSLOCK_ON":
+            with _LED_LOCK: return HID_LED_STATE["CAPSLOCK"]
+        if name == "_NUMLOCK_ON":
+            with _LED_LOCK: return HID_LED_STATE["NUMLOCK"]
+        if name == "_SCROLLLOCK_ON":
+            with _LED_LOCK: return HID_LED_STATE["SCROLLLOCK"]
+        if name == "_RANDOM_INT":              return self._rand.randint(0, 65535)
+        if name == "_RANDOM_SHORT":            return self._rand.randint(0, 65535)
+        if name == "_RANDOM_BYTE":             return self._rand.randint(0, 255)
+        if name == "_RANDOM_NUMBER":           return self._rand.randint(0, 9)
+        if name == "_RANDOM_LOWERCASE_LETTER": return self._rand.choice(string.ascii_lowercase)
+        if name == "_RANDOM_UPPERCASE_LETTER": return self._rand.choice(string.ascii_uppercase)
+        if name == "_RANDOM_LETTER":           return self._rand.choice(string.ascii_letters)
+        if name == "_OS":                      return self.vars.get("_OS", "UNKNOWN")
+        return _NOT_BUILTIN
+
     def _subst_vars(self, text):
         """Replace $NAME tokens with their values (int or quoted string).
         Supports $_RANDOM_* generators."""
         def repl(m):
             name = m.group(1).upper()
-            if name == "_CAPSLOCK_ON":
-                with _LED_LOCK: return "True" if HID_LED_STATE["CAPSLOCK"] else "False"
-            if name == "_NUMLOCK_ON":
-                with _LED_LOCK: return "True" if HID_LED_STATE["NUMLOCK"] else "False"
-            if name == "_SCROLLLOCK_ON":
-                with _LED_LOCK: return "True" if HID_LED_STATE["SCROLLLOCK"] else "False"
-            if name == "_RANDOM_INT":              return str(self._rand.randint(0, 65535))
-            if name == "_RANDOM_SHORT":            return str(self._rand.randint(0, 65535))
-            if name == "_RANDOM_BYTE":             return str(self._rand.randint(0, 255))
-            if name == "_RANDOM_NUMBER":           return str(self._rand.randint(0, 9))
-            if name == "_RANDOM_LOWERCASE_LETTER": return repr(self._rand.choice(string.ascii_lowercase))
-            if name == "_RANDOM_UPPERCASE_LETTER": return repr(self._rand.choice(string.ascii_uppercase))
-            if name == "_RANDOM_LETTER":           return repr(self._rand.choice(string.ascii_letters))
-            if name == "_OS":                      return repr(self.vars.get("_OS", "UNKNOWN"))
-            v = self.vars.get(name)
-            if v is None: return "0"
+            v = self._builtin(name)
+            if v is _NOT_BUILTIN:
+                v = self.vars.get(name)
+                if v is None: return "0"
             if isinstance(v, bool): return "True" if v else "False"
             if isinstance(v, (int, float)): return str(v)
             return repr(str(v))
@@ -437,8 +493,7 @@ class Interp:
     def _eval(self, expr: str):
         src = self._subst_defines(expr)
         src = self._subst_vars(src)
-        for pat, rep in _EXPR_TRANSLATE:
-            src = re.sub(pat, rep, src)
+        src = _translate_expr(src)
         try:
             return eval(src, _SAFE_EVAL_NAMES, {})
         except Exception as e:
@@ -451,11 +506,10 @@ class Interp:
         user wrote."""
         def repl(m):
             name = m.group(1).upper()
-            v = self.vars.get(name)
-            if v is None:
-                # try built-ins
-                if name == "_OS": return str(self.vars.get("_OS", "UNKNOWN"))
-                return ""
+            v = self._builtin(name)
+            if v is _NOT_BUILTIN:
+                v = self.vars.get(name)
+                if v is None: return ""
             return str(v)
         return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", repl, text)
 
@@ -479,6 +533,7 @@ class Interp:
     # -------- interpret a single line -----------------------------------
     def _run_line(self, line):
         if not line: return
+        line = line.lstrip()   # leading blanks go, so keyword slices (line[7:] etc.) start at column 0; trailing blanks stay for STRING
         s = line.strip()
         if not s: return
         u = s.upper()
@@ -599,10 +654,18 @@ class Interp:
         # ---- RUN_PAYLOAD <name> — chain-run a sibling script ----------------
         if u.startswith("RUN_PAYLOAD "):
             name = s[len("RUN_PAYLOAD "):].strip()
+            # Same name whitelist gl_run_script() (GL_RUN) already uses -- this command
+            # had none, so "RUN_PAYLOAD ../../../etc/passwd" would resolve outside
+            # payloads/ (Path joining does not strip ".."). Same operator trust level as
+            # GL_RUN either way (both only run from inside an already-authorized script),
+            # but there is no reason for one DuckyScript command to be stricter than the
+            # sibling command that does the same thing.
+            if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(sh|dd|txt|ducky)$", name):
+                _cfg_log(f"RUN_PAYLOAD bad name: {name!r}"); return
             p = ROOT / "payloads" / name
             if p.exists() and p.is_file():
                 import subprocess as _sp
-                _sp.Popen(["python3", str(ROOT/"ducky.py"), str(p)])
+                _sp.Popen(["python3", str(ROOT/"ducky.py"), str(p)], env=_child_env())
             else:
                 _cfg_log(f"RUN_PAYLOAD not found: {name}")
             return
@@ -753,10 +816,10 @@ class Interp:
             return
 
         # GhostLink
-        if u.startswith("GL_SET "):            gl_set(self._subst_vars(line[7:])); return
+        if u.startswith("GL_SET "):            gl_set(self._subst_string(line[7:])); return
         if u in ("GL_RELOAD", "GL_RELOAD_DNSMASQ"): gl_reload_dnsmasq(); return
-        if u.startswith("GL_RUN "):            gl_run_script(self._subst_vars(line[7:])); return
-        if u.startswith("GL_LOG "):            _cfg_log(self._subst_vars(line[7:])); return
+        if u.startswith("GL_RUN "):            gl_run_script(self._subst_string(line[7:])); return
+        if u.startswith("GL_LOG "):            _cfg_log(self._subst_string(line[7:])); return
         if u.startswith("GL_WAIT "):           time.sleep(max(0, _ms(self._eval(line[8:]), 0))); return
         if u == "GL_REBOOT":
             _cfg_log("GL_REBOOT requested"); os.system("sync; reboot &"); return
@@ -818,6 +881,8 @@ class Interp:
         last_exec = None
         while i < len(lines):
             if self.stop_event is not None and self.stop_event.is_set(): return
+            self.steps = getattr(self, "steps", 0) + 1
+            if self.steps > MAX_STEPS: raise _Budget()
             raw = lines[i]
             s = raw.strip()
             u = s.upper()
@@ -826,14 +891,18 @@ class Interp:
             m = re.match(r"^\s*IF\s*\((.+)\)\s*$", s, re.IGNORECASE)
             if m:
                 cond = bool(self._eval(m.group(1)))
-                then_block, else_block, consumed = self._collect_if(lines, i + 1)
+                try: then_block, else_block, consumed = self._collect_if(lines, i + 1)
+                except _BadScript as e:
+                    _cfg_log(f"line {i+1}: {e}"); sys.stderr.write(f"ducky: line {i+1}: {e}\n"); return
                 i += 1 + consumed
                 self.exec_body(then_block if cond else else_block)
                 continue
 
             m = re.match(r"^\s*WHILE\s*\((.+)\)\s*$", s, re.IGNORECASE)
             if m:
-                body, consumed = self._collect_while(lines, i + 1)
+                try: body, consumed = self._collect_while(lines, i + 1)
+                except _BadScript as e:
+                    _cfg_log(f"line {i+1}: {e}"); sys.stderr.write(f"ducky: line {i+1}: {e}\n"); return
                 i += 1 + consumed
                 guard = 50_000
                 while guard > 0 and bool(self._eval(m.group(1))):
@@ -842,6 +911,12 @@ class Interp:
                     guard -= 1
                 continue
 
+            # A malformed IF or WHILE header used to run as a plain line, so its body ran every
+            # time. Stop the block instead.
+            if re.match(r"^\s*(IF|WHILE|END_IF|END_WHILE)\b", s, re.IGNORECASE):
+                _cfg_log(f"line {i+1}: malformed {u.split()[0]} header, stopped")
+                sys.stderr.write(f"ducky: line {i+1}: malformed {u.split()[0]} header\n")
+                return
             try:
                 r = self._run_line(raw)
             except Exception as e:
@@ -861,9 +936,15 @@ class Interp:
             elif isinstance(r, str) and r.startswith("REPEAT:"):
                 n = _ms(self._eval(r[7:]), 0)
                 if last_exec:
-                    for _ in range(n):
-                        if self.stop_event is not None and self.stop_event.is_set(): return
-                        self._run_line(last_exec)
+                    try:
+                        for _ in range(n):
+                            if self.stop_event is not None and self.stop_event.is_set(): return
+                            self._run_line(last_exec)
+                    except Exception as e:
+                        sys.stderr.write(f"ducky: REPEAT line {i}: {type(e).__name__}: {e}\n")
+                        sys.stderr.write(f"       -> {last_exec.rstrip()[:120]}\n")
+                        _cfg_log(f"REPEAT line {i} {type(e).__name__}: {e}")
+                        return
 
     def _collect_if(self, lines, start):
         """Return (then_body, else_body, consumed) up to matching END_IF."""
@@ -886,7 +967,7 @@ class Interp:
             else:
                 cur.append(lines[i])
             i += 1
-        return then_body, else_body, (i - start)
+        raise _BadScript("IF without END_IF")
 
     def _collect_while(self, lines, start):
         body = []; depth = 1; i = start
@@ -903,7 +984,7 @@ class Interp:
             else:
                 body.append(lines[i])
             i += 1
-        return body, (i - start)
+        raise _BadScript("WHILE without END_WHILE")
 
     def _wait_for_button(self):
         try:
@@ -929,29 +1010,48 @@ class Interp:
             sys.stderr.write(f"ducky: WAIT_FOR_BUTTON_PRESS err {e}\n")
 
     def run(self):
-        cfg_layout = "us"
-        cfg_path = ROOT / "config.txt"
-        if cfg_path.exists():
-            for ln in cfg_path.read_text().splitlines():
-                s = ln.strip()
-                if s.startswith("HID_LAYOUT="):
-                    v = s.split("=", 1)[1]
-                    m = re.search(r"\s#", v)
-                    if m: v = v[:m.start()]
-                    cfg_layout = v.strip() or "us"
-        self.lay = load_layout(cfg_layout)
-
+        if int(os.environ.get("GL_DUCKY_DEPTH", "0") or 0) > MAX_DEPTH:
+            _cfg_log(f"payload chain deeper than {MAX_DEPTH}; not started"); return 1
+        # Write PID so button.py can check if a payload is running (avoids ps overhead).
+        pidfile = Path("/run/ghostlink-ducky.pid")
+        pidfile.write_text(str(os.getpid()))
         try:
-            self.fd = os.open(HID, os.O_RDWR)
-        except OSError as e:
-            sys.stderr.write(f"ducky: open {HID}: {e}\n"); return 1
-        _ensure_led_reader(self.fd)
+            cfg_layout = "us"
+            cfg_path = ROOT / "config.txt"
+            if cfg_path.exists():
+                for ln in cfg_path.read_text().splitlines():
+                    s = ln.strip()
+                    if s.startswith("HID_LAYOUT="):
+                        v = s.split("=", 1)[1]
+                        m = re.search(r"\s#", v)
+                        if m: v = v[:m.start()]
+                        cfg_layout = v.strip() or "us"
+            self.lay = load_layout(cfg_layout)
 
-        body = self._preprocess()
-        _tl_emit("ducky_start", path=str(getattr(self, "path", "?")).split("/")[-1][:60])
-        self.exec_body(body)
-        _tl_emit("ducky_done",  path=str(getattr(self, "path", "?")).split("/")[-1][:60])
-        os.close(self.fd); return 0
+            try:
+                self.fd = os.open(HID, os.O_RDWR)
+            except OSError as e:
+                sys.stderr.write(f"ducky: open {HID}: {e}\n"); return 1
+            _ensure_led_reader(self.fd)
+
+            try:
+                body = self._preprocess()
+                _tl_emit("ducky_start", path=str(getattr(self, "path", "?")).split("/")[-1][:60])
+                self.exec_body(body)
+            except _BadScript as e:
+                _cfg_log(f"script refused: {e}"); sys.stderr.write(f"ducky: {e}\n")
+                os.close(self.fd); return 1
+            except _Budget:
+                _cfg_log(f"step limit {MAX_STEPS} reached; stopped"); sys.stderr.write("ducky: step limit reached\n")
+                os.close(self.fd); return 1
+            _tl_emit("ducky_done",  path=str(getattr(self, "path", "?")).split("/")[-1][:60])
+            os.close(self.fd); return 0
+        finally:
+            # Remove the pidfile only if it still names this run. A payload started meanwhile
+            # writes its own pid, and removing that would reopen the button gate under it.
+            try:
+                if pidfile.read_text().strip() == str(os.getpid()): pidfile.unlink()
+            except Exception: pass
 
 
 def run(path, stop_event=None):

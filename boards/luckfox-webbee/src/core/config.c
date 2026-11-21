@@ -9,6 +9,7 @@
 #include "config.h"
 #include "../common/log.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
@@ -16,15 +17,18 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <sys/socket.h>   /* AF_INET */
 #include <unistd.h>   /* fsync() in cfg_save() */
 
 ghost_cfg_t g_cfg;
 volatile uint64_t g_cfg_gen = 0;
 
+/* 1 for TRUE/YES/ON/1, 0 for FALSE/NO/OFF/0, -1 for anything else. */
 static int bool_of(const char *v) {
-    if (!v) return 0;
-    return (!strcasecmp(v, "TRUE") || !strcasecmp(v, "YES") ||
-            !strcasecmp(v, "ON")   || !strcmp(v, "1"));
+    if (!v) return -1;
+    if (!strcasecmp(v, "TRUE") || !strcasecmp(v, "YES") || !strcasecmp(v, "ON") || !strcmp(v, "1")) return 1;
+    if (!strcasecmp(v, "FALSE") || !strcasecmp(v, "NO") || !strcasecmp(v, "OFF") || !strcmp(v, "0")) return 0;
+    return -1;
 }
 
 /* Copies src into dst. Returns 1 when src did not fit and was cut. */
@@ -173,10 +177,8 @@ static char *ltrim(char *s) {
 }
 
 /* Values that reach shell command strings in bridge.c and main.c are checked
- * here, at parse time, so those files need no change. A rejected value leaves
- * the field unchanged and logs a warning. */
-#define CS_IPV4  "0123456789."
-#define CS_RANGE "0123456789.,"
+ * here, at parse time, so those files need no change. A rejected value
+ * resets the field to its default and logs a warning. */
 #define CS_IFACE "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"
 #define CS_PATH  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-"
 
@@ -195,26 +197,99 @@ static int payload_path_ok(const char *v, size_t maxlen) {
     return charset_ok(v, CS_PATH, maxlen);
 }
 
+/* An IPv4 address in dotted form. */
+static int ipv4_ok(const char *s) {
+    struct in_addr a;
+    return s[0] && inet_pton(AF_INET, s, &a) == 1;
+}
+
+/* A decimal prefix length from 0 to 32. */
+static int prefix_ok(const char *s) {
+    if (!s[0] || strlen(s) > 2) return 0;
+    for (const char *p = s; *p; p++)
+        if (*p < '0' || *p > '9') return 0;
+    return atoi(s) <= 32;
+}
+
+/* DHCP_RANGE is "start,end": exactly two IPv4 addresses, start not above end.
+ * bridge.c substitutes 172.16.24.60 when there is no comma, so the comma is
+ * required because that default could sit below start. */
+static int range_ok(const char *v) {
+    const char *comma = strchr(v, ',');
+    if (!comma || strchr(comma + 1, ',')) return 0;
+    char first[32];
+    size_t n = (size_t)(comma - v);
+    if (n == 0 || n >= sizeof(first)) return 0;
+    memcpy(first, v, n);
+    first[n] = 0;
+    struct in_addr a, b;
+    if (inet_pton(AF_INET, first, &a) != 1 || inet_pton(AF_INET, comma + 1, &b) != 1) return 0;
+    return ntohl(a.s_addr) <= ntohl(b.s_addr);
+}
+
 int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     if (!key) return -1;
     /* Giant switch: one line per schema key. Boring on purpose. */
 #define S(k, field)  if (!strcasecmp(key, k)) { \
+    if (!val[0]) return 0; \
     if (cp(c->field, sizeof(c->field), val)) \
         LOGW("cfg", "%s cut to %zu chars (value too long)", k, sizeof(c->field) - 1); \
     return 0; }
-#define B(k, field)  if (!strcasecmp(key, k)) { c->field = bool_of(val); return 0; }
-#define I(k, field)  if (!strcasecmp(key, k)) { c->field = (int)strtol(val, NULL, 0); return 0; }
-#define H(k, field)  if (!strcasecmp(key, k)) { c->field = (uint16_t)strtoul(val, NULL, 0); return 0; }
+/* Blank keeps the default. Whole numbers are decimal, so 010 is ten.
+ * A value that is not a recognised boolean is set to FALSE and logged; other bad values are rejected and logged. */
+#define B(k, field)  if (!strcasecmp(key, k)) { \
+    int b_ = bool_of(val); \
+    if (!val[0]) return 0; \
+    if (b_ < 0) { LOGW("cfg", "%s is not TRUE or FALSE; set to FALSE", k); b_ = 0; } \
+    c->field = b_; return 0; }
+#define I(k, field)  if (!strcasecmp(key, k)) { \
+    char *end_ = NULL; long v_; \
+    if (!val[0]) return 0; \
+    errno = 0; v_ = strtol(val, &end_, 10); \
+    if (end_ == val || *end_ != 0 || errno == ERANGE || v_ < -2147483647L - 1L || v_ > 2147483647L) { \
+        LOGW("cfg", "%s rejected (not a whole number); field is reset to its default", k); return -2; } \
+    c->field = (int)v_; return 0; }
+#define H(k, field)  if (!strcasecmp(key, k)) { \
+    char *end_ = NULL; unsigned long v_; \
+    if (!val[0]) return 0; \
+    errno = 0; v_ = strtoul(val, &end_, 0); \
+    if (end_ == val || *end_ != 0 || errno == ERANGE || v_ > 0xFFFFul) { \
+        LOGW("cfg", "%s rejected (want a 16-bit number, 0x prefix allowed); field is reset to its default", k); \
+        return -2; } \
+    c->field = (uint16_t)v_; return 0; }
 /* V: copy only if the value uses an allowed charset; returns -2 when rejected. */
 #define V(k, field, allowed) if (!strcasecmp(key, k)) { \
+    if (!val[0]) return 0; \
     if (!charset_ok(val, allowed, sizeof(c->field) - 1)) { \
-        LOGW("cfg", "%s rejected (bad characters or too long); field unchanged", k); \
+        LOGW("cfg", "%s rejected (bad characters or too long); field is reset to its default", k); \
+        return -2; } \
+    cp(c->field, sizeof(c->field), val); return 0; }
+/* IP: an IPv4 address, checked with inet_pton(). */
+#define IP(k, field) if (!strcasecmp(key, k)) { \
+    if (!val[0]) return 0; \
+    if (!ipv4_ok(val) || strlen(val) >= sizeof(c->field)) { \
+        LOGW("cfg", "%s rejected (not an IPv4 address); field is reset to its default", k); \
+        return -2; } \
+    cp(c->field, sizeof(c->field), val); return 0; }
+/* RANGE: DHCP_RANGE, exactly "start,end": both IPv4 addresses, start not above end. */
+#define RANGE(k, field) if (!strcasecmp(key, k)) { \
+    if (!val[0]) return 0; \
+    if (!range_ok(val) || strlen(val) >= sizeof(c->field)) { \
+        LOGW("cfg", "%s rejected (want start,end as IPv4); field is reset to its default", k); \
+        return -2; } \
+    cp(c->field, sizeof(c->field), val); return 0; }
+/* PREFIX: a prefix length, 0-32. bridge.c passes it to ip addr add as /N. */
+#define PREFIX(k, field) if (!strcasecmp(key, k)) { \
+    if (!val[0]) return 0; \
+    if (!prefix_ok(val) || strlen(val) >= sizeof(c->field)) { \
+        LOGW("cfg", "%s rejected (want a prefix length 0-32, e.g. 24); field is reset to its default", k); \
         return -2; } \
     cp(c->field, sizeof(c->field), val); return 0; }
 /* P: payload path, see payload_path_ok(). */
 #define P(k, field) if (!strcasecmp(key, k)) { \
+    if (!val[0]) return 0; \
     if (!payload_path_ok(val, sizeof(c->field) - 1)) { \
-        LOGW("cfg", "%s rejected (must be /path with [A-Za-z0-9._/-], no ..); field unchanged", k); \
+        LOGW("cfg", "%s rejected (must be /path with [A-Za-z0-9._/-], no ..); field is reset to its default", k); \
         return -2; } \
     cp(c->field, sizeof(c->field), val); return 0; }
 
@@ -238,14 +313,14 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
     B("PASSTHROUGH_LAN", passthrough_lan);
     S("NETMODE", netmode);
     B("ASSIGN_IP", assign_ip);
-    V("DHCP_RANGE", dhcp_range, CS_RANGE);
-    V("GATEWAY_IP", gateway_ip, CS_IPV4);
+    RANGE("DHCP_RANGE", dhcp_range);
+    IP("GATEWAY_IP", gateway_ip);
     S("DNS_UPSTREAM", dns_upstream);
     B("MAC_CLONE", mac_clone);
     V("MAC_CLONE_FROM", mac_clone_from, CS_IFACE);
-    V("STATIC_IP", static_ip, CS_IPV4);
-    V("STATIC_NETMASK", static_netmask, CS_IPV4);
-    V("STATIC_GATEWAY", static_gateway, CS_IPV4);
+    IP("STATIC_IP", static_ip);
+    PREFIX("STATIC_NETMASK", static_netmask);
+    IP("STATIC_GATEWAY", static_gateway);
 
     B("LOG_TO_SD", log_to_sd);
     S("RECORD_FORMAT", record_format);
@@ -388,6 +463,9 @@ int cfg_set_kv(ghost_cfg_t *c, const char *key, const char *val) {
 #undef H
 #undef V
 #undef P
+#undef IP
+#undef RANGE
+#undef PREFIX
     return -1; /* unknown key */
 }
 
@@ -411,6 +489,11 @@ int cfg_load(const char *path) {
 
     FILE *f = fopen(path, "r");
     if (!f) {
+        if (errno != ENOENT) {
+            /* present but unreadable (EIO, EACCES): keep the live settings instead of defaults */
+            LOGE("cfg", "cannot read %s: %s; keeping current settings", path, strerror(errno));
+            return -1;
+        }
         LOGW("cfg", "no config at %s, using defaults", path);
         memcpy(&g_cfg, &next, sizeof(g_cfg));
         __atomic_add_fetch(&g_cfg_gen, 1, __ATOMIC_RELEASE);
@@ -421,6 +504,26 @@ int cfg_load(const char *path) {
     int unknown = 0, parsed = 0, rejected = 0, lineno = 0;
     while (fgets(line, sizeof(line), f)) {
         lineno++;
+        size_t ll = strlen(line);
+        if (ll == sizeof(line) - 1 && line[ll - 1] != '\n' && !feof(f)) {
+            int ch = fgetc(f);
+            if (ch == '\r') {
+                /* a CR at the buffer edge is a line end when a LF or EOF follows it */
+                int after_cr = fgetc(f);
+                if (after_cr == '\n' || after_cr == EOF) ch = after_cr;
+                else ungetc(after_cr, f);
+            }
+            if (ch != '\n' && ch != EOF) {
+                /* longer than the buffer: skip the rest, or its tail is parsed as a key */
+                LOGW("cfg", "line %d is longer than %d bytes; ignored", lineno, (int)(sizeof(line) - 1));
+                rejected++;
+                while (ch != '\n' && ch != EOF) ch = fgetc(f);
+                continue;
+            }
+        }
+        /* Windows editors can save a UTF-8 byte-order mark; without this the first key is lost. */
+        if (lineno == 1 && (unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF)
+            memmove(line, line + 3, strlen(line + 3) + 1);
         char *p = ltrim(line);
         if (*p == '#' || *p == '\n' || *p == 0 || *p == '\r') continue;
 
@@ -432,6 +535,10 @@ int cfg_load(const char *path) {
         *eq = 0;
         char *key = p;
         char *val = eq + 1;
+        /* "KEY=#text" triggers this warning: the # starts a comment, so the setting keeps its default.
+         * A space or tab right after the hash does not trigger it. */
+        if (val[0] == '#' && val[1] && val[1] != ' ' && val[1] != '\t')
+            LOGW("cfg", "%s: a value that starts with # is a comment; the setting keeps its default", key);
 
         strip_comment(val);
 
@@ -451,7 +558,14 @@ int cfg_load(const char *path) {
             LOGW("cfg", "line %d: unknown key '%s'", lineno, key);
         }
     }
+    int read_failed = ferror(f);
     fclose(f);
+    if (read_failed) {
+        /* an I/O error mid-file: a partial read must not replace the live config */
+        LOGE("cfg", "read error in %s; keeping current settings", path);
+        return -1;
+    }
+    if (parsed == 0) LOGW("cfg", "%s has no settings; defaults apply", path);
     LOGI("cfg", "loaded %d keys (%d unknown, %d rejected) from %s",
          parsed, unknown, rejected, path);
     memcpy(&g_cfg, &next, sizeof(g_cfg));

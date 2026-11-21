@@ -13,13 +13,17 @@ Pruning triggers (all applied on every rotate and on startup):
   - config-off:  RECORD_PCAP=FALSE wipes ALL existing .pcap files
                  VERDICT_STREAM=FALSE wipes ALL existing .jsonl files
 
-The Writer re-reads config.txt every WATCH_FRAMES frames so the user toggling
-RECORD_PCAP via the Web UI takes effect without restarting the firmware.
+The watcher thread re-reads config.txt and runs the disk guard every 1.5 s, so
+the user toggling RECORD_PCAP via the Web UI takes effect without restarting
+the firmware. Verdict and pcap writes are buffered; the same thread flushes them.
 """
 
+import ipaddress
 import json
 import os
+import re
 import socket
+import stat
 import struct
 import sys
 import threading
@@ -33,8 +37,8 @@ VER_DIR   = ROOT / "verdicts"
 LOG_DIR   = ROOT / "logs"
 LOG_PATH  = LOG_DIR / "ghostlink.log"
 
-WATCH_FRAMES = 10      # re-read config.txt every N frames
-WATCH_SECONDS = 1.5    # or every N seconds, whichever comes first
+WATCH_SECONDS = 1.5    # watcher thread: config reload, disk guard, flush
+OUT_BUF = 64 * 1024    # buffer for the pcap and verdict files, in bytes
 
 # Disk-pressure thresholds (MB free on /root).
 # Overridable via config: WARN_FREE_MB / CRIT_FREE_MB / PANIC_FREE_MB.
@@ -87,24 +91,39 @@ def free_mb(path: str = "/root") -> int:
         st = os.statvfs(path)
         return int(st.f_bavail * st.f_bsize / 1024 / 1024)
     except Exception:
-        return 10_000
+        # statvfs() failed (permission denied, /root unmounted, etc.). Assume
+        # emergency rather than plenty of space — prevents silent data loss if
+        # filesystem becomes inaccessible. Return value < PANIC_FREE_MB (5).
+        return 2
+
+
+def free_mb_or_none(path: str = "/root"):
+    """Free MB on the filesystem, or None when it cannot be read right now.
+    Callers keep their last decision on None; they must not treat it as a level."""
+    try:
+        st = os.statvfs(path)
+        return int(st.f_bavail * st.f_bsize / 1024 / 1024)
+    except Exception:
+        return None
 
 
 def trim_log(p: Path, keep_kb: int = LOG_MAX_KB):
-    """Keep only the last keep_kb KB of a log file, atomically."""
+    """Keep only the last keep_kb KB of a log file, rewritten in place. The daemons append to
+    these files through shell redirections; a replaced file would leave them writing to the old,
+    deleted copy, and their output would vanish."""
     try:
         if not p.exists(): return
         sz = p.stat().st_size
         if sz < keep_kb * 1024 * 2: return  # headroom before trim
-        with open(p, "rb") as f:
+        with open(p, "r+b") as f:
             f.seek(max(0, sz - keep_kb * 1024))
             tail = f.read()
-        # drop partial first line
-        nl = tail.find(b"\n")
-        if nl >= 0: tail = tail[nl+1:]
-        tmp = p.with_suffix(p.suffix + ".tmp")
-        tmp.write_bytes(tail)
-        tmp.replace(p)
+            # drop partial first line
+            nl = tail.find(b"\n")
+            if nl >= 0: tail = tail[nl+1:]
+            f.seek(0)
+            f.write(tail)
+            f.truncate()
     except Exception:
         pass
 
@@ -127,34 +146,41 @@ def nuke(d: Path, pattern: str):
         except Exception: pass
 
 
-def prune_count(d: Path, pattern: str, keep: int):
-    files = sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime)
-    while len(files) > keep:
-        try: files[0].unlink()
-        except Exception: pass
-        files = files[1:]
+# A device with no clock writes 1970 timestamps. Retention therefore orders capture files by
+# their number, and only ages out files whose mtime is a real date.
+SANE_MTIME = 1577836800   # 2020-01-01
 
 
-def prune_age(d: Path, pattern: str, max_age_s: int):
-    now = time.time()
-    for p in list(d.glob(pattern)):
-        try:
-            if now - p.stat().st_mtime > max_age_s:
-                p.unlink()
-        except Exception:
-            pass
+_WRITE_ERRORS = {"n": 0}
 
 
-def prune_disk(d: Path, pattern: str, min_free: int):
-    # keep deleting oldest while free is below threshold
-    guard = 0
-    while free_mb() < min_free and guard < 50:
-        files = sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime)
-        if not files:
-            return
-        try: files[0].unlink()
-        except Exception: pass
-        guard += 1
+def _log_write_error(msg: str):
+    """A failed record write repeats for every frame while the disk is full. Log the first one,
+    then one in a thousand, and nothing during PANIC (the writes are paused then)."""
+    if PRESSURE_STATE["level"] >= 2: return
+    _WRITE_ERRORS["n"] += 1
+    if _WRITE_ERRORS["n"] != 1 and _WRITE_ERRORS["n"] % 1000: return
+    try:
+        with open(LOG_PATH, "a") as lf:
+            lf.write(f"{time.strftime('%H:%M:%S')} sniff {msg}\n")
+    except Exception: pass
+
+
+def _rec_index(p: Path) -> int:
+    """Capture number from rec_NNNNNN.*: the order files were made in."""
+    try: return int(p.stem.split("_")[1])
+    except (IndexError, ValueError): return -1
+
+
+# prune_count/prune_age/prune_disk used to live here. They sorted purely by mtime, which the
+# SANE_MTIME guard above exists specifically to distrust (a device with no clock writes 1970
+# timestamps for every file, so mtime-only ordering can delete newest-first instead of
+# oldest-first), and prune_age had no SANE_MTIME check at all -- a clockless device would see
+# every file as decades old and eligible for deletion on its first run. They were replaced by
+# Writer._prune/_ring_age below, which is index-ordered and SANE_MTIME-guarded, and are gone
+# now: confirmed unreachable from anywhere in onboard/ or tests/ (bug-hunt, 2026-10-31) --
+# dead code sitting next to the real retention path is a landmine for whoever calls it next
+# assuming it's still the live implementation.
 
 
 # -------- rotation ------------------------------------------------------------
@@ -168,14 +194,15 @@ class Writer:
         REC_DIR.mkdir(parents=True, exist_ok=True)
         VER_DIR.mkdir(parents=True, exist_ok=True)
 
+        self._lock      = threading.Lock()  # guards file handle access (main + watcher threads)
         self.cfg_mtime  = 0.0
-        self.last_check = 0.0
         self.pcap_f     = None
         self.verd_f     = None
         self.pcap_bytes = 0
         self.frame      = 0
         self.idx        = self._next_idx()
         self._apply(cfg)
+        self._rec_target = os.path.realpath(REC_DIR)   # where REC_DIR points: flash or the SD card
         self._prune()
         self._open()
 
@@ -212,12 +239,12 @@ class Writer:
 
     def _open(self):
         if self.want_pcap:
-            self.pcap_f = open(REC_DIR / f"rec_{self.idx:06d}.pcap", "wb")
+            self.pcap_f = open(REC_DIR / f"rec_{self.idx:06d}.pcap", "wb", buffering=OUT_BUF)
             self.pcap_f.write(PCAP_HDR)
             self.pcap_f.flush()
             self.pcap_bytes = len(PCAP_HDR)
         if self.want_verd:
-            self.verd_f = open(VER_DIR / f"rec_{self.idx:06d}.jsonl", "ab")
+            self.verd_f = open(VER_DIR / f"rec_{self.idx:06d}.jsonl", "ab", buffering=OUT_BUF)
 
     def _prune(self):
         # 1. config says off → wipe entirely
@@ -225,26 +252,52 @@ class Writer:
             nuke(REC_DIR, "rec_*.pcap")
         if not self.want_verd:
             nuke(VER_DIR, "rec_*.jsonl")
-        # 2. ring counts
-        if self.want_pcap:
-            prune_count(REC_DIR, "rec_*.pcap", self.pcap_ring)
-        if self.want_verd:
-            prune_count(VER_DIR, "rec_*.jsonl", self.verd_ring)
-        # 3. age
+        # 2. ring count + age, in one scan per dir. The old path globbed+stat'd
+        #    each dir twice (prune_count, then prune_age); the kept/deleted set
+        #    is identical done in a single pass, so scan once and stat once.
+        now = time.time()
         max_age_s = self.max_age_h * 3600
-        prune_age(REC_DIR, "rec_*.pcap",  max_age_s)
-        prune_age(VER_DIR, "rec_*.jsonl", max_age_s)
-        # 4. disk free (last resort — eats whatever is oldest in BOTH dirs)
-        if free_mb() < self.min_free_mb:
-            # delete oldest across both until free is OK
+        def _ring_age(d, pattern, keep):
+            files = []
+            for p in d.glob(pattern):
+                try: files.append((_rec_index(p), p.stat().st_mtime, p))
+                except Exception: pass
+            files.sort(key=lambda t: t[0])   # oldest first, by capture number
+            drop = len(files) - keep         # oldest `drop` exceed the ring
+            open_now = {f.name for f in (self.pcap_f, self.verd_f) if f}
+            for i, (_, mtime, p) in enumerate(files):
+                if str(p) in open_now: continue  # never delete the file being written
+                too_old = mtime > SANE_MTIME and now - mtime > max_age_s
+                if i < drop or too_old:
+                    try: p.unlink()
+                    except Exception: pass
+        if self.want_pcap:
+            _ring_age(REC_DIR, "rec_*.pcap",  self.pcap_ring)
+        if self.want_verd:
+            _ring_age(VER_DIR, "rec_*.jsonl", self.verd_ring)
+        # 3. disk free (last resort — eats whatever is oldest in BOTH dirs)
+        fm = free_mb_or_none()
+        if fm is not None and fm < self.min_free_mb:
+            # delete oldest across both until free is OK, never the files being written
+            open_now = {f.name for f in (self.pcap_f, self.verd_f) if f}
             all_files = sorted(
-                list(REC_DIR.glob("rec_*.pcap")) + list(VER_DIR.glob("rec_*.jsonl")),
-                key=lambda p: p.stat().st_mtime,
+                [p for p in list(REC_DIR.glob("rec_*.pcap")) + list(VER_DIR.glob("rec_*.jsonl")) if str(p) not in open_now],
+                key=_rec_index,
             )
-            while all_files and free_mb() < self.min_free_mb + 2:
+            while all_files:
+                fm = free_mb_or_none()
+                if fm is None or fm >= self.min_free_mb + 2: break
                 try: all_files[0].unlink()
                 except Exception: pass
                 all_files = all_files[1:]
+
+    def _check_record_target(self):
+        """REC_DIR is a symlink that the shell points at the flash or the SD card (RECORD_SD). When
+        it moves, rotate, so the new captures are written to the new place."""
+        now = os.path.realpath(REC_DIR)
+        if now != self._rec_target:
+            self._rec_target = now
+            self._rotate()
 
     def _check_config(self):
         try:
@@ -258,73 +311,68 @@ class Writer:
         self._apply(load_cfg(CFG_PATH))
 
         # pcap flipped off → close current + nuke
-        if old_pcap and not self.want_pcap:
-            if self.pcap_f:
-                self.pcap_f.close()
-                self.pcap_f = None
-            nuke(REC_DIR, "rec_*.pcap")
-            sys.stderr.write("sniff: RECORD_PCAP=FALSE, pcaps wiped\n")
-        # pcap flipped on → open fresh
-        if not old_pcap and self.want_pcap and not self.pcap_f:
-            self.idx = self._next_idx()
-            self._open()
+        with self._lock:   # the main thread swaps these handles in _rotate
+            if old_pcap and not self.want_pcap:
+                if self.pcap_f:
+                    self.pcap_f.close()
+                    self.pcap_f = None
+                nuke(REC_DIR, "rec_*.pcap")
+                sys.stderr.write("sniff: RECORD_PCAP=FALSE, pcaps wiped\n")
+            # pcap flipped on → open fresh
+            if not old_pcap and self.want_pcap and not self.pcap_f:
+                self.idx = self._next_idx()
+                self._open()
 
-        if old_verd and not self.want_verd:
-            if self.verd_f:
-                self.verd_f.close()
-                self.verd_f = None
-            nuke(VER_DIR, "rec_*.jsonl")
-        if not old_verd and self.want_verd and not self.verd_f:
-            self.verd_f = open(VER_DIR / f"rec_{self.idx:06d}.jsonl", "ab")
+            if old_verd and not self.want_verd:
+                if self.verd_f:
+                    self.verd_f.close()
+                    self.verd_f = None
+                nuke(VER_DIR, "rec_*.jsonl")
+            if not old_verd and self.want_verd and not self.verd_f:
+                self.verd_f = open(VER_DIR / f"rec_{self.idx:06d}.jsonl", "ab", buffering=OUT_BUF)
 
     def write(self, ts_s: int, ts_us: int, frame_bytes: bytes, verdict: dict):
         self.frame += 1
-        now = time.time()
-        if self.frame % WATCH_FRAMES == 0 or (now - self.last_check) > WATCH_SECONDS:
-            self.last_check = now
-            self._check_config()
-            self._enforce_disk()
+        # Config reload and the disk guard run on the watcher thread, not per frame.
 
         # PANIC: refuse to write anything that touches the FS until free recovers
         if PRESSURE_STATE["level"] >= 2:
             return
 
         caplen = len(frame_bytes)
-        verdict["f"]  = self.frame
-        verdict["t"]  = f"{ts_s}.{ts_us:06d}"
-        verdict["sz"] = caplen
 
         # Capture file-handle refs under the GIL — the watcher thread may null
         # them between our check and the write. Using the local ref makes the
         # worst case a write to a closed handle (ValueError) which we swallow.
-        vf = self.verd_f
-        if self.want_verd and vf is not None:
+        with self._lock: vf = self.verd_f
+        if self.want_verd and vf is not None and verdict.get("rule"):
             try:
+                verdict.update(f=self.frame, t=f"{ts_s}.{ts_us:06d}", sz=caplen)
                 line = (json.dumps(verdict, separators=(",", ":")) + "\n").encode()
                 vf.write(line)
-                vf.flush()
                 self.verd_bytes += len(line)
                 if self.verd_bytes >= VERDICT_MAX_KB * 1024:
                     self._rotate()
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as e:
+                _log_write_error(f"verdict write failed: {e}")
 
-        pf = self.pcap_f
+        with self._lock: pf = self.pcap_f
         if self.want_pcap and pf is not None:
             try:
                 rec = struct.pack("<IIII", ts_s, ts_us, caplen, caplen)
                 pf.write(rec)
                 pf.write(frame_bytes)
-                pf.flush()
                 self.pcap_bytes += 16 + caplen
                 if self.pcap_bytes >= self.rotate_kb * 1024:
                     self._rotate()
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as e:
+                _log_write_error(f"pcap write failed: {e}")
 
     def _enforce_disk(self):
         """Called every ~1.5s. Decide pressure level and act."""
-        f = free_mb()
+        f = free_mb_or_none()
+        if f is None:
+            return  # unreadable right now: keep the current level and delete nothing
         PRESSURE_STATE["free_mb"] = f
         prev = PRESSURE_STATE["level"]
         if   f < CRIT_FREE_MB:  level = 2
@@ -342,8 +390,9 @@ class Writer:
 
         if level == 2:
             # EMERGENCY: close everything, nuke all records + verdicts, trim logs.
-            if self.pcap_f: self.pcap_f.close(); self.pcap_f = None
-            if self.verd_f: self.verd_f.close(); self.verd_f = None
+            with self._lock:
+                if self.pcap_f: self.pcap_f.close(); self.pcap_f = None
+                if self.verd_f: self.verd_f.close(); self.verd_f = None
             nuke(REC_DIR, "rec_*.pcap")
             nuke(VER_DIR, "rec_*.jsonl")
             for lp in LOG_DIR.glob("*.log"):
@@ -365,25 +414,39 @@ class Writer:
         need_pcap_reopen = self.want_pcap and self.pcap_f is None
         need_verd_reopen = self.want_verd and self.verd_f is None
         if (need_pcap_reopen or need_verd_reopen) and f > WARN_FREE_MB + 3:
-            self.idx = self._next_idx()
-            self._open()
+            with self._lock:
+                self.idx = self._next_idx()
+                self._open()
             self.verd_bytes = 0
 
     def _rotate(self):
-        if self.pcap_f:
-            self.pcap_f.close()
-            self.pcap_f = None
-        if self.verd_f:
-            self.verd_f.close()
-            self.verd_f = None
-        self.idx += 1
-        self.pcap_bytes = 0
-        self.verd_bytes = 0
-        self._open()
+        # The handles are swapped under the lock: the watcher thread closes them too.
+        with self._lock:
+            if self.pcap_f:
+                self.pcap_f.close()
+                self.pcap_f = None
+            if self.verd_f:
+                self.verd_f.close()
+                self.verd_f = None
+            self.idx += 1
+            self.pcap_bytes = 0
+            self.verd_bytes = 0
+            self._open()
         self._prune()
         # also trim logs on every rotation (cheap)
         for lp in LOG_DIR.glob("*.log"):
             trim_log(lp, LOG_MAX_KB)
+
+    def flush(self):
+        """Push buffered lines to flash. The watcher calls this every 1.5 s,
+        so the Live tab lags by at most that long."""
+        for fh in (self.pcap_f, self.verd_f):
+            if fh is None:
+                continue
+            try:
+                fh.flush()
+            except (ValueError, OSError):
+                pass
 
     def close(self):
         if self.pcap_f: self.pcap_f.close()
@@ -392,22 +455,28 @@ class Writer:
 
 # -------- cheap protocol parse -----------------------------------------------
 
+_IPV4_ADDRS = struct.Struct(">II")  # source and destination address, IPv4 offset 26
+_PORTS = struct.Struct(">HH")       # source and destination port after the IPv4 header
+
+
+def _flow_id(src: int, dst: int, sp: int, dp: int) -> str:
+    h = src ^ dst ^ (sp << 16) ^ dp
+    return f"{h & 0xFFFFFFFF:08x}"
+
+
 def flow_hash(buf: bytes) -> str:
     if len(buf) < 34:
         return "00000000"
     etype = (buf[12] << 8) | buf[13]
     if etype != 0x0800:
         return "00000000"
-    src = int.from_bytes(buf[26:30], "big")
-    dst = int.from_bytes(buf[30:34], "big")
+    src, dst = _IPV4_ADDRS.unpack_from(buf, 26)
     proto = buf[23]
     ihl = (buf[14] & 0x0F) * 4
     sp = dp = 0
     if (proto == 6 or proto == 17) and len(buf) >= 14 + ihl + 4:
-        sp = (buf[14 + ihl] << 8) | buf[14 + ihl + 1]
-        dp = (buf[14 + ihl + 2] << 8) | buf[14 + ihl + 3]
-    h = src ^ dst ^ (sp << 16) ^ dp
-    return f"{h & 0xFFFFFFFF:08x}"
+        sp, dp = _PORTS.unpack_from(buf, 14 + ihl)
+    return _flow_id(src, dst, sp, dp)
 
 
 def parse_dns_qname(buf: bytes, off: int) -> str:
@@ -491,6 +560,10 @@ def sniff_creds(payload: bytes, dport: int, sport: int) -> dict:
                     "host": host, "field": m.group(1).lower(),
                     "value": _redact(m.group(2))}
 
+        # HTTP request without credential: still capture the host
+        if host:
+            return {"rule": "HTTP", "host": host}
+
     # FTP cleartext
     if dport == 21 or sport == 21:
         try:
@@ -515,19 +588,167 @@ def sniff_creds(payload: bytes, dport: int, sport: int) -> dict:
     return {}
 
 
+_HOST_OK = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+
+
+def _sni_from_clienthello(payload: bytes) -> str:
+    """Server name (SNI) from a TLS ClientHello at the start of payload, or ''."""
+    try:
+        # Record: type 0x16 (handshake). Handshake: type 0x01 (ClientHello), 3-byte length.
+        if len(payload) < 9 or payload[0] != 0x16 or payload[5] != 0x01:
+            return ""
+        pos = 9 + 2 + 32                                   # client version, random
+        pos += 1 + payload[pos]                            # session id
+        pos += 2 + int.from_bytes(payload[pos:pos + 2], "big")   # cipher suites
+        pos += 1 + payload[pos]                            # compression methods
+        end = min(len(payload), pos + 2 + int.from_bytes(payload[pos:pos + 2], "big"))
+        pos += 2                                           # extensions block
+        while pos + 4 <= end:
+            etype = int.from_bytes(payload[pos:pos + 2], "big")
+            elen = int.from_bytes(payload[pos + 2:pos + 4], "big")
+            body = pos + 4
+            if etype == 0 and elen >= 5:                   # server_name
+                # list length (2), name type (1, 0 = host_name), name length (2), name
+                nlen = int.from_bytes(payload[body + 3:body + 5], "big")
+                if body + 5 + nlen > len(payload):          # name cut off by the packet end
+                    return ""
+                host = payload[body + 5:body + 5 + nlen].decode("ascii").lower()
+                return host if _HOST_OK.match(host) else ""
+            pos = body + elen
+    except (IndexError, ValueError, UnicodeDecodeError):
+        pass
+    return ""
+
+
+def _extract_hostname(payload: bytes, dport: int, sport: int) -> str:
+    """Hostname from an HTTP Host header (port 80) or a TLS ClientHello SNI (port 443)."""
+    if dport == 443:
+        return _sni_from_clienthello(payload)
+    try:
+        # HTTP: look for Host header in request line
+        if dport == 80 or sport == 80:
+            try:
+                text = payload.decode("latin-1")
+                # Look for Host header (case-insensitive, may have spaces)
+                m = re.search(r"(?i)\nhost:\s*([^\r\n:]+)", text)
+                if m:
+                    host = m.group(1).strip().lower().split(":")[0]   # host without the port
+                    if host and host != "localhost" and _HOST_OK.match(host):
+                        return host
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+
+# -------- hostnames seen in traffic -------------------------------------------
+# Every hostname read from HTTP Host or TLS SNI is remembered here. The WebUI
+# reads SEEN_FILE (in /run, RAM only) to show the list and to auto-add names.
+SEEN_FILE = "/run/ghostlink-seen.json"
+SEEN_MAX = 500
+SEEN = {}                 # host -> [count, first_ts, last_ts]
+_seen_flushed = 0.0
+_seen_dirty = False       # SEEN changed since the last write
+
+
+def flush_seen():
+    global _seen_flushed, _seen_dirty
+    _seen_flushed = time.time()
+    _seen_dirty = False
+    try:
+        data = [{"host": h, "count": r[0], "first": int(r[1]), "last": int(r[2])} for h, r in SEEN.items()]
+        tmp = SEEN_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, SEEN_FILE)
+    except OSError:
+        pass
+
+
+def note_seen(host):
+    global _seen_dirty
+    _seen_dirty = True
+    now = time.time()
+    rec = SEEN.get(host)
+    if rec is None:
+        if len(SEEN) >= SEEN_MAX:
+            del SEEN[min(SEEN, key=lambda h: SEEN[h][2])]   # forget the least recent name
+        SEEN[host] = [1, now, now]
+    else:
+        rec[0] += 1
+        rec[2] = now
+    if now - _seen_flushed >= 5:
+        flush_seen()
+
+
+# The device's own names (the admin UI). Requests for these are the admin's
+# traffic, not a victim's, so they are never recorded.
+ADMIN_HOSTS_FIXED = frozenset(("172.32.0.93", "ghostlink.local", "localhost", "127.0.0.1"))
+
+# Mirrors webui.py's admin_hosts()/lan_admin_ips(): once the LAN detector verifies a real
+# LAN IP, the admin's own requests arrive over THAT address, not just 172.32.0.93. Without
+# this, every admin page load/API poll over the LAN IP (today's NET_MODE=NAT default) gets
+# recorded as victim traffic in the Live Monitor and pcap/verdict files, mixed in with what
+# was actually captured from the PC. Same validation as webui.py's _read_lan_ip(): only a
+# regular, non-symlink, root-owned file with no group/other write bits is trusted, so a
+# planted file under the world-writable /tmp cannot add an attacker's address to this set.
+LAN_DETECT_PATH = "/tmp/ghostlink.lan.json"
+_admin_hosts_cache = (ADMIN_HOSTS_FIXED, 0.0)
+
+
+def admin_hosts():
+    global _admin_hosts_cache
+    hosts, read_at = _admin_hosts_cache
+    now = time.time()
+    if 0 <= now - read_at < 5.0:
+        return hosts
+    ip = None
+    try:
+        fd = os.open(LAN_DETECT_PATH, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if (stat.S_ISREG(st.st_mode)
+                    and not (os.name == "posix" and (st.st_uid != 0 or (st.st_mode & 0o022)))):
+                data = json.loads(f.read(4096).decode("utf-8"))
+                if isinstance(data, dict) and data.get("detected") is True:
+                    cand = data.get("suggested_ip")
+                    if isinstance(cand, str):
+                        addr = ipaddress.IPv4Address(cand)
+                        if not (addr.is_unspecified or addr.is_loopback or addr.is_multicast
+                                or addr.is_reserved or addr.is_link_local):
+                            ip = str(addr)
+    except Exception:
+        pass
+    hosts = ADMIN_HOSTS_FIXED | ({ip} if ip and ip not in ADMIN_HOSTS_FIXED else set())
+    _admin_hosts_cache = (hosts, now)
+    return hosts
+
+
 def classify(buf: bytes, redirect_from_set) -> dict:
-    v = {"flow": flow_hash(buf)}
-    if len(buf) < 42: return v
-    if ((buf[12] << 8) | buf[13]) != 0x0800: return v
-    ihl   = (buf[14] & 0x0F) * 4
-    proto = buf[23]
-    if proto == 17 and len(buf) >= 14 + ihl + 8:
-        udp_off = 14 + ihl
-        sp = (buf[udp_off] << 8) | buf[udp_off + 1]
-        dp = (buf[udp_off + 2] << 8) | buf[udp_off + 3]
+    # Parse the Ethernet/IPv4 header once. The flow id and the protocol
+    # dispatch below share src/dst/proto/ihl/ports instead of each re-reading
+    # (and flow_hash() re-parsing) the same header bytes on every frame.
+    n = len(buf)
+    if n < 34 or ((buf[12] << 8) | buf[13]) != 0x0800:
+        return {"flow": "00000000"}
+    ihl    = (buf[14] & 0x0F) * 4
+    if ihl < 20:                              # an IPv4 header is at least 20 bytes
+        return {"flow": "00000000"}
+    proto  = buf[23]
+    # A non-first fragment carries no L4 header, so its bytes must not be read as ports.
+    frag_off = ((buf[20] << 8) | buf[21]) & 0x1FFF
+    src, dst = _IPV4_ADDRS.unpack_from(buf, 26)
+    l4_off = 14 + ihl
+    sp = dp = 0
+    if (proto == 6 or proto == 17) and frag_off == 0 and n >= l4_off + 4:
+        sp, dp = _PORTS.unpack_from(buf, l4_off)
+    v = {"flow": _flow_id(src, dst, sp, dp)}
+    if n < 42 or frag_off: return v
+    if proto == 17 and n >= l4_off + 8:
         if dp == 53 or sp == 53:
-            dns_off = udp_off + 8
-            if len(buf) >= dns_off + 12:
+            dns_off = l4_off + 8
+            if n >= dns_off + 12:
                 q = parse_dns_qname(buf, dns_off + 12)
                 v["rule"] = "DNS"
                 v["host"] = q
@@ -540,14 +761,25 @@ def classify(buf: bytes, redirect_from_set) -> dict:
                         v["detail"]  = p
                         break
         return v
-    if proto == 6 and len(buf) >= 14 + ihl + 20:    # TCP
-        tcp_off = 14 + ihl
-        sp = (buf[tcp_off] << 8) | buf[tcp_off + 1]
-        dp = (buf[tcp_off + 2] << 8) | buf[tcp_off + 3]
+    if proto == 6 and n >= l4_off + 20:    # TCP
+        tcp_off = l4_off
         tcp_hdr = ((buf[tcp_off + 12] >> 4) & 0x0F) * 4
+        if tcp_hdr < 20: return v   # a TCP header is at least 20 bytes; less is not a TCP header
         pay_off = tcp_off + tcp_hdr
-        if pay_off < len(buf):
-            cred = sniff_creds(buf[pay_off:], dp, sp)
+        # Responses from port 80 never carry a Host header or a request line,
+        # so skip them before any parsing. Most bytes of a download are these.
+        if sp == 80: return v
+        if pay_off < n:
+            payload = buf[pay_off:]
+            # Extract hostname from HTTP/HTTPS for better verdict display
+            hostname = _extract_hostname(payload, dp, sp)
+            if len(hostname) > 253: hostname = ""   # longer than any DNS name can be
+            # The admin UI's own requests to this device are not victim traffic.
+            if hostname in admin_hosts(): return v
+            if hostname: note_seen(hostname)
+            if hostname and "host" not in v:
+                v["host"] = hostname
+            cred = sniff_creds(payload, dp, sp)
             if cred:
                 v.update(cred)
     return v
@@ -559,10 +791,25 @@ def classify(buf: bytes, redirect_from_set) -> dict:
 STATS_PATH = Path("/tmp/ghostlink.stats.json")
 
 
+_RATE = {"t": None, "frames": 0, "matches": 0, "pps": 0.0, "mps": 0.0}
+
+
 def dump_stats(frame_count: int, match_count: int, start: float, iface: str):
+    # The seen-hosts list is written here too, so the last names reach the file
+    # even when no new name follows them.
+    if _seen_dirty and time.time() - _seen_flushed >= 2:
+        flush_seen()
     try:
         now = time.time()
-        elapsed = max(0.01, now - start)
+        # Rates are measured since the previous stats write. Measuring from process start would
+        # make a long quiet spell leave the figure near zero for a long time afterwards.
+        if _RATE["t"] is None:
+            _RATE.update(t=now, frames=frame_count, matches=match_count)
+        elif now - _RATE["t"] >= 1.0:
+            span = now - _RATE["t"]
+            _RATE.update(pps=round((frame_count - _RATE["frames"]) / span, 2),
+                         mps=round((match_count - _RATE["matches"]) / span, 2),
+                         t=now, frames=frame_count, matches=match_count)
         rx_b = tx_b = rx_p = tx_p = 0
         p = Path(f"/sys/class/net/{iface}/statistics")
         if p.exists():
@@ -579,11 +826,11 @@ def dump_stats(frame_count: int, match_count: int, start: float, iface: str):
             "iface":   iface,
             "frames":  frame_count,
             "matches": match_count,
-            "pps":     round(frame_count / elapsed, 2),
-            "mps":     round(match_count / elapsed, 2),
+            "pps":     _RATE["pps"],
+            "mps":     _RATE["mps"],
             "if_rx_b": rx_b, "if_tx_b": tx_b,
             "if_rx_p": rx_p, "if_tx_p": tx_p,
-            "free_mb":    free_mb(),
+            "free_mb":    PRESSURE_STATE["free_mb"],
             "warn_level": PRESSURE_STATE["level"],
             "warn_text":  ("ok", "pruning (low disk)", "EMERGENCY: writes paused")[PRESSURE_STATE["level"]],
             "warn_free_mb":  WARN_FREE_MB,
@@ -599,6 +846,29 @@ def dump_stats(frame_count: int, match_count: int, start: float, iface: str):
 
 
 # -------- main ----------------------------------------------------------------
+
+def _ifindex(name):
+    """Kernel index of a network interface, or None while it does not exist."""
+    try:
+        with open(f"/sys/class/net/{name}/ifindex") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _open_capture(iface, log):
+    """Raw AF_PACKET socket bound to iface. The 2 s timeout lets the loop do its periodic work on
+    a quiet link. None if the bind fails; the error is logged."""
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+    try:
+        s.bind((iface, 0))
+    except OSError as e:
+        s.close()
+        log(f"bind {iface}: {e}")
+        return None
+    s.settimeout(2.0)
+    return s
+
 
 def main():
     cfg       = load_cfg(CFG_PATH)
@@ -617,13 +887,13 @@ def main():
         try:
             with open(LOG_PATH, "a") as f: f.write(line)
         except Exception: pass
-        sys.stderr.write(m + "\n")
+        # Not echoed to stderr: ghostlink.sh points stderr at this same log file,
+        # so the line would be written twice.
 
-    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
-    try:
-        s.bind((iface, 0))
-    except OSError as e:
-        L(f"bind {iface}: {e}; aborting"); return
+    s = _open_capture(iface, L)
+    if s is None:
+        L("aborting"); return
+    bound_idx = _ifindex(iface)   # to notice when usb0 is removed or recreated
 
     L(f"attached iface={iface} redirect_from={red_from}")
     w = Writer(cfg)
@@ -633,24 +903,50 @@ def main():
 
     # Even when the network is quiet, keep the config poll + disk guard alive.
     def _watcher():
+        ticks = 0
         while True:
             try:
                 w._check_config()
+                w._check_record_target()
                 w._enforce_disk()
+                w.flush()
+                ticks += 1
+                if ticks % 40 == 0:   # about once a minute: the logs also grow on a quiet link
+                    for lp in LOG_DIR.glob("*.log"): trim_log(lp, LOG_MAX_KB)
             except Exception: pass
-            time.sleep(1.5)
+            time.sleep(WATCH_SECONDS)
     threading.Thread(target=_watcher, daemon=True).start()
 
     cfg_mt = 0.0
     cfg_check_count = 0
+    # Hot path: bind time.time/int to locals so each frame is a LOAD_FAST
+    # instead of a global + builtin dict lookup on every packet.
+    _time = time.time
+    _int  = int
     try:
         while True:
             try:
                 buf, _ = s.recvfrom(65535)
             except Exception as e:
-                L(f"recv err {e}"); time.sleep(0.1); continue
-            now = time.time()
-            ts_s = int(now); ts_us = int((now - ts_s) * 1_000_000)
+                # A timeout is a quiet link. Any other error (ENETDOWN while usb0 is down) takes the
+                # same path, so the stats and the reattach check keep running either way.
+                if not isinstance(e, socket.timeout):
+                    L(f"recv err {e}"); time.sleep(0.1)
+                now = _time()
+                if now - last_stats > 2:
+                    dump_stats(w.frame, match_count, start, iface)
+                    last_stats = now
+                cur_idx = _ifindex(iface)
+                if cur_idx != bound_idx:
+                    ns = _open_capture(iface, L) if cur_idx is not None else None
+                    if cur_idx is None or ns is not None:
+                        bound_idx = cur_idx
+                    if ns is not None:
+                        s.close(); s = ns
+                        L(f"reattached iface={iface} ifindex={cur_idx}")
+                continue
+            now = _time()
+            ts_s = _int(now); ts_us = _int((now - ts_s) * 1_000_000)
             # pick up live config changes for REDIRECT_FROM, rate-limited
             # (used to stat() on every packet — 50+ syscalls/sec wasted)
             cfg_check_count += 1
@@ -666,7 +962,10 @@ def main():
                             red_from = []
                         L(f"REDIRECT_FROM reloaded: {red_from}")
                 except Exception: pass
-            v = classify(buf, red_from)
+            try:
+                v = classify(buf, red_from)
+            except Exception:
+                v = {}   # a frame the parser does not handle must not end the sniffer
             if v.get("rule"): match_count += 1
             w.write(ts_s, ts_us, buf, v)
             if now - last_stats > 2:

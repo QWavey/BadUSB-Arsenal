@@ -42,4 +42,5 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self): self.do_GET()
 
 
-ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
+if __name__ == "__main__":
+    ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()

@@ -79,16 +79,16 @@ def _ducky_running() -> bool:
     """Is a ducky.py payload currently running? If so, we skip firing a new
     payload on button-press — the press is almost certainly meant to unblock
     a WAIT_FOR_BUTTON_PRESS inside the running script, not to launch a second
-    payload on top of it."""
+    payload on top of it. Checked via pidfile instead of ps to avoid overhead."""
+    pidfile = Path("/run/ghostlink-ducky.pid")
+    if not pidfile.exists():
+        return False
     try:
-        r = subprocess.run(["ps"], capture_output=True, text=True, timeout=2)
-        for ln in r.stdout.splitlines():
-            if "ducky.py" in ln and "grep" not in ln and "button.py" not in ln:
-                parts = ln.split()
-                if parts and parts[0].isdigit():
-                    return True
-    except Exception: pass
-    return False
+        pid = int(pidfile.read_text().strip())
+        # Verify the PID is still alive and running ducky.py.
+        return Path(f"/proc/{pid}/cmdline").read_text(errors="ignore").find("ducky.py") >= 0
+    except Exception:
+        return False
 
 
 def _fire(name):
@@ -150,7 +150,7 @@ def main():
         except Exception: pass
 
         # if there's a pending single-tap, we have a budget before we fire it
-        now = time.time()
+        now = time.monotonic()
         if pending_single > 0 and (now - pending_single) * 1000 >= tap_window:
             _fire(cfg.get("BUTTON_PAYLOAD", ""))
             pending_single = 0.0
@@ -168,34 +168,46 @@ def main():
         except Exception as e:
             _log(f"read err {e}")
             time.sleep(0.2)
+            # The device node may have been re-created (a reset): open it again.
+            try:
+                f.close()
+                f = open(dev, "rb", buffering=0)
+            except OSError:
+                pass
             continue
 
         if ty != EV_KEY: continue
 
         if val == 1:     # press
-            press_time = time.time()
+            press_time = time.monotonic()
             hold_fired = False
         elif val == 0:   # release
-            if hold_fired: continue
-            dur = time.time() - press_time
+            # A release with no matching press (the daemon started while the
+            # button was already held) must not count as a hold.
+            if hold_fired or press_time == 0.0: continue
+            dur = time.monotonic() - press_time
+            press_time = 0.0
             # If the release came from a hold that we already fired, skip. If
             # we hadn't fired hold yet but duration exceeds, treat as hold.
             if dur * 1000 >= hold_ms:
                 _fire(cfg.get("BUTTON_HOLD_PAYLOAD", "") or cfg.get("BUTTON_PAYLOAD", ""))
+                pending_single = 0.0   # a hold is not a tap: an earlier single must not fire after it
                 continue
             # short tap — decide between single and double
-            if pending_single > 0 and (time.time() - pending_single) * 1000 <= tap_window:
+            if pending_single > 0 and (time.monotonic() - pending_single) * 1000 <= tap_window:
                 # second tap within window → double-tap
                 dbl = cfg.get("BUTTON_DOUBLE_TAP_PAYLOAD", "")
                 if dbl: _fire(dbl)
                 else:   _fire(cfg.get("BUTTON_PAYLOAD", ""))
                 pending_single = 0.0
             else:
-                pending_single = time.time()
-        elif val == 2:   # held
-            if not hold_fired and (time.time() - press_time) * 1000 >= hold_ms:
-                _fire(cfg.get("BUTTON_HOLD_PAYLOAD", ""))
+                pending_single = time.monotonic()
+        elif val == 2 and press_time:   # held
+            if not hold_fired and (time.monotonic() - press_time) * 1000 >= hold_ms:
+                # the same payload as a hold that is released after its time (see below)
+                _fire(cfg.get("BUTTON_HOLD_PAYLOAD", "") or cfg.get("BUTTON_PAYLOAD", ""))
                 hold_fired = True
+                pending_single = 0.0
 
 
 if __name__ == "__main__":

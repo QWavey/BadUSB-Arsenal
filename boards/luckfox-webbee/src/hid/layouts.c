@@ -37,10 +37,37 @@ int layout_load(const char *path) {
         while (*p && *p != '"') p++;
         if (!*p) break;
         p++;
-        const char *ks = p;
-        while (*p && *p != '"') p++;
+        /* key text, with JSON escapes decoded: \" and \\ stand for the quote and the backslash */
+        char kbuf[32]; size_t klen = 0; int bad_key = 0;
+        while (*p && *p != '"') {
+            char dec = *p++;
+            if (dec == '\\' && *p) {
+                char esc = *p++;
+                switch (esc) {
+                    case 'n': dec = '\n'; break;
+                    case 't': dec = '\t'; break;
+                    case 'r': dec = '\r'; break;
+                    case 'b': dec = '\b'; break;
+                    case 'f': dec = '\f'; break;
+                    case 'u': {   /* \uXXXX: only the ASCII range can match a one-byte key */
+                        unsigned code = 0; int ok = 1;
+                        for (int k = 0; k < 4; k++) {
+                            char h = *p;
+                            if (!isxdigit((unsigned char)h)) { ok = 0; break; }
+                            code = code * 16 + (unsigned)(isdigit((unsigned char)h) ? h - '0' : tolower((unsigned char)h) - 'a' + 10);
+                            p++;
+                        }
+                        dec = (ok && code < 0x80) ? (char)code : 0;
+                        break;
+                    }
+                    default: dec = esc; break;   /* \" \\ \/ stand for themselves */
+                }
+                if (dec == 0) { bad_key = 1; continue; }   /* a non-ASCII or malformed escape cannot match a key: the entry is skipped */
+            }
+            if (klen < sizeof(kbuf) - 1) kbuf[klen++] = dec;
+        }
         if (!*p) break;
-        size_t klen = (size_t)(p - ks);
+        kbuf[klen] = 0;
         p++;
         /* skip spaces, colon */
         while (*p == ' ' || *p == ':' || *p == '\t') p++;
@@ -55,9 +82,10 @@ int layout_load(const char *path) {
         }
         if (*p == ']') p++;
 
+        if (bad_key) continue;   /* bad key escape flagged above: skip the entry, store nothing */
         layout_entry_t *e = &g_table[g_n++];
         if (klen >= sizeof(e->name)) klen = sizeof(e->name)-1;
-        memcpy(e->name, ks, klen); e->name[klen] = 0;
+        memcpy(e->name, kbuf, klen); e->name[klen] = 0;
         e->mod = (vn > 0) ? (uint8_t)vals[0] : 0;
         e->key = (vn > 1) ? (uint8_t)vals[1] : 0;
     }

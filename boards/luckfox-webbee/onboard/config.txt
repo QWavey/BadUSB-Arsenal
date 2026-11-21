@@ -18,6 +18,7 @@ SNIFF_IFACE=usb0
 # their own ring that we actually keep.
 LOG=TRUE
 RECORD_PCAP=TRUE
+RECORD_SD=TRUE
 RECORD_ROTATE_KB=1024          # 1 MB files
 RECORD_RING_FILES=4            # 4 x 1 MB = 4 MB max for pcap
 VERDICT_STREAM=TRUE
@@ -51,3 +52,4 @@ HID_DELAY_MS=1500
 
 # Log level: DEBUG|INFO|WARN|ERROR
 LOG_LEVEL=INFO
+NET_MODE=NAT

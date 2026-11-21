@@ -1,0 +1,21 @@
+﻿Test run: 2026-10-29 15:16:33
+--- adapters (Up only)
+  Ethernet 3  0 bps
+  vEthernet (WSL (Hyper-V firewall))  10 Gbps
+  WLAN  1.4 Gbps
+--- default routes
+  via 172.32.0.93 on Ethernet 3 metric 0
+  via 192.168.178.1 on Ethernet 2 metric 0
+  via 192.168.178.1 on WLAN metric 0
+--- which interface carries the internet (1.1.1.1:443)
+  leaves via WLAN, source 192.168.178.166, TCP ok: True
+--- WebBee web UI (172.32.0.93:80)
+  reachable: True
+--- DNS for example.com (the PC's own DNS)
+  104.20.23.154
+  172.66.147.243
+--- DNS for example.com asked of the WebBee directly
+  172.66.147.243
+  104.20.23.154
+--- HTTP to a site through the WebBee's NAT (1.1.1.1:80, no redirect expected)
+  TCP ok: True

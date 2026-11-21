@@ -37,6 +37,7 @@
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -209,37 +210,65 @@ static void r_config_get(int c) {
     /* Dump config.txt verbatim */
     FILE *f = fopen("/mnt/sd/config.txt", "r");
     if (!f) { send_text(c, 404, "no config.txt\n"); return; }
-    fseek(f, 0, SEEK_END);
-    long L = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    long L = -1;
+    if (fseek(f, 0, SEEK_END) == 0) L = ftell(f);
+    if (L < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); send_text(c, 500, "config read fail\n"); return; }
     char *buf = malloc((size_t)L + 1);
-    fread(buf, 1, (size_t)L, f);
-    buf[L] = 0;
+    if (!buf) { fclose(f); send_text(c, 500, "out of memory\n"); return; }
+    size_t got = fread(buf, 1, (size_t)L, f);
     fclose(f);
+    if (got != (size_t)L) { free(buf); send_text(c, 500, "config read fail\n"); return; }
+    buf[L] = 0;
     send_hdr(c, 200, "OK", "text/plain", (size_t)L, NULL);
     write(c, buf, (size_t)L);
     free(buf);
 }
 
+/* One writer at a time: connections run on their own threads, and two
+ * overlapping POSTs would both write config.txt.new and mix their bytes. */
+static pthread_mutex_t g_cfg_write_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static void r_config_post(int c, const char *body, size_t len) {
     /* An empty body must never replace a working config. */
     if (!body || len == 0) { send_json(c, 400, "{\"ok\":false}"); return; }
+    pthread_mutex_lock(&g_cfg_write_mu);
     const char *tmp = "/mnt/sd/config.txt.new";
     FILE *f = fopen(tmp, "w");
-    if (!f) { send_text(c, 500, "write fail\n"); return; }
+    if (!f) { pthread_mutex_unlock(&g_cfg_write_mu); send_text(c, 500, "write fail\n"); return; }
     int ok = (fwrite(body, 1, len, f) == len);
     if (fflush(f) != 0) ok = 0;
     if (fsync(fileno(f)) != 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
-    if (!ok) { unlink(tmp); send_json(c, 500, "{\"ok\":false}"); return; }
+    if (!ok) { unlink(tmp); pthread_mutex_unlock(&g_cfg_write_mu); send_json(c, 500, "{\"ok\":false}"); return; }
     /* rename only after the complete body is on disk */
     if (rename(tmp, "/mnt/sd/config.txt") != 0) {
         unlink(tmp);
+        pthread_mutex_unlock(&g_cfg_write_mu);
         send_json(c, 500, "{\"ok\":false}");
         return;
     }
-    cfg_load("/mnt/sd/config.txt");
+    int load_rc = cfg_load("/mnt/sd/config.txt");
+    pthread_mutex_unlock(&g_cfg_write_mu);
+    /* non-zero: the file is saved, but the live settings were not replaced */
+    if (load_rc != 0) { send_json(c, 500, "{\"ok\":false,\"error\":\"saved but not applied\"}"); return; }
     send_json(c, 200, "{\"ok\":true}");
+}
+
+/* Writes src as a JSON string body (no quotes). Returns the length, or -1 if dst is too small. */
+static int json_escape(char *dst, size_t cap, const char *src) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        char tmp[8];
+        int k;
+        if (*p == '"' || *p == '\\') k = snprintf(tmp, sizeof(tmp), "\\%c", *p);
+        else if (*p < 0x20)          k = snprintf(tmp, sizeof(tmp), "\\u%04x", *p);
+        else                         k = snprintf(tmp, sizeof(tmp), "%c", *p);
+        if (o + (size_t)k + 1 > cap) return -1;
+        memcpy(dst + o, tmp, (size_t)k);
+        o += (size_t)k;
+    }
+    dst[o] = 0;
+    return (int)o;
 }
 
 static void r_records(int c) {
@@ -255,24 +284,31 @@ static void r_records(int c) {
             snprintf(full, sizeof(full), "/mnt/sd/Records/%s", e->d_name);
             struct stat st;
             if (stat(full, &st) == 0) {
-                off += snprintf(body + off, sizeof(body) - off,
+                /* escape the name, then format the entry; append only if it fits, with room for ']' and NUL */
+                char name[1600], entry[1800];
+                if (json_escape(name, sizeof(name), e->d_name) < 0) continue;
+                int w = snprintf(entry, sizeof(entry),
                     "%s{\"name\":\"%s\",\"size\":%lld,\"mtime\":%lld}",
-                    first ? "" : ",", e->d_name,
+                    first ? "" : ",", name,
                     (long long)st.st_size, (long long)st.st_mtime);
+                if (w < 0 || w >= (int)sizeof(entry) || off + w > (int)sizeof(body) - 2) break;
+                memcpy(body + off, entry, (size_t)w);
+                off += w;
                 first = 0;
-                if (off > (int)sizeof(body) - 128) break;
             }
         }
         closedir(d);
     }
-    snprintf(body + off, sizeof(body) - off, "]");
+    body[off++] = ']';   /* the check above keeps room for this and the NUL */
+    body[off] = 0;
     send_json(c, 200, body);
 }
 
 static void r_query(int c, const char *qs) {
     /* Return up to N verdict lines matching key=value filters */
-    char host[128] = {0}, rule[32] = {0};
-    char tmp[256]; strncpy(tmp, qs ? qs : "", sizeof(tmp)-1); tmp[sizeof(tmp)-1] = 0;
+    char host[256] = {0}, rule[64] = {0};
+    char tmp[1024];
+    strncpy(tmp, qs ? qs : "", sizeof(tmp)-1); tmp[sizeof(tmp)-1] = 0;
     url_decode(tmp);
     for (char *p = tmp, *tok; (tok = strtok_r(p, "&", &p));) {
         char *eq = strchr(tok, '=');
@@ -332,7 +368,14 @@ static void r_query(int c, const char *qs) {
 
 static void r_hid(int c, const char *body) {
     if (!body || !*body) { send_text(c, 400, "no body\n"); return; }
-    /* body: "/Payloads/x.ducky" or raw payload. Treat as path first. */
+    /* body: "/Payloads/x.ducky" or raw payload. Treat as path first.
+     * This request is already behind auth_ok() (every path but /favicon.ico is), but a
+     * ".." segment here still lets an authenticated caller make hid_run_payload() read and
+     * run any file readable by this process, not just something under /mnt/sd -- the same
+     * path-traversal class fixed in the Python build's /api/hid today (bug-hunt, 2026-10-31),
+     * just with auth already required here rather than missing entirely. Defense in depth:
+     * refuse any body containing a ".." segment before it ever reaches the path buffer. */
+    if (strstr(body, "..")) { send_json(c, 400, "{\"ok\":false,\"error\":\"bad path\"}"); return; }
     char path[256];
     if (body[0] == '/') snprintf(path, sizeof(path), "/mnt/sd%s", body);
     else                snprintf(path, sizeof(path), "/mnt/sd/Payloads/%s", body);
@@ -342,7 +385,7 @@ static void r_hid(int c, const char *body) {
 
 static void r_reboot(int c) {
     send_json(c, 200, "{\"ok\":true}");
-    close(c);
+    shutdown(c, SHUT_WR);   /* half-close only: the reply is queued, not waited for; the connection thread still owns and closes c */
     sync();
     reboot(RB_AUTOBOOT);
 }
@@ -381,6 +424,16 @@ static void *req_thread(void *arg) {
     char method[8]  = {0};
     char path[1024] = {0};
     sscanf(buf, "%7s %1023s", method, path);
+    /* sscanf cuts a longer target silently: refuse it instead of serving the cut path */
+    const char *tp = buf;
+    while (*tp == ' ') tp++;                 /* leading spaces */
+    while (*tp && *tp != ' ') tp++;          /* the method */
+    while (*tp == ' ') tp++;                 /* spaces after the method */
+    size_t tlen = strcspn(tp, " \r\n");     /* the target: up to a space, CR, LF or the NUL */
+    if (tlen > sizeof(path) - 1) {
+        send_text(c, 414, "request target too long\n");
+        close(c); return NULL;
+    }
 
     if (!auth_ok(buf) && strcmp(path, "/favicon.ico") != 0) {
         send_401(c);
@@ -453,16 +506,32 @@ static void *accept_loop(void *arg) {
         struct sockaddr_in a;
         socklen_t al = sizeof(a);
         int c = accept(lfd, (struct sockaddr *)&a, &al);
-        if (c < 0) { if (errno == EINTR) continue; break; }
+        if (c < 0) {
+            /* Transient errors (fd or memory pressure, aborted handshakes) must
+             * not end the listener: back off briefly and keep serving. */
+            if (errno == EINTR || errno == ECONNABORTED || errno == EMFILE ||
+                errno == ENFILE || errno == ENOBUFS || errno == ENOMEM) {
+                usleep(100 * 1000);
+                continue;
+            }
+            break;
+        }
+        /* A client that connects and stalls must not hold a thread forever. */
+        struct timeval tv = { 15, 0 };
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         pthread_t t;
-        pthread_create(&t, NULL, req_thread, (void *)(intptr_t)c);
+        if (pthread_create(&t, NULL, req_thread, (void *)(intptr_t)c) != 0) {
+            close(c);
+            continue;
+        }
         pthread_detach(t);
     }
     return NULL;
 }
 
 int httpd_start(void) {
-    if (!g_cfg.webui) return 0;
+    if (!g_cfg.webui) return -1;   /* not started: the supervisor must not count it as running */
     /* No credentials means no WebUI: a blank password must never be accepted. */
     if (!g_cfg.webui_pass[0] && !g_cfg.api_token[0]) {
         LOGE("web", "WebUI not started: set WEBUI_PASS or API_TOKEN in config.txt");
@@ -476,14 +545,22 @@ int httpd_start(void) {
     memset(&a, 0, sizeof(a));
     a.sin_family = AF_INET;
     a.sin_port   = htons((uint16_t)g_cfg.webui_port);
-    inet_pton(AF_INET, g_cfg.webui_bind, &a.sin_addr);
+    if (inet_pton(AF_INET, g_cfg.webui_bind, &a.sin_addr) != 1) {
+        /* A bad address must not fall back to INADDR_ANY (every interface). */
+        LOGE("web", "WEBUI_BIND '%s' is not an IPv4 address; WebUI not started", g_cfg.webui_bind);
+        close(g_listen); g_listen = -1; return -1;
+    }
     if (bind(g_listen, (struct sockaddr *)&a, sizeof(a)) < 0) {
         LOGE("web", "bind %s:%d: %s", g_cfg.webui_bind, g_cfg.webui_port, strerror(errno));
         close(g_listen); g_listen = -1; return -1;
     }
     listen(g_listen, 16);
     g_run = 1;
-    pthread_create(&g_t, NULL, accept_loop, (void *)(intptr_t)g_listen);
+    int rc = pthread_create(&g_t, NULL, accept_loop, (void *)(intptr_t)g_listen);
+    if (rc != 0) {
+        LOGE("web", "accept thread failed: %s", strerror(rc));
+        g_run = 0; close(g_listen); g_listen = -1; return -1;
+    }
     LOGI("web", "listening on %s:%d", g_cfg.webui_bind, g_cfg.webui_port);
     return 0;
 }

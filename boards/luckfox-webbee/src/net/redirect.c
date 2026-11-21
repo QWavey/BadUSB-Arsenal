@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static volatile int g_run = 0;
@@ -36,12 +37,25 @@ static int in_from_list(const char *host) {
     buf[sizeof(buf)-1] = 0;
     char *tok, *save = NULL;
     for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
-        /* strip scheme */
-        if (!strncmp(tok, "http://", 7))  tok += 7;
-        if (!strncmp(tok, "https://", 8)) tok += 8;
+        /* trim spaces and tabs around the token */
+        while (*tok == ' ' || *tok == '\t') tok++;
+        size_t tl = strlen(tok);
+        while (tl && (tok[tl-1] == ' ' || tok[tl-1] == '\t')) tok[--tl] = 0;
+        /* strip scheme, case-insensitive */
+        if (!strncasecmp(tok, "http://", 7))  tok += 7;
+        if (!strncasecmp(tok, "https://", 8)) tok += 8;
+        if (!*tok) continue;
         if (!strcasecmp(tok, host)) return 1;
-        /* suffix match: *.google.com */
         size_t L = strlen(tok), H = strlen(host);
+        if (tok[0] == '*' && tok[1] == '.' && tok[2]) {
+            /* wildcard *.google.com: google.com itself, or any name ending in .google.com */
+            const char *base = tok + 2;
+            size_t B = L - 2;
+            if (!strcasecmp(host, base)) return 1;
+            if (B < H && !strcasecmp(host + H - B, base) && host[H - B - 1] == '.') return 1;
+            continue;
+        }
+        /* suffix match: google.com also matches www.google.com */
         if (L < H && !strcasecmp(host + H - L, tok) && host[H - L - 1] == '.') return 1;
     }
     return 0;
@@ -84,8 +98,8 @@ static void *dns_worker(void *arg) {
     /* resolve REDIRECT_TO ip once */
     uint32_t target_ip = 0;
     const char *to = g_cfg.redirect_to;
-    if (!strncmp(to, "http://",  7)) to += 7;
-    if (!strncmp(to, "https://", 8)) to += 8;
+    if (!strncasecmp(to, "http://",  7)) to += 7;
+    if (!strncasecmp(to, "https://", 8)) to += 8;
     char host_only[128];
     strncpy(host_only, to, sizeof(host_only)-1); host_only[sizeof(host_only)-1] = 0;
     char *slash = strchr(host_only, '/'); if (slash) *slash = 0;
@@ -109,6 +123,7 @@ static void *dns_worker(void *arg) {
         socklen_t fl = sizeof(from);
         ssize_t n = recvfrom(s, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
         if (n < 12) continue;
+        if (buf[2] & 0x80) continue;     /* QR=1: a response, never answer one */
 
         /* parse first question */
         char qname[256];
@@ -131,6 +146,7 @@ static void *dns_worker(void *arg) {
         uint8_t resp[600];
         size_t rlen = qoff + 4;
         memcpy(resp, buf, rlen);
+        resp[8] = 0; resp[9] = 0; resp[10] = 0; resp[11] = 0;  /* NSCOUNT=0, ARCOUNT=0: do not echo the query's EDNS OPT */
         resp[2] = 0x81; resp[3] = 0x80;  /* flags: QR=1, RD=1, RA=1 */
         resp[6] = 0; resp[7] = 1;        /* ANCOUNT=1 */
 
@@ -180,6 +196,9 @@ static void *http_worker(void *arg) {
     while (g_run) {
         int c = accept(s, NULL, NULL);
         if (c < 0) continue;
+        /* idle client must not hold the single HTTP worker: 3 s read timeout */
+        struct timeval tv = { 3, 0 };
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         char req[1024]; int n = read(c, req, sizeof(req)-1);
         if (n < 0) { close(c); continue; }
         req[n] = 0;
@@ -187,20 +206,20 @@ static void *http_worker(void *arg) {
         char *sp1 = strchr(req, ' ');
         char path[512] = "/";
         if (sp1) {
-            sp1++; char *sp2 = strchr(sp1, ' ');
-            size_t L = sp2 ? (size_t)(sp2 - sp1) : 0;
+            sp1++;
+            size_t L = strcspn(sp1, " \r\n");   /* path ends at the first space, CR or LF */
             if (L && L < sizeof(path)) { memcpy(path, sp1, L); path[L] = 0; }
         }
 
-        char loc[600];
+        char loc[255 + 511 + 1];   /* REDIRECT_TO (255) + path (511) + NUL */
         if (g_cfg.redirect_preserve_path && path[0] == '/' && path[1]) {
             snprintf(loc, sizeof(loc), "%s%s", g_cfg.redirect_to, path);
         } else {
             snprintf(loc, sizeof(loc), "%s", g_cfg.redirect_to);
         }
         /* ensure scheme in Location */
-        char full[700];
-        if (strncmp(loc, "http", 4) == 0)
+        char full[7 + 255 + 511 + 1];   /* "http://" + loc */
+        if (!strncasecmp(g_cfg.redirect_to, "http://", 7) || !strncasecmp(g_cfg.redirect_to, "https://", 8))
             snprintf(full, sizeof(full), "%s", loc);
         else
             snprintf(full, sizeof(full), "http://%s", loc);
